@@ -20,22 +20,24 @@ def _cli(cfg, *args: str, agent: str | None = None):
     env = {
         **os.environ,
         "QUORUMGIT_DATA_DIR": str(cfg.data_dir),
-        "QUORUMGIT_PG_INSTANCE": cfg.pg_instance,
-        "QUORUMGIT_PG_PORT": str(cfg.pg_port),
     }
     env.pop("QUORUMGIT_AGENT", None)
     if agent:
         env["QUORUMGIT_AGENT"] = agent
     return subprocess.run(
         [sys.executable, "-m", "quorumgit", *args],
-        capture_output=True, text=True, env=env,
+        capture_output=True,
+        text=True,
+        env=env,
     )
 
 
 def _rev_parse(git_dir_args: list[str], ref: str) -> str:
     return subprocess.run(
         ["git", *git_dir_args, "rev-parse", ref],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
 
 
@@ -45,9 +47,17 @@ def test_hub_no_worktree_owner_workflow(committed_conn, tmp_path, cfg):
     task_id = work.create_task(conn, repo_name, "hub-model work")
     conn.commit()
 
-    # claim without a managed worktree — the hub branch stays pushable
-    claimed = _cli(cfg, "claim", str(task_id), "--branch", "feat/hub",
-                   "--scope", "src/**", "--no-worktree", agent=owner)
+    claimed = _cli(
+        cfg,
+        "claim",
+        str(task_id),
+        "--branch",
+        "feat/hub",
+        "--scope",
+        "src/**",
+        "--no-worktree",
+        agent=owner,
+    )
     assert claimed.returncode == 0, claimed.stderr
     assert "no worktree" in claimed.stdout
     match = re.search(r"claim (\d+) acquired", claimed.stdout)
@@ -67,17 +77,24 @@ def test_hub_no_worktree_owner_workflow(committed_conn, tmp_path, cfg):
     pushed = _rev_parse(["--git-dir", str(hub)], "refs/heads/feat/hub")
     assert pushed == _rev_parse(["-C", str(clone)], "HEAD")
 
-    # checkpoint: --commit is required without a worktree, then records it
     missing = _cli(cfg, "checkpoint", str(claim_id), agent=owner)
     assert missing.returncode == 1
     assert "--commit" in missing.stderr
 
-    cp = _cli(cfg, "checkpoint", str(claim_id), "--commit", pushed,
-              "--note", "hub checkpoint", agent=owner)
+    cp = _cli(
+        cfg,
+        "checkpoint",
+        str(claim_id),
+        "--commit",
+        pushed,
+        "--note",
+        "hub checkpoint",
+        agent=owner,
+    )
     assert cp.returncode == 0, cp.stderr
     assert pushed in cp.stdout
 
     row = conn.execute(
-        "SELECT commit_oid FROM checkpoints WHERE claim_id = %s", (claim_id,)
+        "SELECT commit_oid FROM checkpoints WHERE claim_id = ?", (claim_id,)
     ).fetchone()
     assert row is not None and row[0] == pushed
