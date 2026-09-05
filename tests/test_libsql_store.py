@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from importlib import import_module
-from typing import Any
-
 import pytest
 
 from quorumgit.libsql_store import (
@@ -13,10 +10,6 @@ from quorumgit.libsql_store import (
     database_path,
     immediate_transaction,
 )
-
-# Match the production boundary: libsql's runtime PyO3 exports are not fully
-# represented in its published typing metadata.
-libsql: Any = import_module("libsql")
 
 
 def test_connect_local_establishes_required_pragmas(tmp_path):
