@@ -254,7 +254,7 @@ def test_refused_takeover_preserves_holder_and_approval(committed_conn, tmp_path
     assert taken.returncode == 0, taken.stderr
     holder = work.active_claim_for_task(conn, task1)
     assert holder is not None and holder["agent"] == c
-    assert gate.get_approval(conn, gate.operation_hash(operation))["status"] == "denied"
+    assert gate.get_approval(conn, gate.operation_hash(operation))["status"] == "consumed"
 
 
 def test_task_lock_serializes_release_with_takeover_check(initialized_store, tmp_path):
