@@ -118,7 +118,7 @@ CREATE TABLE handoffs (
 -- quorumgit-statement
 CREATE TABLE approvals (
     id INTEGER PRIMARY KEY,
-    operation_hash TEXT NOT NULL UNIQUE CHECK (
+    operation_hash TEXT NOT NULL CHECK (
         length(operation_hash) = 71
         AND substr(operation_hash, 1, 7) = 'sha256:'
         AND substr(operation_hash, 8) NOT GLOB '*[^0-9a-f]*'
@@ -133,10 +133,18 @@ CREATE TABLE approvals (
     ),
     threshold INTEGER NOT NULL DEFAULT 1 CHECK (threshold >= 1),
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'approved', 'denied')),
+        CHECK (status IN ('pending', 'approved', 'denied', 'consumed')),
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    decided_at INTEGER
+    decided_at INTEGER,
+    consumed_at INTEGER,
+    CHECK (status = 'consumed' OR consumed_at IS NULL),
+    CHECK (status <> 'consumed' OR consumed_at IS NOT NULL)
 );
+
+-- quorumgit-statement
+CREATE UNIQUE INDEX approvals_one_live_per_operation
+    ON approvals(operation_hash)
+    WHERE status IN ('pending', 'approved');
 
 -- quorumgit-statement
 CREATE TABLE votes (
