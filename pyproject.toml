@@ -17,6 +17,7 @@ classifiers = [
 dependencies = [
     "psycopg[binary]>=3.2",
     "pg0-embedded==0.14.2",
+    "libsql==0.1.11",
 ]
 
 [project.optional-dependencies]
