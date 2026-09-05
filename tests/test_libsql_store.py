@@ -39,7 +39,8 @@ def test_foreign_keys_are_enforced(tmp_path):
         conn.execute(
             "CREATE TABLE child(parent_id INTEGER NOT NULL REFERENCES parent(id))"
         )
-        with pytest.raises(libsql.Error):
+        # libsql maps SQLite engine failures to PyValueError at its Python API.
+        with pytest.raises(ValueError, match="FOREIGN KEY constraint failed"):
             conn.execute("INSERT INTO child(parent_id) VALUES (1)")
     finally:
         conn.close()
