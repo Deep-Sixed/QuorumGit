@@ -1,167 +1,191 @@
--- QuorumGit core schema.
--- Hot/filterable fields are relational columns; full structured artifacts
--- live in JSONB validated by pg_jsonschema CHECK constraints (defense in
--- depth — the application also validates before insert and re-verifies on
--- read where hashes are involved).
+-- QuorumGit relational schema for local libSQL.
+-- Each chunk between quorumgit-statement markers is executed as one statement.
+-- Governance-critical fields are relational; JSON is reserved for extensible
+-- detail payloads and is validated with SQLite's native JSON functions.
 
 CREATE TABLE repositories (
-    id BIGSERIAL PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE CHECK (name <> ''),
     path TEXT NOT NULL UNIQUE CHECK (path <> ''),
-    protected_refs TEXT[] NOT NULL DEFAULT '{}',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
+-- quorumgit-statement
+CREATE TABLE protected_refs (
+    id INTEGER PRIMARY KEY,
+    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    refname TEXT NOT NULL CHECK (refname <> ''),
+    UNIQUE (repository_id, refname)
+);
+
+-- quorumgit-statement
 CREATE TABLE agents (
-    id BIGSERIAL PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE CHECK (name <> ''),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
+-- quorumgit-statement
 CREATE TABLE tasks (
-    id BIGSERIAL PRIMARY KEY,
-    repository_id BIGINT NOT NULL REFERENCES repositories(id),
+    id INTEGER PRIMARY KEY,
+    repository_id INTEGER NOT NULL REFERENCES repositories(id),
     title TEXT NOT NULL CHECK (title <> ''),
     objective TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'open'
         CHECK (status IN ('open', 'claimed', 'handoff', 'done', 'abandoned')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
+-- quorumgit-statement
 CREATE TABLE claims (
-    id BIGSERIAL PRIMARY KEY,
-    task_id BIGINT NOT NULL REFERENCES tasks(id),
-    agent_id BIGINT NOT NULL REFERENCES agents(id),
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER NOT NULL REFERENCES tasks(id),
+    agent_id INTEGER NOT NULL REFERENCES agents(id),
     branch TEXT NOT NULL CHECK (branch <> ''),
-    acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    lease_expires_at TIMESTAMPTZ NOT NULL,
-    released_at TIMESTAMPTZ,
+    acquired_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    lease_expires_at INTEGER NOT NULL,
+    released_at INTEGER,
     release_reason TEXT
 );
 
--- At most one unreleased claim per task. Lease expiry does not release a
--- claim by itself; expiry is evaluated at read time and expired claims are
--- released explicitly (with an audit trail) when superseded.
+-- quorumgit-statement
 CREATE UNIQUE INDEX claims_one_active_per_task
     ON claims(task_id) WHERE released_at IS NULL;
-CREATE INDEX claims_active_by_agent ON claims(agent_id) WHERE released_at IS NULL;
 
+-- quorumgit-statement
+CREATE INDEX claims_active_by_agent
+    ON claims(agent_id) WHERE released_at IS NULL;
+
+-- quorumgit-statement
 CREATE TABLE scopes (
-    id BIGSERIAL PRIMARY KEY,
-    claim_id BIGINT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+    id INTEGER PRIMARY KEY,
+    claim_id INTEGER NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
     path_glob TEXT NOT NULL CHECK (path_glob <> '')
 );
 
+-- quorumgit-statement
 CREATE TABLE worktrees (
-    id BIGSERIAL PRIMARY KEY,
-    claim_id BIGINT NOT NULL UNIQUE REFERENCES claims(id),
+    id INTEGER PRIMARY KEY,
+    claim_id INTEGER NOT NULL UNIQUE REFERENCES claims(id),
     path TEXT NOT NULL UNIQUE,
-    branch TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    removed_at TIMESTAMPTZ
+    branch TEXT NOT NULL CHECK (branch <> ''),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    removed_at INTEGER
 );
 
+-- quorumgit-statement
 CREATE TABLE checkpoints (
-    id BIGSERIAL PRIMARY KEY,
-    claim_id BIGINT NOT NULL REFERENCES claims(id),
-    commit_oid TEXT NOT NULL CHECK (commit_oid ~ '^[0-9a-f]{40,64}$'),
+    id INTEGER PRIMARY KEY,
+    claim_id INTEGER NOT NULL REFERENCES claims(id),
+    commit_oid TEXT NOT NULL CHECK (
+        length(commit_oid) BETWEEN 40 AND 64
+        AND commit_oid NOT GLOB '*[^0-9a-f]*'
+    ),
     note TEXT NOT NULL DEFAULT '',
-    detail JSONB NOT NULL DEFAULT '{}',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    detail TEXT NOT NULL DEFAULT '{}' CHECK (
+        json_valid(detail) AND json_type(detail) = 'object'
+    ),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
+-- quorumgit-statement
 CREATE TABLE handoffs (
-    id BIGSERIAL PRIMARY KEY,
-    task_id BIGINT NOT NULL REFERENCES tasks(id),
-    from_claim_id BIGINT NOT NULL REFERENCES claims(id),
-    from_agent_id BIGINT NOT NULL REFERENCES agents(id),
-    to_agent_id BIGINT REFERENCES agents(id),  -- NULL = open to any agent
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER NOT NULL REFERENCES tasks(id),
+    from_claim_id INTEGER NOT NULL REFERENCES claims(id),
+    from_agent_id INTEGER NOT NULL REFERENCES agents(id),
+    to_agent_id INTEGER REFERENCES agents(id),
     status TEXT NOT NULL DEFAULT 'open'
-        CHECK (status IN ('open', 'accepted', 'declined')),
-    record JSONB NOT NULL CHECK (
-        jsonb_matches_schema(
-            '{
-                "type": "object",
-                "required": ["completed", "remaining", "last_commit"],
-                "properties": {
-                    "completed": {"type": "string", "minLength": 1},
-                    "remaining": {"type": "string", "minLength": 1},
-                    "last_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
-                    "files_changed": {"type": "array", "items": {"type": "string"}},
-                    "blockers": {"type": "array", "items": {"type": "string"}},
-                    "validation": {"type": "string"}
-                }
-            }'::json,
-            record
-        )
+        CHECK (status IN ('open', 'accepted', 'declined', 'cancelled')),
+    completed TEXT NOT NULL CHECK (completed <> ''),
+    remaining TEXT NOT NULL CHECK (remaining <> ''),
+    last_commit TEXT NOT NULL CHECK (
+        length(last_commit) BETWEEN 40 AND 64
+        AND last_commit NOT GLOB '*[^0-9a-f]*'
     ),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    resolved_at TIMESTAMPTZ
+    files_changed TEXT NOT NULL DEFAULT '[]' CHECK (
+        json_valid(files_changed) AND json_type(files_changed) = 'array'
+    ),
+    blockers TEXT NOT NULL DEFAULT '[]' CHECK (
+        json_valid(blockers) AND json_type(blockers) = 'array'
+    ),
+    validation TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    resolved_at INTEGER
 );
 
+-- quorumgit-statement
 CREATE TABLE approvals (
-    id BIGSERIAL PRIMARY KEY,
-    operation_hash TEXT NOT NULL UNIQUE
-        CHECK (operation_hash ~ '^sha256:[a-f0-9]{64}$'),
-    operation JSONB NOT NULL CHECK (
-        jsonb_matches_schema(
-            '{
-                "type": "object",
-                "required": ["type", "repository"],
-                "properties": {
-                    "type": {"type": "string", "minLength": 1},
-                    "repository": {"type": "string", "minLength": 1}
-                }
-            }'::json,
-            operation
-        )
+    id INTEGER PRIMARY KEY,
+    operation_hash TEXT NOT NULL UNIQUE CHECK (
+        length(operation_hash) = 71
+        AND substr(operation_hash, 1, 7) = 'sha256:'
+        AND substr(operation_hash, 8) NOT GLOB '*[^0-9a-f]*'
     ),
-    threshold INT NOT NULL DEFAULT 1 CHECK (threshold >= 1),
+    operation TEXT NOT NULL CHECK (
+        json_valid(operation)
+        AND json_type(operation) = 'object'
+        AND typeof(json_extract(operation, '$.type')) = 'text'
+        AND length(json_extract(operation, '$.type')) > 0
+        AND typeof(json_extract(operation, '$.repository')) = 'text'
+        AND length(json_extract(operation, '$.repository')) > 0
+    ),
+    threshold INTEGER NOT NULL DEFAULT 1 CHECK (threshold >= 1),
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'approved', 'denied')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    decided_at TIMESTAMPTZ
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    decided_at INTEGER
 );
 
+-- quorumgit-statement
 CREATE TABLE votes (
-    id BIGSERIAL PRIMARY KEY,
-    approval_id BIGINT NOT NULL REFERENCES approvals(id),
+    id INTEGER PRIMARY KEY,
+    approval_id INTEGER NOT NULL REFERENCES approvals(id),
     voter TEXT NOT NULL CHECK (voter <> ''),
-    vote BOOLEAN NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    vote INTEGER NOT NULL CHECK (vote IN (0, 1)),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     UNIQUE (approval_id, voter)
 );
 
+-- quorumgit-statement
 CREATE TABLE conflict_events (
-    id BIGSERIAL PRIMARY KEY,
-    repository_id BIGINT NOT NULL REFERENCES repositories(id),
-    task_id BIGINT,
-    agent_id BIGINT,
+    id INTEGER PRIMARY KEY,
+    repository_id INTEGER NOT NULL REFERENCES repositories(id),
+    task_id INTEGER REFERENCES tasks(id),
+    agent_id INTEGER REFERENCES agents(id),
     classification TEXT NOT NULL CHECK (
         classification IN ('CLEAR', 'RELATED', 'OVERLAPPING', 'CONFLICTING', 'BLOCKED')
     ),
-    detail JSONB NOT NULL DEFAULT '{}',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    detail TEXT NOT NULL DEFAULT '{}' CHECK (
+        json_valid(detail) AND json_type(detail) = 'object'
+    ),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
+-- quorumgit-statement
 CREATE TABLE audit_events (
-    id BIGSERIAL PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     event_type TEXT NOT NULL CHECK (event_type <> ''),
     entity TEXT NOT NULL CHECK (entity <> ''),
-    entity_id BIGINT,
+    entity_id INTEGER,
     agent TEXT,
-    detail JSONB NOT NULL DEFAULT '{}',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    detail TEXT NOT NULL DEFAULT '{}' CHECK (
+        json_valid(detail) AND json_type(detail) = 'object'
+    ),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
--- The audit trail is append-only at the database level.
-CREATE FUNCTION audit_events_append_only() RETURNS trigger AS $$
-BEGIN
-    RAISE EXCEPTION 'audit_events is append-only';
-END;
-$$ LANGUAGE plpgsql;
-
+-- quorumgit-statement
 CREATE TRIGGER audit_events_no_update
-    BEFORE UPDATE OR DELETE ON audit_events
-    FOR EACH ROW EXECUTE FUNCTION audit_events_append_only();
+BEFORE UPDATE ON audit_events
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events is append-only');
+END;
+
+-- quorumgit-statement
+CREATE TRIGGER audit_events_no_delete
+BEFORE DELETE ON audit_events
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events is append-only');
+END;
