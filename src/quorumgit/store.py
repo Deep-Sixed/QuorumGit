@@ -57,6 +57,13 @@ def database_path(cfg: Config) -> Path:
     return cfg.data_dir / DATABASE_FILENAME
 
 
+def _cfg_for_target(target: Config | str | Path) -> Config:
+    if isinstance(target, Config):
+        return target
+    path = Path(target)
+    return Config(data_dir=path.parent, agent=None)
+
+
 def _configure_connection(conn: Connection, timeout_seconds: float) -> None:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
@@ -82,6 +89,7 @@ def open_connection(
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be greater than zero")
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    conn: Connection | None = None
     try:
         conn = libsql.connect(
             str(database_path(cfg)),
@@ -91,10 +99,8 @@ def open_connection(
         _configure_connection(conn, timeout_seconds)
         return conn
     except Exception as exc:
-        try:
+        if conn is not None:
             conn.close()
-        except (NameError, Exception):
-            pass
         if isinstance(exc, StoreError):
             raise
         raise StoreError(f"Cannot open local libSQL store: {exc}") from exc
@@ -122,9 +128,34 @@ def begin_immediate(conn: Connection) -> None:
 # ---------------------------------------------------------------- lifecycle
 
 
+def ensure_running(cfg: Config) -> str:
+    """Compatibility name: ensure the local state directory exists.
+
+    libSQL is embedded and has no server process to start. The returned string
+    is the local database path retained for the pre-cutover CLI call shape.
+    """
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    return str(database_path(cfg))
+
+
+def provision_extensions(_target: object) -> None:
+    """No-op compatibility hook: libSQL requires no external extensions."""
+
+
+def stop(_cfg: Config) -> None:
+    """No-op compatibility hook: an embedded libSQL store has no daemon."""
+
+
 def instance_status(cfg: Config) -> dict[str, Any]:
     path = database_path(cfg)
-    return {"exists": path.exists(), "path": str(path)}
+    exists = path.exists()
+    return {
+        "exists": exists,
+        "path": str(path),
+        # Compatibility keys consumed by the existing CLI until its cleanup PR.
+        "running": exists,
+        "uri": str(path) if exists else None,
+    }
 
 
 def destroy(cfg: Config) -> None:
@@ -170,8 +201,9 @@ def _migration_statements(text: str) -> list[str]:
     return [chunk.strip() for chunk in text.split(MIGRATION_SEPARATOR) if chunk.strip()]
 
 
-def migrate(cfg: Config) -> list[str]:
+def migrate(target: Config | str | Path) -> list[str]:
     """Apply pending libSQL migrations in filename order."""
+    cfg = _cfg_for_target(target)
     conn = open_connection(cfg)
     applied: list[str] = []
     try:
@@ -219,13 +251,14 @@ def migrate(cfg: Config) -> list[str]:
 # ------------------------------------------------------------ contract check
 
 
-def verify_contract(target: Config | Connection) -> None:
+def verify_contract(target: Config | Connection | str | Path) -> None:
     """Fail loudly unless the local store satisfies the runtime contract."""
-    owned = isinstance(target, Config)
+    owned = isinstance(target, (Config, str, Path))
     if owned:
-        if not database_path(target).exists():
+        cfg = _cfg_for_target(target)
+        if not database_path(cfg).exists():
             raise StoreError("Store is not initialized. Run `quorumgit init` first.")
-        conn = open_connection(target)
+        conn = open_connection(cfg)
     else:
         conn = target
 
