@@ -10,11 +10,9 @@ from __future__ import annotations
 import subprocess
 from typing import Any
 
-from psycopg import Connection
-from psycopg.types.json import Jsonb
-
 from . import audit
 from .registry import get_agent, get_repository
+from .store import Connection, begin_immediate, json_dumps
 
 DEFAULT_LEASE_HOURS = 8
 
@@ -39,14 +37,19 @@ def create_task(
     row = conn.execute(
         """
         INSERT INTO tasks (repository_id, title, objective)
-        VALUES (%s, %s, %s) RETURNING id
+        VALUES (?, ?, ?) RETURNING id
         """,
         (repo["id"], title, objective),
     ).fetchone()
     assert row is not None
     task_id = row[0]
-    audit.record(conn, "task.created", "task", task_id,
-                 detail={"repository": repository, "title": title})
+    audit.record(
+        conn,
+        "task.created",
+        "task",
+        task_id,
+        detail={"repository": repository, "title": title},
+    )
     return task_id
 
 
@@ -56,7 +59,7 @@ def get_task(conn: Connection, task_id: int) -> dict:
         SELECT t.id, t.repository_id, r.name, r.path, t.title, t.objective,
                t.status
         FROM tasks t JOIN repositories r ON r.id = t.repository_id
-        WHERE t.id = %s
+        WHERE t.id = ?
         """,
         (task_id,),
     ).fetchone()
@@ -78,7 +81,7 @@ def list_tasks(conn: Connection, repository: str | None = None) -> list[dict]:
         """
         SELECT t.id, r.name, t.title, t.status
         FROM tasks t JOIN repositories r ON r.id = t.repository_id
-        WHERE (%s::text IS NULL OR r.name = %s)
+        WHERE (? IS NULL OR r.name = ?)
         ORDER BY t.id
         """,
         (repository, repository),
@@ -91,7 +94,7 @@ def list_tasks(conn: Connection, repository: str | None = None) -> list[dict]:
 
 def set_task_status(conn: Connection, task_id: int, status: str) -> None:
     conn.execute(
-        "UPDATE tasks SET status = %s, updated_at = now() WHERE id = %s",
+        "UPDATE tasks SET status = ?, updated_at = unixepoch() WHERE id = ?",
         (status, task_id),
     )
 
@@ -100,23 +103,29 @@ def set_task_status(conn: Connection, task_id: int, status: str) -> None:
 
 
 def lock_task(conn: Connection, task_id: int) -> None:
-    """Serialize claim ownership transitions for one task.
+    """Serialize ownership transitions before reading task state.
 
-    Takeover approval binds to the incumbent observed while this lock is held;
-    normal claims and releases take the same lock, so that incumbent cannot be
-    replaced between approval validation and the atomic takeover.
+    libSQL inherits SQLite's single-writer model. BEGIN IMMEDIATE acquires the
+    writer reservation for the whole governance transaction, replacing the
+    PostgreSQL row lock while also serializing cross-task branch/scope checks.
     """
-    row = conn.execute(
-        "SELECT id FROM tasks WHERE id = %s FOR UPDATE", (task_id,)
-    ).fetchone()
+    begin_immediate(conn)
+    row = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None:
         raise WorkError(f"No such task: {task_id}")
 
 
 def _claim_row(row) -> dict:
     keys = (
-        "id", "task_id", "agent_id", "agent", "branch",
-        "lease_expires_at", "released_at", "release_reason", "expired",
+        "id",
+        "task_id",
+        "agent_id",
+        "agent",
+        "branch",
+        "lease_expires_at",
+        "released_at",
+        "release_reason",
+        "expired",
     )
     return dict(zip(keys, row))
 
@@ -126,9 +135,9 @@ def get_claim(conn: Connection, claim_id: int) -> dict:
         """
         SELECT c.id, c.task_id, c.agent_id, a.name, c.branch,
                c.lease_expires_at, c.released_at, c.release_reason,
-               (c.lease_expires_at < now()) AS expired
+               (c.lease_expires_at < unixepoch()) AS expired
         FROM claims c JOIN agents a ON a.id = c.agent_id
-        WHERE c.id = %s
+        WHERE c.id = ?
         """,
         (claim_id,),
     ).fetchone()
@@ -143,9 +152,9 @@ def active_claim_for_task(conn: Connection, task_id: int) -> dict | None:
         """
         SELECT c.id, c.task_id, c.agent_id, a.name, c.branch,
                c.lease_expires_at, c.released_at, c.release_reason,
-               (c.lease_expires_at < now()) AS expired
+               (c.lease_expires_at < unixepoch()) AS expired
         FROM claims c JOIN agents a ON a.id = c.agent_id
-        WHERE c.task_id = %s AND c.released_at IS NULL
+        WHERE c.task_id = ? AND c.released_at IS NULL
         """,
         (task_id,),
     ).fetchone()
@@ -158,34 +167,47 @@ def live_claims_in_repository(
     """Unreleased, unexpired claims in a repository, with their scopes."""
     rows = conn.execute(
         """
-        SELECT c.id, c.task_id, a.name, c.branch,
-               COALESCE(array_agg(s.path_glob) FILTER (WHERE s.id IS NOT NULL), '{}')
+        SELECT c.id, c.task_id, a.name, c.branch
         FROM claims c
         JOIN tasks t ON t.id = c.task_id
         JOIN agents a ON a.id = c.agent_id
-        LEFT JOIN scopes s ON s.claim_id = c.id
-        WHERE t.repository_id = %s
+        WHERE t.repository_id = ?
           AND c.released_at IS NULL
-          AND c.lease_expires_at >= now()
-          AND (%s::bigint IS NULL OR c.task_id <> %s)
-        GROUP BY c.id, c.task_id, a.name, c.branch
+          AND c.lease_expires_at >= unixepoch()
+          AND (? IS NULL OR c.task_id <> ?)
+        ORDER BY c.id
         """,
         (repository_id, exclude_task, exclude_task),
     ).fetchall()
-    return [
-        {"id": r[0], "task_id": r[1], "agent": r[2], "branch": r[3], "scopes": r[4]}
-        for r in rows
-    ]
+    result: list[dict] = []
+    for row in rows:
+        scopes = [
+            r[0]
+            for r in conn.execute(
+                "SELECT path_glob FROM scopes WHERE claim_id = ? ORDER BY id",
+                (row[0],),
+            ).fetchall()
+        ]
+        result.append(
+            {
+                "id": row[0],
+                "task_id": row[1],
+                "agent": row[2],
+                "branch": row[3],
+                "scopes": scopes,
+            }
+        )
+    return result
 
 
 def open_handoff_for_task(conn: Connection, task_id: int) -> dict | None:
-    """An open (unaccepted, undeclined) handoff reserving this task, if any."""
+    """An open handoff reserving this task, if any."""
     row = conn.execute(
         """
         SELECT h.id, a.name
         FROM handoffs h
         LEFT JOIN agents a ON a.id = h.to_agent_id
-        WHERE h.task_id = %s AND h.status = 'open'
+        WHERE h.task_id = ? AND h.status = 'open'
         LIMIT 1
         """,
         (task_id,),
@@ -203,7 +225,7 @@ def open_handoff_for_branch(
         FROM handoffs h
         JOIN claims c ON c.id = h.from_claim_id
         JOIN tasks t ON t.id = h.task_id
-        WHERE t.repository_id = %s AND c.branch = %s AND h.status = 'open'
+        WHERE t.repository_id = ? AND c.branch = ? AND h.status = 'open'
         LIMIT 1
         """,
         (repository_id, branch),
@@ -218,12 +240,12 @@ def live_claim_for_branch(
         """
         SELECT c.id, c.task_id, c.agent_id, a.name, c.branch,
                c.lease_expires_at, c.released_at, c.release_reason,
-               (c.lease_expires_at < now()) AS expired
+               (c.lease_expires_at < unixepoch()) AS expired
         FROM claims c
         JOIN tasks t ON t.id = c.task_id
         JOIN agents a ON a.id = c.agent_id
-        WHERE t.repository_id = %s AND c.branch = %s
-          AND c.released_at IS NULL AND c.lease_expires_at >= now()
+        WHERE t.repository_id = ? AND c.branch = ?
+          AND c.released_at IS NULL AND c.lease_expires_at >= unixepoch()
         LIMIT 1
         """,
         (repository_id, branch),
@@ -243,8 +265,7 @@ def _glob_prefix(glob: str) -> str:
 
 
 def scopes_overlap(a: str, b: str) -> bool:
-    """Conservative overlap test: two scopes overlap when the literal prefix
-    of one is a prefix of the other. Predictable and errs toward flagging."""
+    """Conservative overlap test that errs toward flagging."""
     pa, pb = _glob_prefix(a), _glob_prefix(b)
     return pa.startswith(pb) or pb.startswith(pa)
 
@@ -252,29 +273,57 @@ def scopes_overlap(a: str, b: str) -> bool:
 def verify_commit(
     repo_path: str, commit_oid: str, branch: str | None = None
 ) -> None:
-    """The OID must exist as a commit in the repository. When the branch ref
-    exists, the commit must also be reachable from it — a continuation point
-    nobody can reach is not a continuation point."""
-    exists = subprocess.run(
-        ["git", "-C", str(repo_path), "cat-file", "-e", f"{commit_oid}^{{commit}}"],
-        capture_output=True,
-    ).returncode == 0
+    """Require an existing commit, reachable from the branch when it exists."""
+    exists = (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_path),
+                "cat-file",
+                "-e",
+                f"{commit_oid}^{{commit}}",
+            ],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
     if not exists:
         raise WorkError(
             f"Commit {commit_oid} does not exist in the registered repository."
         )
     if branch:
-        branch_exists = subprocess.run(
-            ["git", "-C", str(repo_path), "show-ref", "--verify", "--quiet",
-             f"refs/heads/{branch}"],
-            capture_output=True,
-        ).returncode == 0
-        if branch_exists:
-            reachable = subprocess.run(
-                ["git", "-C", str(repo_path), "merge-base", "--is-ancestor",
-                 commit_oid, f"refs/heads/{branch}"],
+        branch_exists = (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_path),
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{branch}",
+                ],
                 capture_output=True,
-            ).returncode == 0
+            ).returncode
+            == 0
+        )
+        if branch_exists:
+            reachable = (
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repo_path),
+                        "merge-base",
+                        "--is-ancestor",
+                        commit_oid,
+                        f"refs/heads/{branch}",
+                    ],
+                    capture_output=True,
+                ).returncode
+                == 0
+            )
             if not reachable:
                 raise WorkError(
                     f"Commit {commit_oid} is not reachable from branch "
@@ -290,11 +339,7 @@ def classify(
     scope_globs: list[str],
     exclude_claim_id: int | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Classify a prospective claim against all live claims in the repo.
-
-    exclude_claim_id skips one claim in the BLOCKED check — the holder being
-    displaced by an approved takeover must not block its own replacement.
-    """
+    """Classify a prospective claim against all live claims in the repo."""
     active = active_claim_for_task(conn, task_id)
     if active and not active["expired"] and active["id"] != exclude_claim_id:
         return "BLOCKED", {
@@ -324,8 +369,13 @@ def classify(
             if scopes_overlap(og, sg)
         ]
         if hits:
-            overlaps.append({"claim_id": other["id"], "agent": other["agent"],
-                             "matches": hits})
+            overlaps.append(
+                {
+                    "claim_id": other["id"],
+                    "agent": other["agent"],
+                    "matches": hits,
+                }
+            )
     if overlaps:
         return "OVERLAPPING", {"overlaps": overlaps}
 
@@ -346,17 +396,7 @@ def claim_task(
     takeover_approved: bool = False,
     via_handoff: bool = False,
 ) -> tuple[int, str, dict]:
-    """Claim a task. Returns (claim_id, classification, detail).
-
-    Governance rules:
-    - An open handoff reserves the task: normal claims are refused during the
-      HANDOFF AVAILABLE interval. Only the accept path (via_handoff) proceeds.
-    - BLOCKED (task held by an unexpired claim): refused unless the caller
-      presents an approved takeover (checked by the caller via gate).
-    - An expired holding claim is released here with an audit trail.
-    - CONFLICTING (branch collision): refused; requires releasing/approval.
-    - OVERLAPPING: refused unless explicitly overridden (recorded as such).
-    """
+    """Claim a task. Returns (claim_id, classification, detail)."""
     lock_task(conn, task_id)
     task = get_task(conn, task_id)
     agent_row = get_agent(conn, agent)
@@ -375,13 +415,19 @@ def claim_task(
                 """
                 INSERT INTO conflict_events
                     (repository_id, task_id, agent_id, classification, detail)
-                VALUES (%s, %s, %s, 'BLOCKED', %s)
+                VALUES (?, ?, ?, 'BLOCKED', ?)
                 """,
-                (task["repository_id"], task_id, agent_row["id"], Jsonb(detail)),
+                (
+                    task["repository_id"],
+                    task_id,
+                    agent_row["id"],
+                    json_dumps(detail),
+                ),
             )
             addressee = (
                 f" (addressed to {pending['to_agent']})"
-                if pending["to_agent"] else ""
+                if pending["to_agent"]
+                else ""
             )
             raise ClaimRefused(
                 f"Task {task_id} is reserved for open handoff "
@@ -393,26 +439,37 @@ def claim_task(
     displaced = None
     if holder:
         if holder["expired"]:
-            release_claim(conn, holder["id"], agent="", reason="lease_expired",
-                          enforce_owner=False)
+            release_claim(
+                conn,
+                holder["id"],
+                agent="",
+                reason="lease_expired",
+                enforce_owner=False,
+            )
         elif takeover_approved:
-            # Released only after the replacement claim passes every rule:
-            # a refused takeover must leave the holder untouched.
             displaced = holder
-        # else: classification below reports BLOCKED
 
     classification, detail = classify(
-        conn, task["repository_id"], task_id, branch, scope_globs,
+        conn,
+        task["repository_id"],
+        task_id,
+        branch,
+        scope_globs,
         exclude_claim_id=displaced["id"] if displaced else None,
     )
     conn.execute(
         """
         INSERT INTO conflict_events
             (repository_id, task_id, agent_id, classification, detail)
-        VALUES (%s, %s, %s, %s, %s)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (task["repository_id"], task_id, agent_row["id"], classification,
-         Jsonb(detail)),
+        (
+            task["repository_id"],
+            task_id,
+            agent_row["id"],
+            classification,
+            json_dumps(detail),
+        ),
     )
 
     if classification == "BLOCKED":
@@ -438,37 +495,54 @@ def claim_task(
         )
 
     if displaced:
-        release_claim(conn, displaced["id"], agent=agent,
-                      reason=f"takeover by {agent}", enforce_owner=False)
+        release_claim(
+            conn,
+            displaced["id"],
+            agent=agent,
+            reason=f"takeover by {agent}",
+            enforce_owner=False,
+        )
 
     row = conn.execute(
         """
         INSERT INTO claims (task_id, agent_id, branch, lease_expires_at)
-        VALUES (%s, %s, %s, now() + make_interval(secs => %s))
+        VALUES (?, ?, ?, unixepoch() + ?)
         RETURNING id
         """,
-        (task_id, agent_row["id"], branch, lease_hours * 3600),
+        (task_id, agent_row["id"], branch, int(lease_hours * 3600)),
     ).fetchone()
     assert row is not None
     claim_id = row[0]
     for glob in scope_globs:
         conn.execute(
-            "INSERT INTO scopes (claim_id, path_glob) VALUES (%s, %s)",
+            "INSERT INTO scopes (claim_id, path_glob) VALUES (?, ?)",
             (claim_id, glob),
         )
     set_task_status(conn, task_id, "claimed")
-    audit.record(conn, "claim.acquired", "claim", claim_id, agent=agent,
-                 detail={"task_id": task_id, "branch": branch,
-                         "scopes": scope_globs,
-                         "classification": classification,
-                         "override_overlap": classification == "OVERLAPPING"})
+    audit.record(
+        conn,
+        "claim.acquired",
+        "claim",
+        claim_id,
+        agent=agent,
+        detail={
+            "task_id": task_id,
+            "branch": branch,
+            "scopes": scope_globs,
+            "classification": classification,
+            "override_overlap": classification == "OVERLAPPING",
+        },
+    )
     return claim_id, classification, detail
 
 
 def renew_claim(
-    conn: Connection, claim_id: int, agent: str,
+    conn: Connection,
+    claim_id: int,
+    agent: str,
     lease_hours: float = DEFAULT_LEASE_HOURS,
 ) -> None:
+    begin_immediate(conn)
     claim = get_claim(conn, claim_id)
     if claim["released_at"] is not None:
         raise WorkError(f"Claim {claim_id} is already released.")
@@ -477,24 +551,28 @@ def renew_claim(
             f"Claim {claim_id} belongs to {claim['agent']}, not {agent}."
         )
     conn.execute(
-        """
-        UPDATE claims SET lease_expires_at = now() + make_interval(secs => %s)
-        WHERE id = %s
-        """,
-        (lease_hours * 3600, claim_id),
+        "UPDATE claims SET lease_expires_at = unixepoch() + ? WHERE id = ?",
+        (int(lease_hours * 3600), claim_id),
     )
-    audit.record(conn, "claim.renewed", "claim", claim_id, agent=agent,
-                 detail={"lease_hours": lease_hours})
+    audit.record(
+        conn,
+        "claim.renewed",
+        "claim",
+        claim_id,
+        agent=agent,
+        detail={"lease_hours": lease_hours},
+    )
 
 
 def release_claim(
-    conn: Connection, claim_id: int, agent: str, reason: str = "released",
+    conn: Connection,
+    claim_id: int,
+    agent: str,
+    reason: str = "released",
     enforce_owner: bool = True,
 ) -> None:
     claim = get_claim(conn, claim_id)
     lock_task(conn, claim["task_id"])
-    # Refresh after waiting for the task lock: another transaction may have
-    # completed the ownership transition while this caller was blocked.
     claim = get_claim(conn, claim_id)
     if claim["released_at"] is not None:
         raise WorkError(f"Claim {claim_id} is already released.")
@@ -503,18 +581,29 @@ def release_claim(
             f"Claim {claim_id} belongs to {claim['agent']}, not {agent}."
         )
     conn.execute(
-        "UPDATE claims SET released_at = now(), release_reason = %s WHERE id = %s",
+        "UPDATE claims SET released_at = unixepoch(), release_reason = ? WHERE id = ?",
         (reason, claim_id),
     )
     set_task_status(conn, claim["task_id"], "open")
-    audit.record(conn, "claim.released", "claim", claim_id,
-                 agent=agent or None, detail={"reason": reason})
+    audit.record(
+        conn,
+        "claim.released",
+        "claim",
+        claim_id,
+        agent=agent or None,
+        detail={"reason": reason},
+    )
 
 
 def add_checkpoint(
-    conn: Connection, claim_id: int, agent: str, commit_oid: str,
-    note: str = "", detail: dict | None = None,
+    conn: Connection,
+    claim_id: int,
+    agent: str,
+    commit_oid: str,
+    note: str = "",
+    detail: dict | None = None,
 ) -> int:
+    begin_immediate(conn)
     claim = get_claim(conn, claim_id)
     if claim["released_at"] is not None:
         raise WorkError(f"Claim {claim_id} is released; cannot checkpoint.")
@@ -527,11 +616,17 @@ def add_checkpoint(
     row = conn.execute(
         """
         INSERT INTO checkpoints (claim_id, commit_oid, note, detail)
-        VALUES (%s, %s, %s, %s) RETURNING id
+        VALUES (?, ?, ?, ?) RETURNING id
         """,
-        (claim_id, commit_oid, note, Jsonb(detail or {})),
+        (claim_id, commit_oid, note, json_dumps(detail or {})),
     ).fetchone()
     assert row is not None
-    audit.record(conn, "checkpoint.recorded", "claim", claim_id, agent=agent,
-                 detail={"commit": commit_oid, "note": note})
+    audit.record(
+        conn,
+        "checkpoint.recorded",
+        "claim",
+        claim_id,
+        agent=agent,
+        detail={"commit": commit_oid, "note": note},
+    )
     return row[0]
