@@ -113,15 +113,39 @@ def test_vote_threshold_and_deny(conn):
 
 
 def test_consume_approval_is_single_use(conn):
-    """The same approval payload cannot authorize two operations."""
+    """One approval instance cannot authorize two operations."""
     op = {"type": "protected_ref_update", "repository": "r", "n": 1}
     gate.request_approval(conn, op, requested_by="op")
     gate.vote(conn, gate.operation_hash(op), "op", True)
     assert gate.is_approved(conn, op)
     gate.consume_approval(conn, op, agent="pusher-1")
+    consumed = gate.get_approval(conn, gate.operation_hash(op))
+    assert consumed["status"] == "consumed"
+    assert consumed["consumed_at"] is not None
     assert not gate.is_approved(conn, op)
     with pytest.raises(gate.GateError, match="not consumable"):
         gate.consume_approval(conn, op, agent="pusher-2")
+
+
+def test_consumed_operation_can_be_approved_again(conn):
+    """A consumed exact takeover may be requested again as a new instance."""
+    op = {
+        "type": "lease_takeover",
+        "repository": "r",
+        "task_id": 7,
+        "from_agent": "a",
+        "to_agent": "b",
+    }
+    first = gate.request_approval(conn, op, requested_by="operator")
+    gate.vote(conn, gate.operation_hash(op), "operator", True)
+    gate.consume_approval(conn, op, agent="b")
+    assert gate.get_approval(conn, gate.operation_hash(op))["status"] == "consumed"
+
+    second = gate.request_approval(conn, op, requested_by="operator")
+    assert second["id"] != first["id"]
+    assert second["status"] == "pending"
+    gate.vote(conn, gate.operation_hash(op), "operator", True)
+    assert gate.is_approved(conn, op)
 
 
 def test_consume_approval_concurrent_single_winner(initialized_store):
@@ -170,7 +194,7 @@ def test_consume_approval_concurrent_single_winner(initialized_store):
         check = store.connect(initialized_store)
         try:
             approval = gate.get_approval(check, gate.operation_hash(op))
-            assert approval["status"] == "denied"
+            assert approval["status"] == "consumed"
             consumed = check.execute(
                 "SELECT count(*) FROM audit_events "
                 "WHERE event_type = 'approval.consumed' AND entity_id = ?",
