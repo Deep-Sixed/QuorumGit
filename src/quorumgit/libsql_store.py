@@ -9,10 +9,14 @@ bounded busy timeout, and explicit BEGIN IMMEDIATE governance transactions.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Iterator
 
-import libsql
+# libsql is a PyO3 extension whose published typing metadata does not expose
+# runtime attributes such as connect(). Keep that third-party typing gap at
+# this import boundary rather than weakening Pyright for the project.
+libsql: Any = import_module("libsql")
 
 DATABASE_FILENAME = "quorumgit.db"
 DEFAULT_BUSY_TIMEOUT_SECONDS = 5.0
