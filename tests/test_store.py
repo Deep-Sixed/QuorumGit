@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -56,6 +58,53 @@ def test_incomplete_store_fails_loud(tmp_path):
     conn.close()
     with pytest.raises(store.ContractViolation):
         store.verify_contract(cfg)
+
+
+def test_begin_immediate_waiter_acquires_after_holder_releases(initialized_store):
+    """A contended writer succeeds after release instead of timing out.
+
+    libsql 0.1.11's native busy handler can otherwise sleep for the whole
+    timeout and still raise after the holder has committed. This pins the
+    polling behavior in store.begin_immediate().
+    """
+    holder = store.connect(initialized_store)
+    waiter = store.connect(initialized_store)
+    acquired = threading.Event()
+    started = threading.Event()
+    errors: list[Exception] = []
+    elapsed: list[float] = []
+
+    store.begin_immediate(holder)
+
+    def contend() -> None:
+        started.set()
+        began = time.monotonic()
+        try:
+            store.begin_immediate(waiter, timeout_seconds=2.0)
+            elapsed.append(time.monotonic() - began)
+            acquired.set()
+            waiter.rollback()
+        except Exception as exc:
+            errors.append(exc)
+
+    try:
+        thread = threading.Thread(target=contend)
+        thread.start()
+        assert started.wait(timeout=1)
+        assert not acquired.wait(timeout=0.2), "waiter acquired before holder released"
+        holder.commit()
+        thread.join(timeout=3)
+        assert not thread.is_alive(), "waiter did not return after holder released"
+        assert not errors
+        assert acquired.is_set()
+        assert elapsed and elapsed[0] < 1.5
+    finally:
+        if holder.in_transaction:
+            holder.rollback()
+        if waiter.in_transaction:
+            waiter.rollback()
+        holder.close()
+        waiter.close()
 
 
 def test_single_store_no_external_mode():
