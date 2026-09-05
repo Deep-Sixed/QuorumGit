@@ -41,7 +41,7 @@ Everything an agent does — claim, renew, checkpoint, hand off, release — wri
 
 ## Installation
 
-Requirements: **Python 3.14**, **git**. PostgreSQL is *not* a prerequisite — QuorumGit embeds its own instance via [pg0](https://github.com/vectorize-io/pg0).
+Requirements: **Python 3.13 or 3.14**, **git**. PostgreSQL is *not* a prerequisite — QuorumGit embeds its own instance via [pg0](https://github.com/vectorize-io/pg0).
 
 ```bash
 # recommended: uv (editable, so a git pull updates the live tool)
@@ -249,7 +249,7 @@ ruff check src tests
 pyright
 ```
 
-Python 3.14.5. Tests run against a live throwaway pg0 instance and real Git repositories — nothing is mocked. The suite covers the full acceptance workflow (register → claim → isolate → block overlap → parallel work → checkpoint → handoff → accept → approval-gated takeover → audit → restart survival), real-push hook enforcement, concurrent voting/consumption/resolution races, and a branding gate that keeps application code free of any identity other than QuorumGit.
+Python 3.13 or 3.14. Tests run against a live throwaway pg0 instance and real Git repositories — nothing is mocked. The suite covers the full acceptance workflow (register → claim → isolate → block overlap → parallel work → checkpoint → handoff → accept → approval-gated takeover → audit → restart survival), real-push hook enforcement, concurrent voting/consumption/resolution races, and a branding gate that keeps application code free of any identity other than QuorumGit.
 
 ## License
 
