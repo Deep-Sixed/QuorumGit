@@ -1,30 +1,44 @@
-"""The single persistent store: an application-owned pg0 PostgreSQL instance.
+"""QuorumGit's single persistent store: one local libSQL database file.
 
-There is exactly one storage backend and one operational mode. If pg0, the
-database, or a required extension is unavailable, every operation fails
-loudly with a non-zero exit. There is no fallback store and no external-
-database mode.
+There is exactly one storage backend and one operational mode. The database is
+owned by QuorumGit under QUORUMGIT_DATA_DIR; there is no PostgreSQL service,
+external connection string, fallback store, or degraded mode.
 """
 
 from __future__ import annotations
 
-import hashlib
-import subprocess
-import tempfile
-import urllib.request
-from importlib import resources
+import json
+import time
+from importlib import import_module, resources
 from pathlib import Path
-from typing import LiteralString, cast
+from typing import Any
 
-import psycopg
-from psycopg import sql
+from .config import Config
 
-from .config import DATABASE_NAME, Config
+# libsql is a PyO3 extension whose runtime exports are not fully represented in
+# its published typing metadata. Keep the third-party typing gap at this one
+# boundary rather than weakening Pyright for the project.
+libsql: Any = import_module("libsql")
+Connection = Any
 
-REQUIRED_EXTENSIONS = ("pg_jsonschema", "pgcrypto")
+DATABASE_FILENAME = "quorumgit.db"
+DEFAULT_BUSY_TIMEOUT_SECONDS = 5.0
+
+# libSQL 0.1.11's busy handler does not wake when a write lock is released: a
+# contended BEGIN IMMEDIATE sleeps for the whole PRAGMA busy_timeout and then
+# raises "database is locked", even if the holder committed immediately after
+# the attempt began. A long busy_timeout therefore only delays a guaranteed
+# failure. Instead each attempt fails fast and begin_immediate() polls until
+# DEFAULT_BUSY_TIMEOUT_SECONDS, which does observe the release.
+LOCK_POLL_TIMEOUT_MS = 50
+LOCK_RETRY_INITIAL_SECONDS = 0.002
+LOCK_RETRY_MAX_SECONDS = 0.05
+MIGRATION_SEPARATOR = "-- quorumgit-statement"
+
 REQUIRED_TABLES = (
     "schema_migrations",
     "repositories",
+    "protected_refs",
     "agents",
     "tasks",
     "claims",
@@ -38,21 +52,6 @@ REQUIRED_TABLES = (
     "audit_events",
 )
 
-# pg_jsonschema is not bundled with pg0; it is installed as a three-file
-# drop-in extracted from the pinned upstream release artifact. The files land
-# inside pg0's versioned installation directory, so a pg0/PostgreSQL upgrade
-# silently removes them — provisioning is idempotent and re-run by `init`,
-# and the contract check fails loudly whenever the extension is missing.
-PG_JSONSCHEMA_VERSION = "0.3.4"
-PG_JSONSCHEMA_DEB_URL = (
-    "https://github.com/supabase/pg_jsonschema/releases/download/"
-    f"v{PG_JSONSCHEMA_VERSION}/pg_jsonschema-v{PG_JSONSCHEMA_VERSION}"
-    "-pg18-amd64-linux-gnu.deb"
-)
-PG_JSONSCHEMA_DEB_SHA256 = (
-    "5c7fe6c810835e4242fb0365b57581c0009b0155200dd4f1266cee434295732f"
-)
-
 
 class StoreError(RuntimeError):
     pass
@@ -62,178 +61,173 @@ class ContractViolation(StoreError):
     pass
 
 
+# ---------------------------------------------------------------- connection
+
+
+def database_path(cfg: Config) -> Path:
+    return cfg.data_dir / DATABASE_FILENAME
+
+
+def _cfg_for_target(target: Config | str | Path) -> Config:
+    if isinstance(target, Config):
+        return target
+    path = Path(target)
+    return Config(data_dir=path.parent, agent=None)
+
+
+def _configure_connection(conn: Connection, _timeout_seconds: float) -> None:
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute(f"PRAGMA busy_timeout = {LOCK_POLL_TIMEOUT_MS}")
+
+    foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    if foreign_keys != 1:
+        raise ContractViolation("libSQL connection did not enable foreign keys")
+    if journal_mode != "wal":
+        raise ContractViolation(
+            f"libSQL connection did not enter WAL mode: {journal_mode!r}"
+        )
+    if busy_timeout != LOCK_POLL_TIMEOUT_MS:
+        raise ContractViolation("libSQL connection did not apply busy_timeout")
+
+
+def open_connection(
+    cfg: Config, *, timeout_seconds: float = DEFAULT_BUSY_TIMEOUT_SECONDS
+) -> Connection:
+    """Open the local database without requiring an already-applied schema."""
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be greater than zero")
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    conn: Connection | None = None
+    try:
+        conn = libsql.connect(
+            str(database_path(cfg)),
+            timeout=timeout_seconds,
+            isolation_level="IMMEDIATE",
+        )
+        _configure_connection(conn, timeout_seconds)
+        return conn
+    except Exception as exc:
+        if conn is not None:
+            conn.close()
+        if isinstance(exc, StoreError):
+            raise
+        raise StoreError(f"Cannot open local libSQL store: {exc}") from exc
+
+
+def connect(cfg: Config) -> Connection:
+    """Open a normal connection and fail loudly unless the contract is valid."""
+    if not database_path(cfg).exists():
+        raise StoreError("Store is not initialized. Run `quorumgit init` first.")
+    conn = open_connection(cfg)
+    try:
+        verify_contract(conn)
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def _is_locked_error(exc: Exception) -> bool:
+    return "locked" in str(exc).lower() or "busy" in str(exc).lower()
+
+
+def begin_immediate(
+    conn: Connection, *, timeout_seconds: float = DEFAULT_BUSY_TIMEOUT_SECONDS
+) -> None:
+    """Acquire the single-writer reservation before governance reads.
+
+    Polls rather than issuing one blocking BEGIN: see LOCK_POLL_TIMEOUT_MS for
+    why libSQL's own busy handler cannot be relied on to wait here. Raises
+    StoreError once timeout_seconds elapses so a contended governance command
+    fails loudly instead of proceeding without the reservation.
+    """
+    if conn.in_transaction:
+        return
+    deadline = time.monotonic() + timeout_seconds
+    delay = LOCK_RETRY_INITIAL_SECONDS
+    while True:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            return
+        except Exception as exc:
+            if not _is_locked_error(exc):
+                raise
+            if time.monotonic() >= deadline:
+                raise StoreError(
+                    "Could not acquire the store write lock within "
+                    f"{timeout_seconds:g}s; another quorumgit command is "
+                    "holding it. Retry once it finishes."
+                ) from exc
+            time.sleep(delay)
+            delay = min(delay * 2, LOCK_RETRY_MAX_SECONDS)
+
+
 # ---------------------------------------------------------------- lifecycle
 
 
-def _pg0_handle(cfg: Config):
-    from pg0 import Pg0
-
-    cfg.pg_data_dir.mkdir(parents=True, exist_ok=True)
-    return Pg0(
-        name=cfg.pg_instance,
-        port=cfg.pg_port,
-        database=DATABASE_NAME,
-        data_dir=str(cfg.pg_data_dir),
-    )
-
-
 def ensure_running(cfg: Config) -> str:
-    """Start (or reuse) the pg0 instance and return the database URL."""
-    from pg0 import Pg0AlreadyRunningError, Pg0Error
+    """Compatibility name: ensure the local state directory exists.
 
-    pg = _pg0_handle(cfg)
-    try:
-        pg.start()
-    except Pg0AlreadyRunningError:
-        pass
-    except Pg0Error as exc:
-        raise StoreError(f"pg0 failed to start: {exc}") from exc
-    _ensure_database(pg)
-    uri = pg.uri
-    if not uri:
-        raise StoreError("pg0 reported no connection URI after start.")
-    return uri
+    libSQL is embedded and has no server process to start. The returned string
+    is the local database path retained for the pre-cutover CLI call shape.
+    """
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    return str(database_path(cfg))
 
 
-def instance_status(cfg: Config) -> dict:
-    from pg0 import Pg0NotFoundError, Pg0NotRunningError
-
-    pg = _pg0_handle(cfg)
-    # This pg0 version reports a stopped/absent instance through the returned
-    # InstanceInfo (running=False, uri=None) rather than by raising; the
-    # exception arms are kept for older/other pg0 releases.
-    try:
-        info = pg.info()
-    except (Pg0NotRunningError, Pg0NotFoundError):
-        return {"running": False}
-    if not getattr(info, "running", False) or not info.uri:
-        return {"running": False}
-    return {"running": True, "uri": info.uri, "port": info.port}
+def provision_extensions(_target: object) -> None:
+    """No-op compatibility hook: libSQL requires no external extensions."""
 
 
-def stop(cfg: Config) -> None:
-    from pg0 import Pg0NotRunningError
+def stop(_cfg: Config) -> None:
+    """No-op compatibility hook: an embedded libSQL store has no daemon."""
 
-    try:
-        _pg0_handle(cfg).stop()
-    except Pg0NotRunningError:
-        pass
+
+def instance_status(cfg: Config) -> dict[str, Any]:
+    path = database_path(cfg)
+    exists = path.exists()
+    return {
+        "exists": exists,
+        "path": str(path),
+        # Compatibility keys consumed by the existing CLI until its cleanup PR.
+        "running": exists,
+        "uri": str(path) if exists else None,
+    }
 
 
 def destroy(cfg: Config) -> None:
-    """Stop the instance and delete its data. Irreversible."""
-    import pg0 as pg0mod
-    from pg0 import Pg0NotFoundError, Pg0NotRunningError
-
-    try:
-        _pg0_handle(cfg).stop()
-    except (Pg0NotRunningError, Pg0NotFoundError):
-        pass
-    try:
-        pg0mod.drop(cfg.pg_instance, force=True)
-    except Pg0NotFoundError:
-        pass
-
-
-def _ensure_database(pg) -> None:
-    """Create the application database if the instance predates it."""
-    admin_uri = pg.uri.rsplit("/", 1)[0] + "/postgres"
-    with psycopg.connect(admin_uri, autocommit=True) as conn:
-        exists = conn.execute(
-            "SELECT 1 FROM pg_database WHERE datname = %s", (DATABASE_NAME,)
-        ).fetchone()
-        if not exists:
-            conn.execute(
-                sql.SQL("CREATE DATABASE {}").format(sql.Identifier(DATABASE_NAME))
-            )
-
-
-# ---------------------------------------------------------------- extensions
-
-
-def _pg0_installation_dir() -> Path:
-    root = Path.home() / ".pg0" / "installation"
-    versions = sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
-    if not versions:
-        raise StoreError(f"No pg0 PostgreSQL installation found under {root}")
-    return versions[-1]
-
-
-def _install_pg_jsonschema_dropin() -> None:
-    install = _pg0_installation_dir()
-    lib_dir = install / "lib"
-    ext_dir = install / "share" / "extension"
-    if not lib_dir.is_dir() or not ext_dir.is_dir():
-        raise StoreError(f"Unexpected pg0 installation layout at {install}")
-
-    with tempfile.TemporaryDirectory(prefix="quorumgit-ext-") as tmp:
-        tmp_path = Path(tmp)
-        deb = tmp_path / "pg_jsonschema.deb"
+    """Delete the local store and SQLite sidecars. Irreversible."""
+    path = database_path(cfg)
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
         try:
-            urllib.request.urlretrieve(PG_JSONSCHEMA_DEB_URL, deb)
-        except OSError as exc:
-            raise StoreError(
-                "pg_jsonschema is not installed and the pinned artifact could "
-                f"not be downloaded from {PG_JSONSCHEMA_DEB_URL}: {exc}"
-            ) from exc
-        digest = hashlib.sha256(deb.read_bytes()).hexdigest()
-        if digest != PG_JSONSCHEMA_DEB_SHA256:
-            raise StoreError(
-                "pg_jsonschema artifact checksum mismatch: "
-                f"expected {PG_JSONSCHEMA_DEB_SHA256}, got {digest}. "
-                "Refusing to install."
-            )
-        extracted = tmp_path / "extracted"
-        result = subprocess.run(
-            ["dpkg-deb", "-x", str(deb), str(extracted)],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise StoreError(f"dpkg-deb extraction failed: {result.stderr.strip()}")
-
-        so_files = list(extracted.rglob("pg_jsonschema.so"))
-        control_files = list(extracted.rglob("pg_jsonschema*.control")) + list(
-            extracted.rglob("pg_jsonschema--*.sql")
-        )
-        if not so_files or not control_files:
-            raise StoreError("Extension artifact did not contain the expected files.")
-        # Atomic per-file install: write beside the target, then rename.
-        for src, dest_dir in [(f, lib_dir) for f in so_files] + [
-            (f, ext_dir) for f in control_files
-        ]:
-            staged = dest_dir / (src.name + ".staged")
-            staged.write_bytes(src.read_bytes())
-            staged.replace(dest_dir / src.name)
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
 
 
-def provision_extensions(uri: str) -> None:
-    with psycopg.connect(uri, autocommit=True) as conn:
-        available = {
-            row[0]
-            for row in conn.execute("SELECT name FROM pg_available_extensions")
-        }
-        if "pg_jsonschema" not in available:
-            _install_pg_jsonschema_dropin()
-        for ext in REQUIRED_EXTENSIONS:
-            try:
-                conn.execute(
-                    sql.SQL("CREATE EXTENSION IF NOT EXISTS {}").format(
-                        sql.Identifier(ext)
-                    )
-                )
-            except psycopg.Error as exc:
-                raise StoreError(
-                    f"Required extension {ext!r} could not be installed: {exc}"
-                ) from exc
+# ------------------------------------------------------------------- JSON
+
+
+def json_dumps(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def json_loads(value: str | bytes | bytearray | None, default: Any) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8")
+    return json.loads(value)
 
 
 # ---------------------------------------------------------------- migrations
 
 
-def migrate(uri: str) -> list[str]:
-    """Apply pending SQL migrations in filename order. Returns applied names."""
-    migration_files = sorted(
+def _migration_files() -> list[Any]:
+    return sorted(
         (
             f
             for f in resources.files("quorumgit.migrations").iterdir()
@@ -241,72 +235,104 @@ def migrate(uri: str) -> list[str]:
         ),
         key=lambda f: f.name,
     )
+
+
+def _migration_statements(text: str) -> list[str]:
+    return [chunk.strip() for chunk in text.split(MIGRATION_SEPARATOR) if chunk.strip()]
+
+
+def migrate(target: Config | str | Path) -> list[str]:
+    """Apply pending libSQL migrations in filename order."""
+    cfg = _cfg_for_target(target)
+    conn = open_connection(cfg)
     applied: list[str] = []
-    with psycopg.connect(uri) as conn:
+    try:
+        begin_immediate(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version TEXT PRIMARY KEY,
-                applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                applied_at INTEGER NOT NULL DEFAULT (unixepoch())
             )
             """
         )
+        conn.commit()
+
         done = {
-            row[0] for row in conn.execute("SELECT version FROM schema_migrations")
+            row[0]
+            for row in conn.execute(
+                "SELECT version FROM schema_migrations"
+            ).fetchall()
         }
-        for mig in migration_files:
+        for mig in _migration_files():
             if mig.name in done:
                 continue
-            conn.execute(cast(LiteralString, mig.read_text(encoding="utf-8")))
-            conn.execute(
-                "INSERT INTO schema_migrations (version) VALUES (%s)", (mig.name,)
-            )
+            begin_immediate(conn)
+            try:
+                for statement in _migration_statements(
+                    mig.read_text(encoding="utf-8")
+                ):
+                    conn.execute(statement)
+                conn.execute(
+                    "INSERT INTO schema_migrations (version) VALUES (?)",
+                    (mig.name,),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
             applied.append(mig.name)
-        conn.commit()
-    return applied
+        return applied
+    except Exception as exc:
+        if isinstance(exc, StoreError):
+            raise
+        raise StoreError(f"Migration failed: {exc}") from exc
+    finally:
+        conn.close()
 
 
 # ------------------------------------------------------------ contract check
 
 
-def verify_contract(uri: str) -> None:
-    """Fail loudly unless the store satisfies the full runtime contract."""
-    try:
-        with psycopg.connect(uri) as conn:
-            installed = {
-                row[0] for row in conn.execute("SELECT extname FROM pg_extension")
-            }
-            missing_ext = set(REQUIRED_EXTENSIONS) - installed
-            if missing_ext:
-                raise ContractViolation(
-                    f"Missing required extensions: {sorted(missing_ext)}. "
-                    "Run `quorumgit init` to provision them."
-                )
-            tables = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-                )
-            }
-            missing_tables = set(REQUIRED_TABLES) - tables
-            if missing_tables:
-                raise ContractViolation(
-                    f"Missing required tables: {sorted(missing_tables)}. "
-                    "Run `quorumgit init` to apply migrations."
-                )
-            row = conn.execute(
-                "SELECT jsonb_matches_schema('{\"type\":\"object\"}'::json, '{}'::jsonb)"
-            ).fetchone()
-            if row is None or row[0] is not True:
-                raise ContractViolation("jsonb_matches_schema is not functional.")
-    except psycopg.Error as exc:
-        raise StoreError(f"Store is unreachable: {exc}") from exc
+def verify_contract(target: Config | Connection | str | Path) -> None:
+    """Fail loudly unless the local store satisfies the runtime contract."""
+    owned = isinstance(target, (Config, str, Path))
+    if owned:
+        cfg = _cfg_for_target(target)
+        if not database_path(cfg).exists():
+            raise StoreError("Store is not initialized. Run `quorumgit init` first.")
+        conn = open_connection(cfg)
+    else:
+        conn = target
 
-
-def connect(cfg: Config) -> psycopg.Connection:
-    """Connection for normal operations: store must be up and contract-valid."""
-    uri = ensure_running(cfg)
     try:
-        return psycopg.connect(uri)
-    except psycopg.Error as exc:
-        raise StoreError(f"Cannot connect to the store: {exc}") from exc
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        missing = set(REQUIRED_TABLES) - tables
+        if missing:
+            raise ContractViolation(
+                f"Missing required tables: {sorted(missing)}. "
+                "Run `quorumgit init` to apply migrations."
+            )
+
+        foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+        journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        if foreign_keys != 1:
+            raise ContractViolation("foreign_keys is not enabled on this connection")
+        if journal_mode != "wal":
+            raise ContractViolation(f"journal_mode is {journal_mode!r}, expected 'wal'")
+
+        json_ok = conn.execute("SELECT json_valid('{}')").fetchone()
+        if json_ok is None or json_ok[0] != 1:
+            raise ContractViolation("SQLite JSON functions are not functional")
+    except StoreError:
+        raise
+    except Exception as exc:
+        raise StoreError(f"Store contract check failed: {exc}") from exc
+    finally:
+        if owned:
+            conn.close()

@@ -1,4 +1,4 @@
-"""Phase 3: approval gate and pre-receive enforcement against real pushes."""
+"""Approval gate and pre-receive enforcement against real pushes."""
 
 from __future__ import annotations
 
@@ -10,10 +10,9 @@ import time
 import uuid
 from pathlib import Path
 
-import psycopg
 import pytest
 
-from quorumgit import gate, registry, work
+from quorumgit import gate, registry, store, work
 from tests.conftest import make_git_repo
 
 
@@ -23,11 +22,15 @@ def _setup(committed_conn, tmp_path):
     suffix = uuid.uuid4().hex[:8]
     seed = make_git_repo(tmp_path / "seed")
     hub = tmp_path / "hub.git"
-    subprocess.run(["git", "clone", "--bare", str(seed), str(hub)],
-                   check=True, capture_output=True)
+    subprocess.run(
+        ["git", "clone", "--bare", str(seed), str(hub)],
+        check=True,
+        capture_output=True,
+    )
     repo_name = f"hub-{suffix}"
-    registry.add_repository(conn, repo_name, hub,
-                            protected_refs=["refs/heads/main"])
+    registry.add_repository(
+        conn, repo_name, hub, protected_refs=["refs/heads/main"]
+    )
     a, b = f"agent-a-{suffix}", f"agent-b-{suffix}"
     registry.add_agent(conn, a)
     registry.add_agent(conn, b)
@@ -35,41 +38,50 @@ def _setup(committed_conn, tmp_path):
     conn.commit()
 
     clone = tmp_path / "clone"
-    subprocess.run(["git", "clone", str(hub), str(clone)],
-                   check=True, capture_output=True)
+    subprocess.run(
+        ["git", "clone", str(hub), str(clone)], check=True, capture_output=True
+    )
     return repo_name, hub, clone, a, b
 
 
 def _push(clone: Path, agent: str | None, *refspec: str, cfg=None):
     env = {
         **os.environ,
-        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@localhost",
-        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@localhost",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@localhost",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@localhost",
     }
     env.pop("QUORUMGIT_AGENT", None)
     if agent:
         env["QUORUMGIT_AGENT"] = agent
     if cfg:
         env["QUORUMGIT_DATA_DIR"] = str(cfg.data_dir)
-        env["QUORUMGIT_PG_INSTANCE"] = cfg.pg_instance
-        env["QUORUMGIT_PG_PORT"] = str(cfg.pg_port)
         env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env["PATH"]
     return subprocess.run(
         ["git", "-C", str(clone), "push", "origin", *refspec],
-        capture_output=True, text=True, env=env,
+        capture_output=True,
+        text=True,
+        env=env,
     )
 
 
 def _commit(clone: Path, filename: str, branch: str | None = None):
     env = {
         **os.environ,
-        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@localhost",
-        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@localhost",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@localhost",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@localhost",
     }
 
     def git(*args):
-        subprocess.run(["git", "-C", str(clone), *args], check=True,
-                       capture_output=True, env=env)
+        subprocess.run(
+            ["git", "-C", str(clone), *args],
+            check=True,
+            capture_output=True,
+            env=env,
+        )
 
     if branch:
         git("checkout", "-B", branch)
@@ -101,34 +113,61 @@ def test_vote_threshold_and_deny(conn):
 
 
 def test_consume_approval_is_single_use(conn):
-    """The same approval payload cannot authorize two operations."""
+    """One approval instance cannot authorize two operations."""
     op = {"type": "protected_ref_update", "repository": "r", "n": 1}
     gate.request_approval(conn, op, requested_by="op")
     gate.vote(conn, gate.operation_hash(op), "op", True)
     assert gate.is_approved(conn, op)
     gate.consume_approval(conn, op, agent="pusher-1")
+    consumed = gate.get_approval(conn, gate.operation_hash(op))
+    assert consumed["status"] == "consumed"
+    assert consumed["consumed_at"] is not None
     assert not gate.is_approved(conn, op)
-    # A second consume of the identical payload must fail, not silently pass.
     with pytest.raises(gate.GateError, match="not consumable"):
         gate.consume_approval(conn, op, agent="pusher-2")
 
 
+def test_consumed_operation_can_be_approved_again(conn):
+    """A consumed exact takeover may be requested again as a new instance."""
+    op = {
+        "type": "lease_takeover",
+        "repository": "r",
+        "task_id": 7,
+        "from_agent": "a",
+        "to_agent": "b",
+    }
+    first = gate.request_approval(conn, op, requested_by="operator")
+    gate.vote(conn, gate.operation_hash(op), "operator", True)
+    gate.consume_approval(conn, op, agent="b")
+    assert gate.get_approval(conn, gate.operation_hash(op))["status"] == "consumed"
+
+    second = gate.request_approval(conn, op, requested_by="operator")
+    assert second["id"] != first["id"]
+    assert second["status"] == "pending"
+    gate.vote(conn, gate.operation_hash(op), "operator", True)
+    assert gate.is_approved(conn, op)
+
+
 def test_consume_approval_concurrent_single_winner(initialized_store):
-    """Two live connections race to consume one approval; exactly one wins.
+    """Two real libSQL connections race to consume one approval; one wins.
 
-    The second consumer is already in flight (blocked on the FOR UPDATE row
-    lock) before the first commits, so this exercises genuine concurrency,
-    not sequential reuse.
+    The second consumer is already in flight and blocked on SQLite's writer
+    reservation before the first commits. This preserves the original genuine
+    two-connection race while asserting BEGIN IMMEDIATE semantics.
     """
-    op = {"type": "protected_ref_update", "repository": "race-repo",
-          "n": uuid.uuid4().hex}
-    with psycopg.connect(initialized_store) as setup:
-        gate.request_approval(setup, op, requested_by="op")
-        gate.vote(setup, gate.operation_hash(op), "op", True)
-        setup.commit()
+    op = {
+        "type": "protected_ref_update",
+        "repository": "race-repo",
+        "n": uuid.uuid4().hex,
+    }
+    setup = store.connect(initialized_store)
+    gate.request_approval(setup, op, requested_by="op")
+    gate.vote(setup, gate.operation_hash(op), "op", True)
+    setup.commit()
+    setup.close()
 
-    conn1 = psycopg.connect(initialized_store)
-    conn2 = psycopg.connect(initialized_store)
+    conn1 = store.connect(initialized_store)
+    conn2 = store.connect(initialized_store)
     racer_error: list[Exception] = []
     racer_started = threading.Event()
 
@@ -142,47 +181,59 @@ def test_consume_approval_concurrent_single_winner(initialized_store):
             conn2.rollback()
 
     try:
-        # First consumer holds the row lock, uncommitted.
         gate.consume_approval(conn1, op, agent="pusher-1")
         thread = threading.Thread(target=racer)
         thread.start()
         racer_started.wait(timeout=10)
-        time.sleep(0.5)  # let the racer block on the row lock
-        conn1.commit()  # release the lock; the racer must now lose
+        time.sleep(0.5)
+        conn1.commit()
         thread.join(timeout=30)
         assert not thread.is_alive(), "second consumer never returned"
         assert racer_error, "both consumers succeeded — approval used twice"
 
-        with psycopg.connect(initialized_store) as check:
+        check = store.connect(initialized_store)
+        try:
             approval = gate.get_approval(check, gate.operation_hash(op))
-            assert approval["status"] == "denied"
+            assert approval["status"] == "consumed"
             consumed = check.execute(
                 "SELECT count(*) FROM audit_events "
-                "WHERE event_type = 'approval.consumed' AND entity_id = %s",
+                "WHERE event_type = 'approval.consumed' AND entity_id = ?",
                 (approval["id"],),
             ).fetchone()
             assert consumed is not None and consumed[0] == 1
+        finally:
+            check.close()
     finally:
         conn1.close()
         conn2.close()
 
 
 def test_hook_protected_ref_requires_approval(committed_conn, tmp_path, cfg):
-    repo_name, hub, clone, a, b = _setup(committed_conn, tmp_path)
+    repo_name, hub, clone, a, _b = _setup(committed_conn, tmp_path)
     _commit(clone, "newfile.txt")
     result = _push(clone, a, "main", cfg=cfg)
     assert result.returncode != 0
     assert "requires an approval" in result.stderr
 
-    # approve the exact update, then it lands
     oldrev = subprocess.run(
         ["git", "--git-dir", str(hub), "rev-parse", "refs/heads/main"],
-        capture_output=True, text=True, check=True).stdout.strip()
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
     newrev = subprocess.run(
         ["git", "-C", str(clone), "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=True).stdout.strip()
-    op = {"type": "protected_ref_update", "repository": repo_name,
-          "refname": "refs/heads/main", "oldrev": oldrev, "newrev": newrev}
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    op = {
+        "type": "protected_ref_update",
+        "repository": repo_name,
+        "refname": "refs/heads/main",
+        "oldrev": oldrev,
+        "newrev": newrev,
+    }
     gate.request_approval(committed_conn, op, requested_by="operator")
     gate.vote(committed_conn, gate.operation_hash(op), "operator", True)
     committed_conn.commit()
@@ -190,21 +241,22 @@ def test_hook_protected_ref_requires_approval(committed_conn, tmp_path, cfg):
     result = _push(clone, a, "main", cfg=cfg)
     assert result.returncode == 0, result.stderr
 
-    # the approval was consumed: replaying the same update is refused
-    subprocess.run(["git", "-C", str(clone), "reset", "--hard", oldrev],
-                   check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(clone), "reset", "--hard", oldrev],
+        check=True,
+        capture_output=True,
+    )
     force = _push(clone, a, "+main", cfg=cfg)
-    assert force.returncode != 0  # force update needs its own approval
+    assert force.returncode != 0
 
 
-def test_hook_claimed_branch_rejects_other_agents(
-    committed_conn, tmp_path, cfg
-):
+def test_hook_claimed_branch_rejects_other_agents(committed_conn, tmp_path, cfg):
     conn = committed_conn
-    repo_name, hub, clone, a, b = _setup(conn, tmp_path)
+    repo_name, _hub, clone, a, b = _setup(conn, tmp_path)
     task = work.create_task(conn, repo_name, "guarded work")
-    work.claim_task(conn, task, a, branch="feat/guarded",
-                    scope_globs=["src/**"])
+    work.claim_task(
+        conn, task, a, branch="feat/guarded", scope_globs=["src/**"]
+    )
     conn.commit()
 
     _commit(clone, "src/change.py", branch="feat/guarded")
@@ -218,7 +270,6 @@ def test_hook_claimed_branch_rejects_other_agents(
     owner = _push(clone, a, "feat/guarded", cfg=cfg)
     assert owner.returncode == 0, owner.stderr
 
-    # unclaimed branches remain open to anyone
     _commit(clone, "docs/free.md", branch="feat/free")
     free = _push(clone, b, "feat/free", cfg=cfg)
     assert free.returncode == 0, free.stderr

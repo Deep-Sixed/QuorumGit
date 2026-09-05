@@ -11,13 +11,22 @@ permissions:
 
 jobs:
   test:
-    name: Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.11", "3.14"]
+        exclude:
+          # libsql 0.1.11 publishes a cp314 wheel for manylinux only. On
+          # Windows pip falls back to the sdist and the Rust extension build
+          # fails on the runner, so this combination cannot be gated until
+          # upstream ships a cp314 win_amd64 wheel. macOS + 3.14 also builds
+          # from source, but succeeds (~2 min), so it stays in the matrix.
+          - os: windows-latest
+            python-version: "3.14"
 
     steps:
       - name: Checkout

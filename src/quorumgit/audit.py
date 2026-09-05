@@ -5,8 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from psycopg import Connection
-from psycopg.types.json import Jsonb
+from .store import Connection, json_dumps, json_loads
 
 
 def record(
@@ -20,9 +19,9 @@ def record(
     conn.execute(
         """
         INSERT INTO audit_events (event_type, entity, entity_id, agent, detail)
-        VALUES (%s, %s, %s, %s, %s)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (event_type, entity, entity_id, agent, Jsonb(detail or {})),
+        (event_type, entity, entity_id, agent, json_dumps(detail or {})),
     )
 
 
@@ -35,13 +34,23 @@ def events(
     query = """
         SELECT id, event_type, entity, entity_id, agent, detail, created_at
         FROM audit_events
-        WHERE (%s::text IS NULL OR entity = %s)
-          AND (%s::bigint IS NULL OR entity_id = %s)
+        WHERE (? IS NULL OR entity = ?)
+          AND (? IS NULL OR entity_id = ?)
         ORDER BY id DESC
-        LIMIT %s
+        LIMIT ?
     """
     rows = conn.execute(
         query, (entity, entity, entity_id, entity_id, limit)
     ).fetchall()
-    keys = ("id", "event_type", "entity", "entity_id", "agent", "detail", "created_at")
-    return [dict(zip(keys, row)) for row in rows]
+    return [
+        {
+            "id": row[0],
+            "event_type": row[1],
+            "entity": row[2],
+            "entity_id": row[3],
+            "agent": row[4],
+            "detail": json_loads(row[5], {}),
+            "created_at": row[6],
+        }
+        for row in rows
+    ]

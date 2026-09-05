@@ -40,7 +40,11 @@ def test_scope_overlap_requires_acknowledgment(conn, git_repo):
     with pytest.raises(work.ClaimRefused, match="overlap"):
         work.claim_task(conn, t2, b, branch="feat/y", scope_globs=["src/app*"])
     claim_id, classification, _ = work.claim_task(
-        conn, t2, b, branch="feat/y", scope_globs=["src/app*"],
+        conn,
+        t2,
+        b,
+        branch="feat/y",
+        scope_globs=["src/app*"],
         override_overlap=True,
     )
     assert classification == "OVERLAPPING"
@@ -71,12 +75,16 @@ def test_expired_lease_is_reclaimable(conn, git_repo):
     repo, a, b = _setup(conn, git_repo)
     task = work.create_task(conn, repo, "expiring")
     claim_id, _, _ = work.claim_task(
-        conn, task, a, branch="feat/x", scope_globs=["src/**"],
+        conn,
+        task,
+        a,
+        branch="feat/x",
+        scope_globs=["src/**"],
         lease_hours=0.0001,
     )
     conn.execute(
-        "UPDATE claims SET lease_expires_at = now() - interval '1 minute' "
-        "WHERE id = %s", (claim_id,),
+        "UPDATE claims SET lease_expires_at = unixepoch() - 60 WHERE id = ?",
+        (claim_id,),
     )
     new_claim, classification, _ = work.claim_task(
         conn, task, b, branch="feat/z", scope_globs=["src/**"]
@@ -106,15 +114,17 @@ def test_worktree_isolation(conn, git_repo, cfg):
     repo, a, b = _setup(conn, git_repo)
     t1 = work.create_task(conn, repo, "task one")
     t2 = work.create_task(conn, repo, "task two")
-    c1, _, _ = work.claim_task(conn, t1, a, branch="feat/one",
-                               scope_globs=["src/**"])
-    c2, _, _ = work.claim_task(conn, t2, b, branch="feat/two",
-                               scope_globs=["docs/**"])
+    c1, _, _ = work.claim_task(
+        conn, t1, a, branch="feat/one", scope_globs=["src/**"]
+    )
+    c2, _, _ = work.claim_task(
+        conn, t2, b, branch="feat/two", scope_globs=["docs/**"]
+    )
     w1 = trees.create_worktree(conn, c1, cfg.worktrees_dir)
     w2 = trees.create_worktree(conn, c2, cfg.worktrees_dir)
     assert w1["path"] != w2["path"]
     assert trees.head_commit(w1["path"]) == trees.head_commit(w2["path"])
-    # checkpoints record the worktree's HEAD
-    cp = work.add_checkpoint(conn, c1, a, trees.head_commit(w1["path"]),
-                             note="start")
+    cp = work.add_checkpoint(
+        conn, c1, a, trees.head_commit(w1["path"]), note="start"
+    )
     assert cp
