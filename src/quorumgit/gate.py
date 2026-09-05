@@ -38,56 +38,83 @@ def operation_hash(operation: dict[str, Any]) -> str:
     return stable_hash(operation)
 
 
-def request_approval(
-    conn: Connection,
-    operation: dict[str, Any],
-    requested_by: str,
-    threshold: int = DEFAULT_THRESHOLD,
-) -> dict:
-    """Create (or return the existing) approval request for an operation."""
-    op_hash = operation_hash(operation)
-    row = conn.execute(
-        """
-        INSERT INTO approvals (operation_hash, operation, threshold)
-        VALUES (?, ?, ?)
-        ON CONFLICT (operation_hash) DO NOTHING
-        RETURNING id
-        """,
-        (op_hash, json_dumps(operation), threshold),
-    ).fetchone()
-    if row:
-        audit.record(
-            conn,
-            "approval.requested",
-            "approval",
-            row[0],
-            agent=requested_by,
-            detail={"operation": operation, "hash": op_hash},
-        )
-    return get_approval(conn, op_hash)
-
-
-def get_approval(conn: Connection, op_hash: str) -> dict:
-    row = conn.execute(
-        """
-        SELECT id, operation_hash, operation, threshold, status
-        FROM approvals WHERE operation_hash = ?
-        """,
-        (op_hash,),
-    ).fetchone()
-    if row is None:
-        raise GateError(f"No approval request exists for {op_hash}")
+def _approval_dict(row) -> dict:
     return {
         "id": row[0],
         "operation_hash": row[1],
         "operation": json_loads(row[2], {}),
         "threshold": row[3],
         "status": row[4],
+        "consumed_at": row[5],
     }
 
 
+def request_approval(
+    conn: Connection,
+    operation: dict[str, Any],
+    requested_by: str,
+    threshold: int = DEFAULT_THRESHOLD,
+) -> dict:
+    """Create or return the live approval instance for an exact operation.
+
+    Pending/approved instances are reused. Denied/consumed instances are
+    terminal history, so the same exact operation may be requested again as a
+    fresh approval instance. BEGIN IMMEDIATE makes that lifecycle race-free.
+    """
+    begin_immediate(conn)
+    op_hash = operation_hash(operation)
+    existing = conn.execute(
+        """
+        SELECT id, operation_hash, operation, threshold, status, consumed_at
+        FROM approvals
+        WHERE operation_hash = ? AND status IN ('pending', 'approved')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (op_hash,),
+    ).fetchone()
+    if existing is not None:
+        return _approval_dict(existing)
+
+    row = conn.execute(
+        """
+        INSERT INTO approvals (operation_hash, operation, threshold)
+        VALUES (?, ?, ?)
+        RETURNING id
+        """,
+        (op_hash, json_dumps(operation), threshold),
+    ).fetchone()
+    assert row is not None
+    audit.record(
+        conn,
+        "approval.requested",
+        "approval",
+        row[0],
+        agent=requested_by,
+        detail={"operation": operation, "hash": op_hash},
+    )
+    return get_approval(conn, op_hash)
+
+
+def get_approval(conn: Connection, op_hash: str) -> dict:
+    """Return the newest approval instance for an operation hash."""
+    row = conn.execute(
+        """
+        SELECT id, operation_hash, operation, threshold, status, consumed_at
+        FROM approvals
+        WHERE operation_hash = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (op_hash,),
+    ).fetchone()
+    if row is None:
+        raise GateError(f"No approval request exists for {op_hash}")
+    return _approval_dict(row)
+
+
 def vote(conn: Connection, op_hash: str, voter: str, approve: bool) -> dict:
-    """Record a vote and decide the approval atomically.
+    """Record a vote and decide the newest approval instance atomically.
 
     BEGIN IMMEDIATE serializes competing voters before either reads the current
     approval state. Denial has precedence and terminal states remain final.
@@ -144,7 +171,7 @@ def vote(conn: Connection, op_hash: str, voter: str, approve: bool) -> dict:
 
 
 def is_approved(conn: Connection, operation: dict[str, Any]) -> bool:
-    """True only if an approval bound to this exact operation is approved."""
+    """True only if the newest instance for this exact operation is approved."""
     try:
         approval = get_approval(conn, operation_hash(operation))
     except GateError:
@@ -163,7 +190,7 @@ def consume_approval(conn: Connection, operation: dict[str, Any], agent: str) ->
             f"{approval['status']}); it may already be used."
         )
     cur = conn.execute(
-        "UPDATE approvals SET status = 'denied', decided_at = unixepoch() "
+        "UPDATE approvals SET status = 'consumed', consumed_at = unixepoch() "
         "WHERE id = ? AND status = 'approved'",
         (approval["id"],),
     )
