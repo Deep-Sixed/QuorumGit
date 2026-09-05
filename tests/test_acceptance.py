@@ -168,7 +168,9 @@ def test_full_workflow(committed_conn, cfg, tmp_path, initialized_store):
 
     events = {
         row[0]
-        for row in conn.execute("SELECT DISTINCT event_type FROM audit_events")
+        for row in conn.execute(
+            "SELECT DISTINCT event_type FROM audit_events"
+        ).fetchall()
     }
     for expected in (
         "repository.registered",

@@ -8,6 +8,7 @@ external connection string, fallback store, or degraded mode.
 from __future__ import annotations
 
 import json
+import time
 from importlib import import_module, resources
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,16 @@ Connection = Any
 
 DATABASE_FILENAME = "quorumgit.db"
 DEFAULT_BUSY_TIMEOUT_SECONDS = 5.0
+
+# libSQL 0.1.11's busy handler does not wake when a write lock is released: a
+# contended BEGIN IMMEDIATE sleeps for the whole PRAGMA busy_timeout and then
+# raises "database is locked", even if the holder committed immediately after
+# the attempt began. A long busy_timeout therefore only delays a guaranteed
+# failure. Instead each attempt fails fast and begin_immediate() polls until
+# DEFAULT_BUSY_TIMEOUT_SECONDS, which does observe the release.
+LOCK_POLL_TIMEOUT_MS = 50
+LOCK_RETRY_INITIAL_SECONDS = 0.002
+LOCK_RETRY_MAX_SECONDS = 0.05
 MIGRATION_SEPARATOR = "-- quorumgit-statement"
 
 REQUIRED_TABLES = (
@@ -64,10 +75,10 @@ def _cfg_for_target(target: Config | str | Path) -> Config:
     return Config(data_dir=path.parent, agent=None)
 
 
-def _configure_connection(conn: Connection, timeout_seconds: float) -> None:
+def _configure_connection(conn: Connection, _timeout_seconds: float) -> None:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute(f"PRAGMA busy_timeout = {int(timeout_seconds * 1000)}")
+    conn.execute(f"PRAGMA busy_timeout = {LOCK_POLL_TIMEOUT_MS}")
 
     foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
     journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
@@ -78,7 +89,7 @@ def _configure_connection(conn: Connection, timeout_seconds: float) -> None:
         raise ContractViolation(
             f"libSQL connection did not enter WAL mode: {journal_mode!r}"
         )
-    if busy_timeout != int(timeout_seconds * 1000):
+    if busy_timeout != LOCK_POLL_TIMEOUT_MS:
         raise ContractViolation("libSQL connection did not apply busy_timeout")
 
 
@@ -119,10 +130,39 @@ def connect(cfg: Config) -> Connection:
     return conn
 
 
-def begin_immediate(conn: Connection) -> None:
-    """Acquire the single-writer reservation before governance reads."""
-    if not conn.in_transaction:
-        conn.execute("BEGIN IMMEDIATE")
+def _is_locked_error(exc: Exception) -> bool:
+    return "locked" in str(exc).lower() or "busy" in str(exc).lower()
+
+
+def begin_immediate(
+    conn: Connection, *, timeout_seconds: float = DEFAULT_BUSY_TIMEOUT_SECONDS
+) -> None:
+    """Acquire the single-writer reservation before governance reads.
+
+    Polls rather than issuing one blocking BEGIN: see LOCK_POLL_TIMEOUT_MS for
+    why libSQL's own busy handler cannot be relied on to wait here. Raises
+    StoreError once timeout_seconds elapses so a contended governance command
+    fails loudly instead of proceeding without the reservation.
+    """
+    if conn.in_transaction:
+        return
+    deadline = time.monotonic() + timeout_seconds
+    delay = LOCK_RETRY_INITIAL_SECONDS
+    while True:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            return
+        except Exception as exc:
+            if not _is_locked_error(exc):
+                raise
+            if time.monotonic() >= deadline:
+                raise StoreError(
+                    "Could not acquire the store write lock within "
+                    f"{timeout_seconds:g}s; another quorumgit command is "
+                    "holding it. Retry once it finishes."
+                ) from exc
+            time.sleep(delay)
+            delay = min(delay * 2, LOCK_RETRY_MAX_SECONDS)
 
 
 # ---------------------------------------------------------------- lifecycle
@@ -219,7 +259,10 @@ def migrate(target: Config | str | Path) -> list[str]:
         conn.commit()
 
         done = {
-            row[0] for row in conn.execute("SELECT version FROM schema_migrations")
+            row[0]
+            for row in conn.execute(
+                "SELECT version FROM schema_migrations"
+            ).fetchall()
         }
         for mig in _migration_files():
             if mig.name in done:

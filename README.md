@@ -6,7 +6,7 @@ QuorumGit prevents coding agents (or humans) working the same codebase from step
 
 ```
 agent-one ──┐
-agent-two ──┼──► quorumgit CLI ──► embedded PostgreSQL (claims, leases, approvals, audit)
+agent-two ──┼──► quorumgit CLI ──► local libSQL file (claims, leases, approvals, audit)
 reviewer  ──┘                          │
                                        └──► git pre-receive hook (push enforcement)
 ```
@@ -21,7 +21,7 @@ Run two or more autonomous coding agents against one repository and, without coo
 - **Abandoned work** — an agent's session ends and nobody knows what was done, what remains, or which commit to continue from.
 - **Ungoverned destruction** — force pushes, ref deletions, and branch takeovers with no approval and no record.
 
-QuorumGit makes each of these either impossible or explicitly governed, using mechanisms Git and PostgreSQL already provide: worktrees, pre-receive hooks, row locks, and append-only tables.
+QuorumGit makes each of these either impossible or explicitly governed, using mechanisms Git and SQLite already provide: worktrees, pre-receive hooks, single-writer transactions, and append-only tables.
 
 ## The mental model
 
@@ -41,9 +41,9 @@ Everything an agent does — claim, renew, checkpoint, hand off, release — wri
 
 ## Installation
 
-Requirements: **Python 3.11–3.14**, **git**. PostgreSQL is *not* a prerequisite — QuorumGit embeds its own instance via [pg0](https://github.com/vectorize-io/pg0).
+Requirements: **Python 3.11–3.14**, **git**. There is no database to install, no server to run, and no extension to provision: the store is a single [libSQL](https://github.com/tursodatabase/libsql-python) database file under `QUORUMGIT_DATA_DIR`.
 
-> **Platform note.** `quorumgit init` provisions the `pg_jsonschema` extension from a pinned `pg18-amd64-linux-gnu` `.deb` and extracts it with `dpkg-deb`, so **v0.1 initialization is supported on Linux x86-64 only**. On macOS or Windows `init` fails unless the extension is already present in the pg0 distribution.
+> **Platform note.** Linux, macOS, and Windows are supported. `libsql` 0.1.11 publishes a prebuilt wheel for CPython 3.11–3.13 on all three, and for CPython 3.14 on Linux only — on macOS 3.14 pip builds the extension from source (needs a Rust toolchain), and on Windows 3.14 that build does not currently succeed. Use 3.11–3.13 on Windows until upstream ships a 3.14 wheel.
 
 ```bash
 # recommended: uv (editable, so a git pull updates the live tool)
@@ -57,12 +57,12 @@ Then initialize the store once:
 
 ```bash
 $ quorumgit init
-store: postgresql://postgres:postgres@127.0.0.1:5434/quorumgit
-migrations applied: ['001_core.sql', '002_handoff_cancel.sql']
+store: /home/you/.quorumgit/quorumgit.db
+migrations applied: ['001_core.sql']
 contract: ok
 ```
 
-`init` starts the embedded PostgreSQL instance, installs the `pg_jsonschema` extension if missing (fetched over HTTPS from the pinned upstream release and verified against a hard-coded SHA-256 before install), applies migrations, and verifies the runtime contract. It is idempotent — re-run it any time; it also repairs the extension after a PostgreSQL upgrade.
+`init` creates the state directory, applies migrations, and verifies the runtime contract (required tables, foreign keys on, WAL journal mode). It is idempotent — re-run it any time.
 
 `quorumgit status` shows the store URI, contract state, and row counts. If the store is down or incomplete, every command exits non-zero: there is **one storage backend and no fallback**, by design.
 
@@ -177,6 +177,7 @@ Rules that hold no matter what:
 - **An approval never bypasses branch reservations.** A claimed branch still accepts pushes only from its claiming agent; a branch frozen by an open handoff accepts none at all. The hook checks reservations *before* approvals.
 - **Denial has precedence and is terminal.** One `--deny` vote denies the approval; later yes votes are refused.
 - **Consumption is single-use under concurrency.** Two simultaneous pushes racing for one approval produce exactly one accepted push — the loser is rejected, not silently allowed.
+- **A consumed approval is spent, not blacklisted.** Consumption moves the approval to a terminal `consumed` state (with `consumed_at`) rather than reusing `denied`, and only one *live* (`pending` or `approved`) approval may exist per operation hash. The same operation can therefore be requested and approved again later as a new approval instance — which matters for takeovers, whose payload is stable and legitimately repeatable. What is never possible is one approval authorizing twice.
 - The default threshold is 1 (a human operator); the vote schema supports higher thresholds.
 
 Takeovers follow the same pattern: claiming a task someone else holds (`claim <task> --takeover`) prints the takeover operation to approve. The takeover is atomic — the incumbent is released, the replacement claim created, and the approval consumed in one transaction, or none of it happens. A refused takeover leaves the incumbent untouched and the approval unconsumed.
@@ -212,20 +213,18 @@ Takeovers follow the same pattern: claiming a task someone else holds (`claim <t
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `QUORUMGIT_DATA_DIR` | State root: pg0 data and managed worktrees | `~/.quorumgit` |
-| `QUORUMGIT_PG_INSTANCE` | Name of the QuorumGit-owned pg0 instance | `quorumgit` |
-| `QUORUMGIT_PG_PORT` | Local PostgreSQL port | selected automatically |
+| `QUORUMGIT_DATA_DIR` | State root: `quorumgit.db` and managed worktrees | `~/.quorumgit` |
 | `QUORUMGIT_AGENT` | Agent identity for CLI commands and governed pushes | unset |
 
-There is deliberately no external-database option and no connection-string configuration: QuorumGit owns one embedded instance and fails loudly when it is unavailable.
+There is deliberately no external-database option and no connection-string configuration: QuorumGit owns one local database file and fails loudly when it is missing or fails its contract check.
 
 ## Design properties
 
-- **CLI-only, no daemon.** Every operation is a short-lived transaction. Lease expiry is computed from timestamps at read time — there is no scheduler, no cron, nothing to keep alive except the embedded PostgreSQL that pg0 manages.
-- **One store, fail-loud.** No SQLite fallback, no file mode, no degraded operation. If the store or a required extension is missing, commands exit non-zero and say why.
-- **Concurrency-safe where it counts.** Approval voting and consumption, takeover ownership transitions, and handoff resolution all serialize on row locks (`SELECT … FOR UPDATE`) with guarded conditional updates, in a consistent lock order. Races produce exactly one winner and an explicit error for the loser — verified by concurrent two-connection tests, not by inspection.
+- **CLI-only, no daemon.** Every operation is a short-lived transaction. Lease expiry is computed from timestamps at read time — there is no scheduler, no cron, and nothing to keep alive at all — the store is a file.
+- **One store, fail-loud.** One libSQL file, no second backend, no degraded operation. If the store is missing or fails its contract check, commands exit non-zero and say why.
+- **Concurrency-safe where it counts.** Every governance write takes the database's single-writer reservation (`BEGIN IMMEDIATE`) before it reads, and pairs it with guarded conditional updates. Approval voting and consumption, takeover ownership transitions, and handoff resolution all serialize; races produce exactly one winner and an explicit error for the loser — verified by concurrent two-connection tests, not by inspection. Because the reservation covers the whole database rather than one row, it also closes the cross-task branch collision that per-task row locks did not.
 - **Verified continuation.** Checkpoint and handoff commits must exist in the registered repository (and be reachable from the claimed branch when it exists). The continuation contract survives restarts: stop the store mid-workflow and the claims, handoffs, and audit history are intact when it returns.
-- **Structured artifacts are schema-checked in the database.** Handoff records and approval operations are JSONB validated by `pg_jsonschema` CHECK constraints.
+- **Structured artifacts are schema-checked in the database.** Handoff and approval fields the governance rules depend on are relational columns with `CHECK` constraints; JSON is retained only for open-ended arrays and detail blobs.
 
 ## Threat model — read this honestly
 
@@ -251,7 +250,7 @@ ruff check src tests
 pyright
 ```
 
-Supported interpreters: Python 3.11 through 3.14; `ruff` and `pyright` are pinned to the 3.11 floor so post-3.11 syntax and APIs fail the checks. Tests run against a live throwaway pg0 instance and real Git repositories — nothing is mocked. The suite covers the full acceptance workflow (register → claim → isolate → block overlap → parallel work → checkpoint → handoff → accept → approval-gated takeover → audit → restart survival), real-push hook enforcement, concurrent voting/consumption/resolution races, and a branding gate that keeps application code free of any identity other than QuorumGit.
+Supported interpreters: Python 3.11 through 3.14; `ruff` and `pyright` are pinned to the 3.11 floor so post-3.11 syntax and APIs fail the checks. Tests run against a real libSQL database and real Git repositories — nothing is mocked. The suite covers the full acceptance workflow (register → claim → isolate → block overlap → parallel work → checkpoint → handoff → accept → approval-gated takeover → audit → restart survival), real-push hook enforcement, concurrent voting/consumption/resolution races, and a branding gate that keeps application code free of any identity other than QuorumGit.
 
 ## License
 
