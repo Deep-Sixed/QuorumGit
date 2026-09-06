@@ -157,6 +157,7 @@ def cmd_claim(args, cfg) -> int:
     agent = _agent(args, cfg)
     with store.connect(cfg) as conn:
         takeover_operation = None
+        takeover_approval = None
         if args.takeover:
             # Bind the approval to a stable incumbent. claim_task() and every
             # release take this same task lock, closing the stale-holder window.
@@ -168,10 +169,12 @@ def cmd_claim(args, cfg) -> int:
                     "type": "lease_takeover",
                     "repository": task["repository"],
                     "task_id": args.task_id,
+                    "from_claim_id": holder["id"],
                     "from_agent": holder["agent"],
                     "to_agent": agent,
                 }
-                if not gate.is_approved(conn, takeover_operation):
+                takeover_approval = gate.approved_instance(conn, takeover_operation)
+                if takeover_approval is None:
                     print(
                         "[quorumgit] REFUSED: lease takeover requires approval.\n"
                         f"operation hash: "
@@ -206,7 +209,10 @@ def cmd_claim(args, cfg) -> int:
         # commit together or not at all.
         if takeover_operation is not None:
             try:
-                gate.consume_approval(conn, takeover_operation, agent=agent)
+                assert takeover_approval is not None
+                gate.consume_approval(
+                    conn, takeover_approval["id"], takeover_operation, agent=agent
+                )
             except gate.GateError as exc:
                 conn.rollback()
                 print(f"[quorumgit] REFUSED: {exc}", file=sys.stderr)
@@ -356,16 +362,22 @@ def cmd_approve_request(args, cfg) -> int:
             threshold=args.threshold,
         )
         conn.commit()
-    print(f"approval {approval['operation_hash']} status={approval['status']}")
+    print(
+        f"approval {approval['id']} hash={approval['operation_hash']} "
+        f"status={approval['status']}"
+    )
     return 0
 
 
 def cmd_approve_vote(args, cfg) -> int:
     with store.connect(cfg) as conn:
-        approval = gate.vote(conn, args.operation_hash, _agent(args, cfg),
+        approval = gate.vote(conn, args.approval_id, _agent(args, cfg),
                              approve=not args.deny)
         conn.commit()
-    print(f"approval {approval['operation_hash']} status={approval['status']}")
+    print(
+        f"approval {approval['id']} hash={approval['operation_hash']} "
+        f"status={approval['status']}"
+    )
     return 0
 
 
@@ -517,7 +529,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--threshold", type=int, default=1),
     ), parent=ap)
     add("vote", cmd_approve_vote, lambda sp: (
-        sp.add_argument("operation_hash"),
+        sp.add_argument("approval_id", type=int),
         sp.add_argument("--agent"),
         sp.add_argument("--deny", action="store_true"),
     ), parent=ap)

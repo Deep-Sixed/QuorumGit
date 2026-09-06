@@ -319,6 +319,20 @@ def verify_contract(target: Config | Connection | str | Path) -> None:
                 "Run `quorumgit init` to apply migrations."
             )
 
+        required_migrations = {migration.name for migration in _migration_files()}
+        applied_migrations = {
+            row[0]
+            for row in conn.execute(
+                "SELECT version FROM schema_migrations"
+            ).fetchall()
+        }
+        missing_migrations = required_migrations - applied_migrations
+        if missing_migrations:
+            raise ContractViolation(
+                f"Missing required migrations: {sorted(missing_migrations)}. "
+                "Run `quorumgit init` to apply migrations."
+            )
+
         foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
         journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
         if foreign_keys != 1:
