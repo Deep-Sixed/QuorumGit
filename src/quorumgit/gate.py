@@ -7,18 +7,21 @@ operation payload. Enforcement is fail-closed: any hook error rejects the push.
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
 from . import audit
 from .canonical import stable_hash
-from .registry import get_repository
+from .registry import assert_repository_identity_unique, get_repository
 from .store import Connection, begin_immediate, json_dumps, json_loads
 from .work import live_claim_for_branch, open_handoff_for_branch
 
 DEFAULT_THRESHOLD = 1
+HOOK_MARKER = "# quorumgit-managed-pre-receive v1"
 
 
 class GateError(RuntimeError):
@@ -237,6 +240,41 @@ def _is_fast_forward(git_dir: str, oldrev: str, newrev: str) -> bool:
     return result.returncode == 0
 
 
+def _invoking_git_common_dir(git_dir: str) -> Path:
+    result = subprocess.run(
+        ["git", "--git-dir", git_dir, "rev-parse", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        suffix = f": {detail}" if detail else ""
+        raise PushRejected(f"Unable to resolve invoking Git repository{suffix}")
+    raw = result.stdout.strip()
+    if not raw:
+        raise PushRejected("Git returned no common directory for invoking repository.")
+    common = Path(raw)
+    if not common.is_absolute():
+        common = Path.cwd() / common
+    return common.resolve()
+
+
+def _verify_repository_binding(
+    conn: Connection,
+    repository: str,
+    git_dir: str,
+) -> dict:
+    repo = get_repository(conn, repository)
+    expected = assert_repository_identity_unique(conn, repo)
+    actual = _invoking_git_common_dir(git_dir)
+    if actual != expected:
+        raise PushRejected(
+            f"Hook repository mismatch: {repository!r} is registered for "
+            f"{expected}, but this push is running in {actual}."
+        )
+    return repo
+
+
 def check_ref_update(
     conn: Connection,
     repository: str,
@@ -247,7 +285,7 @@ def check_ref_update(
     refname: str,
 ) -> None:
     """Enforce governance for one ref update. Raises PushRejected."""
-    repo = get_repository(conn, repository)
+    repo = _verify_repository_binding(conn, repository, git_dir)
     branch = refname.removeprefix("refs/heads/")
 
     if refname.startswith("refs/heads/"):
@@ -340,32 +378,124 @@ def run_pre_receive(
     return 0
 
 
-def install_hook(conn: Connection, repository: str) -> Path:
-    """Install the pre-receive hook into the repository's git directory."""
-    repo = get_repository(conn, repository)
-    git_dir = Path(
-        subprocess.run(
-            ["git", "-C", repo["path"], "rev-parse", "--absolute-git-dir"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
+def _effective_pre_receive_hook(repository_path: str | Path) -> Path:
+    repo_path = Path(repository_path).resolve()
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), "rev-parse", "--git-path", "hooks/pre-receive"],
+        capture_output=True,
+        text=True,
     )
-    hooks_dir = git_dir / "hooks"
-    hooks_dir.mkdir(exist_ok=True)
-    hook_path = hooks_dir / "pre-receive"
-    hook_path.write_text(
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        suffix = f": {detail}" if detail else ""
+        raise GateError(f"Unable to resolve Git hook path for {repo_path}{suffix}")
+    raw = result.stdout.strip()
+    if not raw:
+        raise GateError(f"Git returned no pre-receive hook path for {repo_path}")
+    hook_path = Path(raw)
+    if not hook_path.is_absolute():
+        hook_path = repo_path / hook_path
+    return hook_path.resolve()
+
+
+def _hook_script(repository: str, executable: str | None = None) -> str:
+    python = executable or sys.executable
+    return (
+        "#!/bin/sh\n"
+        f"{HOOK_MARKER}\n"
+        f"exec {shlex.quote(python)} -m quorumgit hook pre-receive "
+        f"--repo {shlex.quote(repository)}\n"
+    )
+
+
+def _legacy_hook_script(repository: str) -> str:
+    """Exact pre-PR6 hook shape, recognized only for safe in-place upgrade."""
+    return (
         "#!/bin/sh\n"
         f'exec "{sys.executable}" -m quorumgit hook pre-receive '
-        f'--repo "{repository}"\n',
-        encoding="utf-8",
+        f'--repo "{repository}"\n'
     )
-    hook_path.chmod(0o755)
+
+
+def _write_hook_atomically(hook_path: Path, content: str) -> None:
+    hook_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{hook_path.name}.quorumgit-",
+        dir=hook_path.parent,
+        text=True,
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp_path.chmod(0o755)
+        os.replace(tmp_path, hook_path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def install_hook(conn: Connection, repository: str) -> Path:
+    """Safely install QuorumGit at Git's effective pre-receive hook path.
+
+    Existing unrelated hooks are never overwritten or silently chained. An
+    exact current QuorumGit hook is idempotent; an exact legacy QuorumGit hook
+    for the same repository is upgraded in place. Any other existing content
+    is refused so operators must make coexistence explicit.
+    """
+    begin_immediate(conn)
+    repo = get_repository(conn, repository)
+    common_dir = assert_repository_identity_unique(conn, repo)
+    hook_path = _effective_pre_receive_hook(repo["path"])
+    expected = _hook_script(repository)
+    action = "installed"
+
+    if hook_path.exists():
+        try:
+            existing = hook_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise GateError(
+                f"Cannot inspect existing pre-receive hook {hook_path}: {exc}"
+            ) from exc
+        if existing == expected:
+            hook_path.chmod(0o755)
+            action = "verified"
+        elif existing == _legacy_hook_script(repository):
+            _write_hook_atomically(hook_path, expected)
+            action = "upgraded"
+        elif HOOK_MARKER in existing.splitlines()[:3]:
+            raise GateError(
+                f"Existing QuorumGit-managed pre-receive hook differs at "
+                f"{hook_path}; refusing to overwrite it."
+            )
+        else:
+            raise GateError(
+                f"Existing pre-receive hook at {hook_path} is not owned by "
+                "QuorumGit; refusing to overwrite or silently chain it."
+            )
+    else:
+        _write_hook_atomically(hook_path, expected)
+
+    effective = _effective_pre_receive_hook(repo["path"])
+    if effective != hook_path or not hook_path.exists():
+        raise GateError(
+            f"Installed hook is not Git's effective pre-receive hook: {hook_path}"
+        )
+    if hook_path.read_text(encoding="utf-8") != expected:
+        raise GateError(f"Installed pre-receive hook failed verification: {hook_path}")
+
     audit.record(
         conn,
-        "hook.installed",
+        f"hook.{action}",
         "repository",
         repo["id"],
-        detail={"path": str(hook_path)},
+        detail={
+            "path": str(hook_path),
+            "git_common_dir": str(common_dir),
+        },
     )
     return hook_path
