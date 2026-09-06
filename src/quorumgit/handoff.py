@@ -192,6 +192,7 @@ def accept_handoff(
         lease_hours=lease_hours,
         override_overlap=True,
         via_handoff=True,
+        handoff_id=handoff_id,
     )
 
     wt = trees.worktree_for_claim(conn, handoff["from_claim_id"])
@@ -247,6 +248,12 @@ def decline_handoff(conn: Connection, handoff_id: int, agent: str) -> None:
             "only the addressee may decline it."
         )
     work.lock_task(conn, handoff["task_id"])
+    trees.cleanup_released_worktree(
+        conn,
+        handoff["from_claim_id"],
+        agent=agent,
+        reason="handoff_declined",
+    )
     cur = conn.execute(
         "UPDATE handoffs SET status = 'declined', resolved_at = unixepoch() "
         "WHERE id = ? AND status = 'open'",
@@ -272,6 +279,12 @@ def cancel_handoff(conn: Connection, handoff_id: int, agent: str) -> None:
             "only the creator may cancel it."
         )
     work.lock_task(conn, handoff["task_id"])
+    trees.cleanup_released_worktree(
+        conn,
+        handoff["from_claim_id"],
+        agent=agent,
+        reason="handoff_cancelled",
+    )
     cur = conn.execute(
         "UPDATE handoffs SET status = 'cancelled', resolved_at = unixepoch() "
         "WHERE id = ? AND status = 'open'",

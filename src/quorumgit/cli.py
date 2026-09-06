@@ -69,6 +69,35 @@ def cmd_destroy(args, cfg) -> int:
     return 0
 
 
+def cmd_doctor(args, cfg) -> int:
+    """Inspect and optionally reconcile recorded managed-worktree drift."""
+    with store.connect(cfg) as conn:
+        findings = trees.doctor_worktrees(conn, repair=args.repair)
+        if args.repair:
+            conn.commit()
+    if not findings:
+        print("worktrees: ok")
+        return 0
+    unresolved = False
+    for finding in findings:
+        state = "repaired" if finding.get("repaired") else "detected"
+        if finding.get("error"):
+            state = f"repair failed: {finding['error']}"
+            unresolved = True
+        elif not finding.get("repaired"):
+            unresolved = True
+        print(
+            f"worktree {finding['worktree_id']} claim {finding['claim_id']}: "
+            f"{finding['issue']} — {state} — {finding['path']}"
+        )
+    if args.repair and not unresolved:
+        print("worktrees: reconciled")
+        return 0
+    if not args.repair:
+        print("re-run with `quorumgit doctor --repair` to reconcile safe cases.")
+    return 1
+
+
 # --------------------------------------------------------- registry commands
 
 
@@ -393,6 +422,8 @@ def build_parser() -> argparse.ArgumentParser:
     add("status", cmd_status)
     add("destroy", cmd_destroy,
         lambda sp: sp.add_argument("--yes", action="store_true"))
+    add("doctor", cmd_doctor,
+        lambda sp: sp.add_argument("--repair", action="store_true"))
 
     repo = sub.add_parser("repo").add_subparsers(dest="sub", required=True)
     add("add", cmd_repo_add, lambda sp: (

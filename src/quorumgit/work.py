@@ -7,6 +7,7 @@ the moment another operation supersedes it. No background process exists.
 
 from __future__ import annotations
 
+import math
 import subprocess
 from typing import Any
 
@@ -25,6 +26,15 @@ class WorkError(RuntimeError):
 
 class ClaimRefused(WorkError):
     """The claim was refused by governance rules; message says why."""
+
+
+def _lease_seconds(lease_hours: float) -> int:
+    if not math.isfinite(lease_hours) or lease_hours <= 0:
+        raise WorkError("Lease duration must be finite and greater than zero.")
+    seconds = int(lease_hours * 3600)
+    if seconds <= 0:
+        raise WorkError("Lease duration is too small; it must be at least one second.")
+    return seconds
 
 
 # ------------------------------------------------------------------- tasks
@@ -216,7 +226,10 @@ def open_handoff_for_task(conn: Connection, task_id: int) -> dict | None:
 
 
 def open_handoff_for_branch(
-    conn: Connection, repository_id: int, branch: str
+    conn: Connection,
+    repository_id: int,
+    branch: str,
+    exclude_handoff_id: int | None = None,
 ) -> dict | None:
     """An open handoff that reserves this branch during the handoff gap."""
     row = conn.execute(
@@ -226,11 +239,46 @@ def open_handoff_for_branch(
         JOIN claims c ON c.id = h.from_claim_id
         JOIN tasks t ON t.id = h.task_id
         WHERE t.repository_id = ? AND c.branch = ? AND h.status = 'open'
+          AND (? IS NULL OR h.id <> ?)
         LIMIT 1
         """,
-        (repository_id, branch),
+        (repository_id, branch, exclude_handoff_id, exclude_handoff_id),
     ).fetchone()
     return {"id": row[0]} if row else None
+
+
+def open_handoff_scope_conflicts(
+    conn: Connection,
+    repository_id: int,
+    scope_globs: list[str],
+    exclude_handoff_id: int | None = None,
+) -> list[dict]:
+    """Return open handoff scope reservations overlapping prospective scopes."""
+    rows = conn.execute(
+        """
+        SELECT h.id, s.path_glob
+        FROM handoffs h
+        JOIN claims c ON c.id = h.from_claim_id
+        JOIN tasks t ON t.id = h.task_id
+        JOIN scopes s ON s.claim_id = c.id
+        WHERE t.repository_id = ? AND h.status = 'open'
+          AND (? IS NULL OR h.id <> ?)
+        ORDER BY h.id, s.id
+        """,
+        (repository_id, exclude_handoff_id, exclude_handoff_id),
+    ).fetchall()
+    conflicts: list[dict] = []
+    for handoff_id, reserved in rows:
+        for requested in scope_globs:
+            if scopes_overlap(reserved, requested):
+                conflicts.append(
+                    {
+                        "handoff_id": handoff_id,
+                        "reserved": reserved,
+                        "requested": requested,
+                    }
+                )
+    return conflicts
 
 
 def live_claim_for_branch(
@@ -395,8 +443,13 @@ def claim_task(
     override_overlap: bool = False,
     takeover_approved: bool = False,
     via_handoff: bool = False,
+    handoff_id: int | None = None,
 ) -> tuple[int, str, dict]:
     """Claim a task. Returns (claim_id, classification, detail)."""
+    try:
+        lease_seconds = _lease_seconds(lease_hours)
+    except WorkError as exc:
+        raise ClaimRefused(str(exc)) from exc
     lock_task(conn, task_id)
     task = get_task(conn, task_id)
     agent_row = get_agent(conn, agent)
@@ -434,6 +487,65 @@ def claim_task(
                 f"{pending['id']}{addressee}. Continue it with "
                 f"`quorumgit handoff accept {pending['id']}`."
             )
+
+    excluded_handoff = handoff_id if via_handoff else None
+    branch_reservation = open_handoff_for_branch(
+        conn, task["repository_id"], branch, exclude_handoff_id=excluded_handoff
+    )
+    if branch_reservation:
+        detail = {
+            "reason": "branch reserved for open handoff",
+            "handoff_id": branch_reservation["id"],
+            "branch": branch,
+        }
+        conn.execute(
+            """
+            INSERT INTO conflict_events
+                (repository_id, task_id, agent_id, classification, detail)
+            VALUES (?, ?, ?, 'BLOCKED', ?)
+            """,
+            (
+                task["repository_id"],
+                task_id,
+                agent_row["id"],
+                json_dumps(detail),
+            ),
+        )
+        raise ClaimRefused(
+            f"Branch {branch!r} is reserved for open handoff "
+            f"{branch_reservation['id']}."
+        )
+
+    handoff_scope_hits = open_handoff_scope_conflicts(
+        conn,
+        task["repository_id"],
+        scope_globs,
+        exclude_handoff_id=excluded_handoff,
+    )
+    if handoff_scope_hits:
+        detail = {
+            "reason": "scope reserved for open handoff",
+            "overlaps": handoff_scope_hits,
+        }
+        conn.execute(
+            """
+            INSERT INTO conflict_events
+                (repository_id, task_id, agent_id, classification, detail)
+            VALUES (?, ?, ?, 'BLOCKED', ?)
+            """,
+            (
+                task["repository_id"],
+                task_id,
+                agent_row["id"],
+                json_dumps(detail),
+            ),
+        )
+        ids = sorted({hit["handoff_id"] for hit in handoff_scope_hits})
+        raise ClaimRefused(
+            "Declared scopes are reserved by open handoff(s): "
+            + ", ".join(str(i) for i in ids)
+            + "."
+        )
 
     holder = active_claim_for_task(conn, task_id)
     displaced = None
@@ -509,7 +621,7 @@ def claim_task(
         VALUES (?, ?, ?, unixepoch() + ?)
         RETURNING id
         """,
-        (task_id, agent_row["id"], branch, int(lease_hours * 3600)),
+        (task_id, agent_row["id"], branch, lease_seconds),
     ).fetchone()
     assert row is not None
     claim_id = row[0]
@@ -542,6 +654,7 @@ def renew_claim(
     agent: str,
     lease_hours: float = DEFAULT_LEASE_HOURS,
 ) -> None:
+    lease_seconds = _lease_seconds(lease_hours)
     begin_immediate(conn)
     claim = get_claim(conn, claim_id)
     if claim["released_at"] is not None:
@@ -550,9 +663,13 @@ def renew_claim(
         raise WorkError(
             f"Claim {claim_id} belongs to {claim['agent']}, not {agent}."
         )
+    if claim["expired"]:
+        raise WorkError(
+            f"Claim {claim_id} has expired and cannot be renewed; acquire a new claim."
+        )
     conn.execute(
         "UPDATE claims SET lease_expires_at = unixepoch() + ? WHERE id = ?",
-        (int(lease_hours * 3600), claim_id),
+        (lease_seconds, claim_id),
     )
     audit.record(
         conn,

@@ -80,7 +80,7 @@ def test_expired_lease_is_reclaimable(conn, git_repo):
         a,
         branch="feat/x",
         scope_globs=["src/**"],
-        lease_hours=0.0001,
+        lease_hours=0.001,
     )
     conn.execute(
         "UPDATE claims SET lease_expires_at = unixepoch() - 60 WHERE id = ?",
