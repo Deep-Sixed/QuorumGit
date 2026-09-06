@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 import uuid
 from pathlib import Path
@@ -10,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from quorumgit import gate, receive, registry, store, work
+from quorumgit.config import Config
 from tests.conftest import make_git_repo
 from tests.test_gate import _commit, _push
 
@@ -159,54 +159,68 @@ def test_rejected_update_keeps_approval_and_retry_reuses_reservation(
     )
 
 
-def test_inflight_branch_freezes_claim_transition(
-    committed_conn, initialized_store, tmp_path, cfg, monkeypatch
-):
-    repo_name, hub, clone, owner, _operator = _setup(committed_conn, tmp_path, cfg)
-    task = work.create_task(committed_conn, repo_name, "reserved branch")
-    claim_id, _, _ = work.claim_task(
-        committed_conn,
-        task,
-        owner,
-        branch="feat/reserved",
-        scope_globs=["src/**"],
-    )
-    committed_conn.commit()
-
-    _commit(clone, "src/reserved.py", branch="feat/reserved")
-    newrev = subprocess.run(
-        ["git", "-C", str(clone), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    zero = "0" * 40
-    line = f"{zero} {newrev} refs/heads/feat/reserved\n"
-    monkeypatch.setenv("GIT_DIR", str(hub))
-    monkeypatch.setenv("QUORUMGIT_AGENT", owner)
-    assert receive.run_pre_receive(committed_conn, repo_name, [line]) == 0
-
-    blocked = store.connect(initialized_store)
+def test_inflight_branch_freezes_claim_transition(tmp_path, monkeypatch):
+    """The reservation freezes ownership in an isolated authority store."""
+    local_cfg = Config(data_dir=tmp_path / "mutation-data", agent=None)
+    store.migrate(local_cfg)
+    store.verify_contract(local_cfg)
+    conn = store.connect(local_cfg)
     try:
-        with pytest.raises(Exception, match="in-flight Git mutation"):
-            work.release_claim(blocked, claim_id, owner)
-        blocked.rollback()
-    finally:
-        blocked.close()
+        repo_name, hub, clone, owner, _operator = _setup(conn, tmp_path, local_cfg)
+        task = work.create_task(conn, repo_name, "reserved branch")
+        claim_id, _, _ = work.claim_task(
+            conn,
+            task,
+            owner,
+            branch="feat/reserved",
+            scope_globs=["src/**"],
+        )
+        conn.commit()
 
-    subprocess.run(
-        ["git", "--git-dir", str(hub), "update-ref", "refs/heads/feat/reserved", newrev],
-        check=True,
-        capture_output=True,
-    )
-    assert receive.run_post_receive(committed_conn, repo_name, [line]) == 0
+        _commit(clone, "src/reserved.py", branch="feat/reserved")
+        newrev = subprocess.run(
+            ["git", "-C", str(clone), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        zero = "0" * 40
+        line = f"{zero} {newrev} refs/heads/feat/reserved\n"
+        monkeypatch.setenv("GIT_DIR", str(hub))
+        monkeypatch.setenv("QUORUMGIT_AGENT", owner)
+        assert receive.run_pre_receive(conn, repo_name, [line]) == 0
 
-    after = store.connect(initialized_store)
-    try:
-        work.release_claim(after, claim_id, owner)
-        after.commit()
+        blocked = store.connect(local_cfg)
+        try:
+            with pytest.raises(ValueError, match="in-flight Git mutation"):
+                work.release_claim(blocked, claim_id, owner)
+            blocked.rollback()
+        finally:
+            blocked.close()
+
+        subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(hub),
+                "update-ref",
+                "refs/heads/feat/reserved",
+                newrev,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        assert receive.run_post_receive(conn, repo_name, [line]) == 0
+
+        after = store.connect(local_cfg)
+        try:
+            work.release_claim(after, claim_id, owner)
+            after.commit()
+        finally:
+            after.close()
     finally:
-        after.close()
+        conn.close()
+        store.destroy(local_cfg)
 
 
 def test_install_refuses_unrelated_post_hook_without_changing_it(conn, tmp_path):
