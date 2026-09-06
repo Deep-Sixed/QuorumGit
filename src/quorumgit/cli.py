@@ -10,7 +10,18 @@ import argparse
 import json
 import sys
 
-from . import __version__, audit, config, gate, handoff, registry, store, trees, work
+from . import (
+    __version__,
+    audit,
+    config,
+    gate,
+    handoff,
+    receive,
+    registry,
+    store,
+    trees,
+    work,
+)
 
 
 def _agent(args, cfg) -> str:
@@ -159,8 +170,6 @@ def cmd_claim(args, cfg) -> int:
         takeover_operation = None
         takeover_approval = None
         if args.takeover:
-            # Bind the approval to a stable incumbent. claim_task() and every
-            # release take this same task lock, closing the stale-holder window.
             work.lock_task(conn, args.task_id)
             holder = work.active_claim_for_task(conn, args.task_id)
             if holder and not holder["expired"]:
@@ -184,7 +193,7 @@ def cmd_claim(args, cfg) -> int:
                         f"{json.dumps(takeover_operation, sort_keys=True)}",
                         file=sys.stderr,
                     )
-                    conn.commit()  # keep the conflict/audit trail
+                    conn.commit()
                     return 1
         try:
             claim_id, classification, _ = work.claim_task(
@@ -198,15 +207,9 @@ def cmd_claim(args, cfg) -> int:
                 takeover_approved=takeover_operation is not None,
             )
         except work.ClaimRefused as exc:
-            # A refused claim is non-destructive: the holder was not released
-            # and the approval was not consumed. Commit only the conflict
-            # event and audit trail.
             conn.commit()
             print(f"[quorumgit] REFUSED: {exc}", file=sys.stderr)
             return 1
-        # The takeover succeeded: consume the approval in the same
-        # transaction, so replacement claim + holder release + consumption
-        # commit together or not at all.
         if takeover_operation is not None:
             try:
                 assert takeover_approval is not None
@@ -391,15 +394,20 @@ def cmd_approve_hash(args, cfg) -> int:
 
 def cmd_hook_install(args, cfg) -> int:
     with store.connect(cfg) as conn:
-        path = gate.install_hook(conn, args.repo)
+        path = receive.install_hooks(conn, args.repo)
         conn.commit()
-    print(f"pre-receive hook installed: {path}")
+    print(f"receive hooks installed (pre-receive: {path})")
     return 0
 
 
 def cmd_hook_pre_receive(args, cfg) -> int:
     with store.connect(cfg) as conn:
-        return gate.run_pre_receive(conn, args.repo, sys.stdin)
+        return receive.run_pre_receive(conn, args.repo, sys.stdin)
+
+
+def cmd_hook_post_receive(args, cfg) -> int:
+    with store.connect(cfg) as conn:
+        return receive.run_post_receive(conn, args.repo, sys.stdin)
 
 
 # -------------------------------------------------------------------- audit
@@ -540,6 +548,8 @@ def build_parser() -> argparse.ArgumentParser:
     add("install", cmd_hook_install,
         lambda sp: sp.add_argument("--repo", required=True), parent=hook)
     add("pre-receive", cmd_hook_pre_receive,
+        lambda sp: sp.add_argument("--repo", required=True), parent=hook)
+    add("post-receive", cmd_hook_post_receive,
         lambda sp: sp.add_argument("--repo", required=True), parent=hook)
 
     add("audit", cmd_audit, lambda sp: (
