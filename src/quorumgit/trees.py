@@ -251,6 +251,10 @@ def doctor_worktrees(conn: Connection, repair: bool = False) -> list[dict]:
         if repair:
             try:
                 if issue == "missing":
+                    # The directory is already gone, but Git may still retain
+                    # a stale worktree registration that would block reuse of
+                    # the branch. Prune metadata before closing the DB record.
+                    _git(repo_path, "worktree", "prune")
                     _mark_removed(
                         conn,
                         wt,
