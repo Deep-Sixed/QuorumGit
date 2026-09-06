@@ -198,6 +198,15 @@ def test_inflight_branch_freezes_claim_transition(tmp_path, monkeypatch):
         finally:
             blocked.close()
 
+        # A real receive has already placed incoming objects in Git's object
+        # quarantine before pre-receive runs. This direct hook test mirrors that
+        # condition by fetching the committed object into the bare hub before
+        # updating its ref manually.
+        subprocess.run(
+            ["git", "--git-dir", str(hub), "fetch", str(clone), newrev],
+            check=True,
+            capture_output=True,
+        )
         subprocess.run(
             [
                 "git",
