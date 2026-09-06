@@ -32,7 +32,7 @@ Seven concepts, in the order you meet them:
 | **Repository** | A registered Git repo that QuorumGit governs. |
 | **Agent** | A registered identity. Set via `QUORUMGIT_AGENT` or `--agent`. |
 | **Task** | A unit of work against one repository. |
-| **Claim** | An agent's exclusive lease on a task: names a branch, declares write **scopes** (path globs), and expires at a timestamp. Expired leases make the task reclaimable — evaluated at read time, no timers. |
+| **Claim** | An agent's exclusive lease on a task: names a branch, declares write **scopes** (path globs), and expires at a timestamp. Expired leases make the task reclaimable and cannot be renewed — evaluated at read time, no timers. |
 | **Worktree** | An isolated `git worktree` created per claim. Agents never share a mutable checkout; Git itself refuses to check one branch out twice. |
 | **Handoff** | A structured continuation record (done / remaining / exact commit / blockers) that transfers work to a successor instead of abandoning it. |
 | **Approval** | An operator sign-off, hash-bound to one exact operation (a specific push, takeover, or deletion), consumed on use. |
@@ -81,7 +81,7 @@ quorumgit task add --repo myproject --title "implement feature X"
 
 quorumgit claim 1 --branch feat/x --scope 'src/**'
 # claim 1 acquired (CLEAR).
-# worktree: ~/.quorumgit/worktrees/myproject/task-1-agent-one
+# worktree: ~/.quorumgit/worktrees/myproject/task-1-agent-one-claim-1
 # branch: feat/x
 ```
 
@@ -110,7 +110,7 @@ QUORUMGIT_AGENT=agent-two quorumgit handoff accept 1
 # claim 2 acquired. Same worktree, exact commit to continue from.
 ```
 
-What just *didn't* happen, silently: a second agent claiming task 1 (**BLOCKED**), claiming another task on branch `feat/x` (**CONFLICTING**), or claiming a task whose scopes overlap `src/**` (**OVERLAPPING**, refused unless explicitly overridden and audited). While the handoff was open, the task was **reserved** — not claimable by third parties, its branch frozen — until agent-two accepted.
+What just *didn't* happen, silently: a second agent claiming task 1 (**BLOCKED**), claiming another task on branch `feat/x` (**CONFLICTING**), or claiming a task whose scopes overlap `src/**` (**OVERLAPPING**, refused unless explicitly overridden and audited). While the handoff was open, the task, branch, and declared scopes were **reserved** for continuation until agent-two accepted.
 
 ## Conflict classification
 
@@ -188,18 +188,19 @@ Takeovers follow the same pattern: claiming a task someone else holds (`claim <t
 |---|---|
 | `quorumgit init` | Start/provision the store (idempotent) |
 | `quorumgit status` | Store health, contract check, row counts |
+| `quorumgit doctor [--repair]` | Detect and conservatively reconcile recorded managed-worktree drift |
 | `quorumgit destroy --yes` | Stop the store and delete its data |
 | `quorumgit repo add <name> <path> [--protected-ref <ref>]…` | Register a repository |
 | `quorumgit agent add <name>` | Register an agent identity |
 | `quorumgit task add --repo <name> --title <t> [--objective <o>]` | Create a task |
 | `quorumgit claim <task> --branch <b> --scope <glob>… [--no-worktree] [--takeover] [--override-overlap] [--lease-hours <h>]` | Claim a task |
-| `quorumgit renew <claim>` | Extend a lease |
+| `quorumgit renew <claim>` | Extend a live, unexpired lease; expired claims must be acquired again |
 | `quorumgit checkpoint <claim> [--commit <oid>] [--note <n>]` | Record verified progress |
 | `quorumgit release <claim> [--remove-worktree] [--reason <r>]` | Release a claim |
 | `quorumgit handoff create <claim> --completed <c> --remaining <r> [--to <agent>] [--last-commit <oid>]` | Hand work off |
 | `quorumgit handoff accept <id>` | Continue handed-off work (addressee, or anyone if unaddressed) |
-| `quorumgit handoff decline <id>` | Decline — addressee only |
-| `quorumgit handoff cancel <id>` | Cancel — creator only |
+| `quorumgit handoff decline <id>` | Decline — addressee only; clean retained worktree is removed |
+| `quorumgit handoff cancel <id>` | Cancel — creator only; clean retained worktree is removed |
 | `quorumgit handoff list / show <id>` | Inspect handoffs |
 | `quorumgit approve request <json> [--threshold <n>]` | Open an approval for an exact operation |
 | `quorumgit approve vote <hash> [--deny]` | Vote |
@@ -208,6 +209,8 @@ Takeovers follow the same pattern: claiming a task someone else holds (`claim <t
 | `quorumgit audit [--entity <e>] [--entity-id <id>] [--limit <n>]` | Read the audit trail |
 
 `repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
+
+`quorumgit doctor` only checks worktree paths already recorded by QuorumGit. `--repair` can mark a missing recorded checkout removed, prune its stale Git worktree metadata, or remove an orphaned released-claim checkout. Repairs use ordinary non-forced `git worktree remove`; dirty worktrees are reported instead of destroyed.
 
 ## Configuration
 
