@@ -232,7 +232,25 @@ def doctor_worktrees(conn: Connection, repair: bool = False) -> list[dict]:
         ).fetchone() is not None
 
         issue: str | None = None
-        if wt["removed_at"] is None and not exists:
+        identity_error = None
+        if exists:
+            try:
+                expected_common = Path(_git(repo_path, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+                actual_common = Path(_git(wt["path"], "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+                actual_root = Path(_git(wt["path"], "rev-parse", "--show-toplevel")).resolve()
+                actual_branch = _git(wt["path"], "rev-parse", "--symbolic-full-name", "HEAD")
+                if actual_common != expected_common or actual_root != Path(wt["path"]).resolve():
+                    issue = "repository_mismatch"
+                elif actual_branch == "HEAD":
+                    issue = "detached_head"
+                elif actual_branch != f"refs/heads/{wt['branch']}":
+                    issue = "branch_mismatch"
+            except WorktreeError as exc:
+                issue = "unverifiable_checkout"
+                identity_error = str(exc)
+        if issue is not None:
+            pass
+        elif wt["removed_at"] is None and not exists:
             issue = "missing"
         elif wt["removed_at"] is None and released_at is not None and not open_handoff:
             issue = "orphaned"
@@ -248,6 +266,12 @@ def doctor_worktrees(conn: Connection, repair: bool = False) -> list[dict]:
             "issue": issue,
             "repaired": False,
         }
+        if issue in {"repository_mismatch", "branch_mismatch", "detached_head", "unverifiable_checkout"}:
+            finding["error"] = identity_error or (
+                "Checkout identity differs from its recorded ownership; inspect it manually."
+            )
+            findings.append(finding)
+            continue
         if repair:
             try:
                 if issue == "missing":
