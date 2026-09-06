@@ -19,7 +19,28 @@ CREATE UNIQUE INDEX votes_one_registered_agent
 
 -- quorumgit-statement
 UPDATE votes
-SET voter_agent_id = (SELECT id FROM agents WHERE name = votes.voter)
+SET voter_agent_id = (
+    SELECT a.id
+    FROM agents a
+    WHERE a.name = votes.voter
+      AND EXISTS (
+          SELECT 1
+          FROM audit_events vote_event
+          WHERE vote_event.event_type = 'approval.vote'
+            AND vote_event.entity = 'approval'
+            AND vote_event.entity_id = votes.approval_id
+            AND vote_event.agent = votes.voter
+            AND EXISTS (
+                SELECT 1
+                FROM audit_events registration
+                WHERE registration.event_type = 'agent.registered'
+                  AND registration.entity = 'agent'
+                  AND registration.entity_id = a.id
+                  AND registration.agent = a.name
+                  AND registration.id < vote_event.id
+            )
+      )
+)
 WHERE voter_agent_id IS NULL
   AND EXISTS (SELECT 1 FROM agents WHERE name = votes.voter);
 
@@ -31,6 +52,15 @@ SET requested_by_agent_id = (
     WHERE e.event_type = 'approval.requested'
       AND e.entity = 'approval'
       AND e.entity_id = approvals.id
+      AND EXISTS (
+          SELECT 1
+          FROM audit_events registration
+          WHERE registration.event_type = 'agent.registered'
+            AND registration.entity = 'agent'
+            AND registration.entity_id = a.id
+            AND registration.agent = a.name
+            AND registration.id < e.id
+      )
     ORDER BY e.id LIMIT 1
 )
 WHERE requested_by_agent_id IS NULL;
@@ -43,6 +73,15 @@ SET consumed_by_agent_id = (
     WHERE e.event_type = 'approval.consumed'
       AND e.entity = 'approval'
       AND e.entity_id = approvals.id
+      AND EXISTS (
+          SELECT 1
+          FROM audit_events registration
+          WHERE registration.event_type = 'agent.registered'
+            AND registration.entity = 'agent'
+            AND registration.entity_id = a.id
+            AND registration.agent = a.name
+            AND registration.id < e.id
+      )
     ORDER BY e.id DESC LIMIT 1
 )
 WHERE consumed_by_agent_id IS NULL;

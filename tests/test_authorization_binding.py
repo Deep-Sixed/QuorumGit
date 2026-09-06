@@ -22,6 +22,61 @@ def _agents(conn, *names):
         conn.execute("INSERT INTO agents (name) VALUES (?) ON CONFLICT DO NOTHING", (name,))
 
 
+def _apply_001(cfg: Config):
+    conn = store.open_connection(cfg)
+    conn.execute(
+        "CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, "
+        "applied_at INTEGER NOT NULL DEFAULT (unixepoch()))"
+    )
+    migration = Path(store.__file__).parent / "migrations" / "001_core.sql"
+    for statement in store._migration_statements(migration.read_text(encoding="utf-8")):
+        conn.execute(statement)
+    conn.execute("INSERT INTO schema_migrations (version) VALUES ('001_core.sql')")
+    return conn
+
+
+def _register_001_agent(conn, name: str) -> int:
+    row = conn.execute(
+        "INSERT INTO agents (name) VALUES (?) RETURNING id", (name,)
+    ).fetchone()
+    assert row is not None
+    agent_id = row[0]
+    conn.execute(
+        "INSERT INTO audit_events (event_type, entity, entity_id, agent) "
+        "VALUES ('agent.registered', 'agent', ?, ?)",
+        (agent_id, name),
+    )
+    return agent_id
+
+
+def _insert_001_approval(conn, operation: dict, requester: str) -> int:
+    row = conn.execute(
+        "INSERT INTO approvals (operation_hash, operation, status) "
+        "VALUES (?, ?, 'approved') RETURNING id",
+        (gate.operation_hash(operation), store.json_dumps(operation)),
+    ).fetchone()
+    assert row is not None
+    approval_id = row[0]
+    conn.execute(
+        "INSERT INTO audit_events (event_type, entity, entity_id, agent) "
+        "VALUES ('approval.requested', 'approval', ?, ?)",
+        (approval_id, requester),
+    )
+    return approval_id
+
+
+def _insert_001_vote(conn, approval_id: int, voter: str) -> None:
+    conn.execute(
+        "INSERT INTO votes (approval_id, voter, vote) VALUES (?, ?, 1)",
+        (approval_id, voter),
+    )
+    conn.execute(
+        "INSERT INTO audit_events (event_type, entity, entity_id, agent) "
+        "VALUES ('approval.vote', 'approval', ?, ?)",
+        (approval_id, voter),
+    )
+
+
 def test_approval_requester_must_be_registered(conn):
     operation = {"type": "test", "repository": "r"}
     before = conn.execute("SELECT count(*) FROM approvals").fetchone()[0]
@@ -124,34 +179,32 @@ def test_new_approval_rows_reference_registered_agents(conn):
     assert row is not None and all(value is not None for value in row)
 
 
+def test_contract_rejects_001_only_store_until_all_migrations_apply(tmp_path):
+    cfg = Config(data_dir=tmp_path / "only-001", agent=None)
+    conn = _apply_001(cfg)
+    conn.commit()
+    conn.close()
+
+    message = "Missing required migrations: ['002_approval_identities.sql']"
+    with pytest.raises(store.ContractViolation, match=re.escape(message)):
+        store.verify_contract(cfg)
+    with pytest.raises(store.ContractViolation, match=re.escape(message)):
+        store.connect(cfg)
+
+    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    store.verify_contract(cfg)
+    upgraded = store.connect(cfg)
+    upgraded.close()
+
+
 def test_identity_migration_preserves_and_backfills_history(tmp_path):
     cfg = Config(data_dir=tmp_path / "historical", agent=None)
-    conn = store.open_connection(cfg)
-    conn.execute(
-        "CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, "
-        "applied_at INTEGER NOT NULL DEFAULT (unixepoch()))"
-    )
-    migration = Path(store.__file__).parent / "migrations" / "001_core.sql"
-    for statement in store._migration_statements(migration.read_text(encoding="utf-8")):
-        conn.execute(statement)
-    conn.execute("INSERT INTO schema_migrations (version) VALUES ('001_core.sql')")
-    conn.execute("INSERT INTO agents (name) VALUES ('known')")
+    conn = _apply_001(cfg)
+    _register_001_agent(conn, "known")
     operation = {"type": "historical", "repository": "r"}
-    op_hash = gate.operation_hash(operation)
-    conn.execute(
-        "INSERT INTO approvals (operation_hash, operation, status) VALUES (?, ?, 'approved')",
-        (op_hash, store.json_dumps(operation)),
-    )
-    conn.execute(
-        "INSERT INTO votes (approval_id, voter, vote) VALUES (1, 'known', 1)"
-    )
-    conn.execute(
-        "INSERT INTO votes (approval_id, voter, vote) VALUES (1, 'legacy-ghost', 1)"
-    )
-    conn.execute(
-        "INSERT INTO audit_events (event_type, entity, entity_id, agent) "
-        "VALUES ('approval.requested', 'approval', 1, 'known')"
-    )
+    approval_id = _insert_001_approval(conn, operation, "known")
+    _insert_001_vote(conn, approval_id, "known")
+    _insert_001_vote(conn, approval_id, "legacy-ghost")
     conn.commit()
     conn.close()
 
@@ -183,6 +236,74 @@ def test_identity_migration_preserves_and_backfills_history(tmp_path):
             )
     finally:
         migrated.rollback()
+        migrated.close()
+
+
+def test_migration_does_not_backfill_requester_registered_after_request(tmp_path):
+    cfg = Config(data_dir=tmp_path / "late-requester", agent=None)
+    conn = _apply_001(cfg)
+    operation = {"type": "late-requester", "repository": "r"}
+    approval_id = _insert_001_approval(conn, operation, "ghost")
+    _register_001_agent(conn, "ghost")
+    conn.commit()
+    conn.close()
+
+    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    migrated = store.connect(cfg)
+    try:
+        row = migrated.execute(
+            "SELECT requested_by_agent_id, status FROM approvals WHERE id = ?",
+            (approval_id,),
+        ).fetchone()
+        assert row == (None, "denied")
+        event = migrated.execute(
+            "SELECT detail FROM audit_events "
+            "WHERE event_type = 'approval.identity_invalidated' AND entity_id = ?",
+            (approval_id,),
+        ).fetchone()
+        assert event is not None
+        assert store.json_loads(event[0], {})["reason"] == (
+            "unregistered historical requester"
+        )
+    finally:
+        migrated.close()
+
+
+def test_migration_does_not_backfill_voter_registered_after_vote(tmp_path):
+    cfg = Config(data_dir=tmp_path / "late-voter", agent=None)
+    conn = _apply_001(cfg)
+    _register_001_agent(conn, "requester")
+    operation = {"type": "late-voter", "repository": "r"}
+    approval_id = _insert_001_approval(conn, operation, "requester")
+    _insert_001_vote(conn, approval_id, "ghost")
+    _register_001_agent(conn, "ghost")
+    conn.commit()
+    conn.close()
+
+    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    migrated = store.connect(cfg)
+    try:
+        approval = migrated.execute(
+            "SELECT requested_by_agent_id, status FROM approvals WHERE id = ?",
+            (approval_id,),
+        ).fetchone()
+        vote = migrated.execute(
+            "SELECT voter_agent_id FROM votes WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+        assert approval is not None and approval[0] is not None
+        assert approval[1] == "denied"
+        assert vote == (None,)
+        event = migrated.execute(
+            "SELECT detail FROM audit_events "
+            "WHERE event_type = 'approval.identity_invalidated' AND entity_id = ?",
+            (approval_id,),
+        ).fetchone()
+        assert event is not None
+        assert store.json_loads(event[0], {})["reason"] == (
+            "unregistered historical voter"
+        )
+    finally:
         migrated.close()
 
 
