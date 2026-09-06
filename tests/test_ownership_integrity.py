@@ -98,9 +98,10 @@ def test_expired_claim_does_not_resurrect_cross_task_branch(conn, git_repo):
     with pytest.raises(work.WorkError, match="expired"):
         work.renew_claim(conn, old, a)
     assert work.get_claim(conn, new)["agent"] == b
-    assert work.live_claim_for_branch(
+    live = work.live_claim_for_branch(
         conn, work.get_task(conn, second)["repository_id"], "feat/shared"
-    )["id"] == new
+    )
+    assert live is not None and live["id"] == new
 
 
 def test_open_handoff_reserves_branch_across_tasks(conn, git_repo):
@@ -150,7 +151,8 @@ def test_unauthorized_remove_does_not_touch_worktree(conn, git_repo, cfg):
     with pytest.raises(trees.WorktreeError, match="belongs to"):
         trees.remove_worktree(conn, claim, b)
     assert Path(wt["path"]).exists()
-    assert trees.worktree_for_claim(conn, claim)["removed_at"] is None
+    recorded = trees.worktree_for_claim(conn, claim)
+    assert recorded is not None and recorded["removed_at"] is None
 
 
 def test_same_task_same_agent_can_create_new_worktree_after_release(
@@ -180,10 +182,13 @@ def test_decline_cleans_retained_handoff_worktree(conn, git_repo, cfg):
         conn, task, a, branch="feat/decline", scope_globs=["src/**"]
     )
     wt = trees.create_worktree(conn, claim, cfg.worktrees_dir)
-    hid = handoff.create_handoff(conn, claim, a, _handoff_record(git_repo), to_agent=b)
+    hid = handoff.create_handoff(
+        conn, claim, a, _handoff_record(git_repo), to_agent=b
+    )
     handoff.decline_handoff(conn, hid, b)
     assert not Path(wt["path"]).exists()
-    assert trees.worktree_for_claim(conn, claim)["removed_at"] is not None
+    recorded = trees.worktree_for_claim(conn, claim)
+    assert recorded is not None and recorded["removed_at"] is not None
     assert handoff.get_handoff(conn, hid)["status"] == "declined"
 
 
@@ -197,7 +202,8 @@ def test_cancel_cleans_retained_handoff_worktree(conn, git_repo, cfg):
     hid = handoff.create_handoff(conn, claim, a, _handoff_record(git_repo))
     handoff.cancel_handoff(conn, hid, a)
     assert not Path(wt["path"]).exists()
-    assert trees.worktree_for_claim(conn, claim)["removed_at"] is not None
+    recorded = trees.worktree_for_claim(conn, claim)
+    assert recorded is not None and recorded["removed_at"] is not None
     assert handoff.get_handoff(conn, hid)["status"] == "cancelled"
 
 
@@ -209,10 +215,11 @@ def test_dirty_handoff_worktree_is_not_force_removed(conn, git_repo, cfg):
     )
     wt = trees.create_worktree(conn, claim, cfg.worktrees_dir)
     (Path(wt["path"]) / "dirty.txt").write_text("do not delete\n")
-    hid = handoff.create_handoff(conn, claim, a, _handoff_record(git_repo), to_agent=b)
+    hid = handoff.create_handoff(
+        conn, claim, a, _handoff_record(git_repo), to_agent=b
+    )
     with pytest.raises(trees.WorktreeError):
         handoff.decline_handoff(conn, hid, b)
-    conn.rollback()
     assert Path(wt["path"]).exists()
     assert handoff.get_handoff(conn, hid)["status"] == "open"
 
@@ -229,7 +236,8 @@ def test_doctor_repairs_missing_recorded_worktree(conn, git_repo, cfg):
     assert any(f["issue"] == "missing" for f in findings)
     repaired = trees.doctor_worktrees(conn, repair=True)
     assert any(f["issue"] == "missing" and f["repaired"] for f in repaired)
-    assert trees.worktree_for_claim(conn, claim)["removed_at"] is not None
+    recorded = trees.worktree_for_claim(conn, claim)
+    assert recorded is not None and recorded["removed_at"] is not None
 
 
 def test_doctor_removes_orphaned_released_worktree(conn, git_repo, cfg):
@@ -245,7 +253,8 @@ def test_doctor_removes_orphaned_released_worktree(conn, git_repo, cfg):
     repaired = trees.doctor_worktrees(conn, repair=True)
     assert any(f["issue"] == "orphaned" and f["repaired"] for f in repaired)
     assert not Path(wt["path"]).exists()
-    assert trees.worktree_for_claim(conn, claim)["removed_at"] is not None
+    recorded = trees.worktree_for_claim(conn, claim)
+    assert recorded is not None and recorded["removed_at"] is not None
 
 
 def test_cross_process_same_branch_has_one_winner(
