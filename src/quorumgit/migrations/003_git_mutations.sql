@@ -43,3 +43,69 @@ CREATE UNIQUE INDEX git_mutations_one_reserved_approval
 -- quorumgit-statement
 CREATE INDEX git_mutations_by_repository_status
     ON git_mutations(repository_id, status, expires_at);
+
+-- quorumgit-statement
+CREATE TRIGGER claims_blocked_by_git_mutation_insert
+BEFORE INSERT ON claims
+WHEN EXISTS (
+    SELECT 1
+    FROM tasks t
+    JOIN git_mutations m ON m.repository_id = t.repository_id
+    WHERE t.id = NEW.task_id
+      AND m.refname = 'refs/heads/' || NEW.branch
+      AND m.status = 'reserved'
+      AND m.expires_at >= unixepoch()
+)
+BEGIN
+    SELECT RAISE(ABORT, 'branch has an in-flight Git mutation');
+END;
+
+-- quorumgit-statement
+CREATE TRIGGER claims_blocked_by_git_mutation_update
+BEFORE UPDATE OF lease_expires_at, released_at, release_reason ON claims
+WHEN EXISTS (
+    SELECT 1
+    FROM tasks t
+    JOIN git_mutations m ON m.repository_id = t.repository_id
+    WHERE t.id = OLD.task_id
+      AND m.refname = 'refs/heads/' || OLD.branch
+      AND m.status = 'reserved'
+      AND m.expires_at >= unixepoch()
+)
+BEGIN
+    SELECT RAISE(ABORT, 'branch has an in-flight Git mutation');
+END;
+
+-- quorumgit-statement
+CREATE TRIGGER handoffs_blocked_by_git_mutation_insert
+BEFORE INSERT ON handoffs
+WHEN EXISTS (
+    SELECT 1
+    FROM claims c
+    JOIN tasks t ON t.id = c.task_id
+    JOIN git_mutations m ON m.repository_id = t.repository_id
+    WHERE c.id = NEW.from_claim_id
+      AND m.refname = 'refs/heads/' || c.branch
+      AND m.status = 'reserved'
+      AND m.expires_at >= unixepoch()
+)
+BEGIN
+    SELECT RAISE(ABORT, 'branch has an in-flight Git mutation');
+END;
+
+-- quorumgit-statement
+CREATE TRIGGER handoffs_blocked_by_git_mutation_update
+BEFORE UPDATE OF status, to_agent_id, resolved_at ON handoffs
+WHEN EXISTS (
+    SELECT 1
+    FROM claims c
+    JOIN tasks t ON t.id = c.task_id
+    JOIN git_mutations m ON m.repository_id = t.repository_id
+    WHERE c.id = OLD.from_claim_id
+      AND m.refname = 'refs/heads/' || c.branch
+      AND m.status = 'reserved'
+      AND m.expires_at >= unixepoch()
+)
+BEGIN
+    SELECT RAISE(ABORT, 'branch has an in-flight Git mutation');
+END;
