@@ -63,10 +63,14 @@ def _identity_conflict(
             continue
         try:
             existing_common = git_common_dir(path)
-        except RegistryError as exc:
-            raise RegistryError(
-                f"Cannot verify registered repository {name!r} at {path!r}: {exc}"
-            ) from exc
+        except RegistryError:
+            # A historical registration may outlive its checkout (for example
+            # after an operator removes a repository or a test fixture is
+            # cleaned up). It cannot prove an alias of the currently valid
+            # target, so it must not wedge every later governance operation.
+            # The target repository itself is still resolved strictly before
+            # this scan by add_repository()/assert_repository_identity_unique().
+            continue
         if existing_common == common_dir:
             return {
                 "id": repository_id,
