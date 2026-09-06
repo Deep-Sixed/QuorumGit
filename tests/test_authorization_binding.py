@@ -35,6 +35,13 @@ def _apply_001(cfg: Config):
     return conn
 
 
+def _migrate_after_001(cfg: Config) -> list[str]:
+    """Apply every packaged successor while keeping the identity migration first."""
+    applied = store.migrate(cfg)
+    assert applied and applied[0] == "002_approval_identities.sql"
+    return applied
+
+
 def _register_001_agent(conn, name: str) -> int:
     row = conn.execute(
         "INSERT INTO agents (name) VALUES (?) RETURNING id", (name,)
@@ -185,13 +192,16 @@ def test_contract_rejects_001_only_store_until_all_migrations_apply(tmp_path):
     conn.commit()
     conn.close()
 
-    message = "Missing required migrations: ['002_approval_identities.sql']"
-    with pytest.raises(store.ContractViolation, match=re.escape(message)):
-        store.verify_contract(cfg)
-    with pytest.raises(store.ContractViolation, match=re.escape(message)):
-        store.connect(cfg)
+    for opener in (store.verify_contract, store.connect):
+        with pytest.raises(store.ContractViolation) as caught:
+            opener(cfg)
+        message = str(caught.value)
+        assert "002_approval_identities.sql" in message
+        assert "003_git_mutations.sql" in message
+        assert "Run `quorumgit init`" in message
 
-    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    applied = _migrate_after_001(cfg)
+    assert "003_git_mutations.sql" in applied
     store.verify_contract(cfg)
     upgraded = store.connect(cfg)
     upgraded.close()
@@ -208,7 +218,8 @@ def test_identity_migration_preserves_and_backfills_history(tmp_path):
     conn.commit()
     conn.close()
 
-    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    applied = _migrate_after_001(cfg)
+    assert "003_git_mutations.sql" in applied
     migrated = store.connect(cfg)
     try:
         requester = migrated.execute(
@@ -248,7 +259,8 @@ def test_migration_does_not_backfill_requester_registered_after_request(tmp_path
     conn.commit()
     conn.close()
 
-    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    applied = _migrate_after_001(cfg)
+    assert "003_git_mutations.sql" in applied
     migrated = store.connect(cfg)
     try:
         row = migrated.execute(
@@ -280,7 +292,8 @@ def test_migration_does_not_backfill_voter_registered_after_vote(tmp_path):
     conn.commit()
     conn.close()
 
-    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    applied = _migrate_after_001(cfg)
+    assert "003_git_mutations.sql" in applied
     migrated = store.connect(cfg)
     try:
         approval = migrated.execute(
