@@ -33,6 +33,15 @@ def _git(repo_path: str | Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _git_common_dir(repo_path: str | Path) -> Path:
+    """Resolve Git's common directory without requiring newer rev-parse flags."""
+    base = Path(repo_path).resolve()
+    common = Path(_git(base, "rev-parse", "--git-common-dir"))
+    if not common.is_absolute():
+        common = base / common
+    return common.resolve()
+
+
 def create_worktree(
     conn: Connection, claim_id: int, worktrees_dir: Path, base_ref: str = "HEAD"
 ) -> dict:
@@ -235,11 +244,18 @@ def doctor_worktrees(conn: Connection, repair: bool = False) -> list[dict]:
         identity_error = None
         if exists:
             try:
-                expected_common = Path(_git(repo_path, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
-                actual_common = Path(_git(wt["path"], "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
-                actual_root = Path(_git(wt["path"], "rev-parse", "--show-toplevel")).resolve()
-                actual_branch = _git(wt["path"], "rev-parse", "--symbolic-full-name", "HEAD")
-                if actual_common != expected_common or actual_root != Path(wt["path"]).resolve():
+                expected_common = _git_common_dir(repo_path)
+                actual_common = _git_common_dir(wt["path"])
+                actual_root = Path(
+                    _git(wt["path"], "rev-parse", "--show-toplevel")
+                ).resolve()
+                actual_branch = _git(
+                    wt["path"], "rev-parse", "--symbolic-full-name", "HEAD"
+                )
+                if (
+                    actual_common != expected_common
+                    or actual_root != Path(wt["path"]).resolve()
+                ):
                     issue = "repository_mismatch"
                 elif actual_branch == "HEAD":
                     issue = "detached_head"
@@ -266,7 +282,12 @@ def doctor_worktrees(conn: Connection, repair: bool = False) -> list[dict]:
             "issue": issue,
             "repaired": False,
         }
-        if issue in {"repository_mismatch", "branch_mismatch", "detached_head", "unverifiable_checkout"}:
+        if issue in {
+            "repository_mismatch",
+            "branch_mismatch",
+            "detached_head",
+            "unverifiable_checkout",
+        }:
             finding["error"] = identity_error or (
                 "Checkout identity differs from its recorded ownership; inspect it manually."
             )
