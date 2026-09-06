@@ -16,7 +16,12 @@ from typing import Any, Iterable
 
 from . import audit
 from .canonical import stable_hash
-from .registry import assert_repository_identity_unique, get_repository
+from .registry import (
+    RegistryError,
+    assert_repository_identity_unique,
+    get_agent,
+    get_repository,
+)
 from .store import Connection, begin_immediate, json_dumps, json_loads
 from .work import live_claim_for_branch, open_handoff_for_branch
 
@@ -39,6 +44,37 @@ def operation_hash(operation: dict[str, Any]) -> str:
     if not operation.get("type") or not operation.get("repository"):
         raise GateError("Operation requires 'type' and 'repository' fields.")
     return stable_hash(operation)
+
+
+def _validate_takeover_operation(conn: Connection, operation: dict[str, Any]) -> None:
+    if operation.get("type") != "lease_takeover":
+        return
+    required = ("task_id", "from_claim_id", "from_agent", "to_agent")
+    missing = [field for field in required if operation.get(field) is None]
+    if missing:
+        raise GateError(f"Lease takeover operation is missing fields: {missing}")
+    get_agent(conn, str(operation["to_agent"]))
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM claims c
+        JOIN agents a ON a.id = c.agent_id
+        JOIN tasks t ON t.id = c.task_id
+        JOIN repositories r ON r.id = t.repository_id
+        WHERE c.id = ? AND c.task_id = ? AND a.name = ? AND r.name = ?
+          AND c.released_at IS NULL AND c.lease_expires_at >= unixepoch()
+        """,
+        (
+            operation["from_claim_id"],
+            operation["task_id"],
+            operation["from_agent"],
+            operation["repository"],
+        ),
+    ).fetchone()
+    if row is None:
+        raise GateError(
+            "Lease takeover operation does not match the current live incumbent claim."
+        )
 
 
 def _approval_dict(row) -> dict:
@@ -65,6 +101,8 @@ def request_approval(
     fresh approval instance. BEGIN IMMEDIATE makes that lifecycle race-free.
     """
     begin_immediate(conn)
+    requester = get_agent(conn, requested_by)
+    _validate_takeover_operation(conn, operation)
     op_hash = operation_hash(operation)
     existing = conn.execute(
         """
@@ -81,11 +119,13 @@ def request_approval(
 
     row = conn.execute(
         """
-        INSERT INTO approvals (operation_hash, operation, threshold)
-        VALUES (?, ?, ?)
+        INSERT INTO approvals (
+            operation_hash, operation, threshold, requested_by_agent_id
+        )
+        VALUES (?, ?, ?, ?)
         RETURNING id
         """,
-        (op_hash, json_dumps(operation), threshold),
+        (op_hash, json_dumps(operation), threshold, requester["id"]),
     ).fetchone()
     assert row is not None
     audit.record(
@@ -116,23 +156,40 @@ def get_approval(conn: Connection, op_hash: str) -> dict:
     return _approval_dict(row)
 
 
-def vote(conn: Connection, op_hash: str, voter: str, approve: bool) -> dict:
-    """Record a vote and decide the newest approval instance atomically.
+def get_approval_by_id(conn: Connection, approval_id: int) -> dict:
+    row = conn.execute(
+        """
+        SELECT id, operation_hash, operation, threshold, status, consumed_at
+        FROM approvals WHERE id = ?
+        """,
+        (approval_id,),
+    ).fetchone()
+    if row is None:
+        raise GateError(f"No approval request exists with id {approval_id}")
+    return _approval_dict(row)
+
+
+def vote(conn: Connection, approval_id: int, voter: str, approve: bool) -> dict:
+    """Record a vote against one explicit approval instance atomically.
 
     BEGIN IMMEDIATE serializes competing voters before either reads the current
     approval state. Denial has precedence and terminal states remain final.
     """
     begin_immediate(conn)
-    approval = get_approval(conn, op_hash)
+    voter_row = get_agent(conn, voter)
+    approval = get_approval_by_id(conn, approval_id)
     if approval["status"] != "pending":
-        raise GateError(f"Approval {op_hash} is already {approval['status']}.")
+        raise GateError(f"Approval {approval_id} is already {approval['status']}.")
     threshold = approval["threshold"]
     conn.execute(
         """
-        INSERT INTO votes (approval_id, voter, vote) VALUES (?, ?, ?)
-        ON CONFLICT (approval_id, voter) DO UPDATE SET vote = excluded.vote
+        INSERT INTO votes (approval_id, voter, vote, voter_agent_id)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (approval_id, voter) DO UPDATE SET
+            vote = excluded.vote,
+            voter_agent_id = excluded.voter_agent_id
         """,
-        (approval["id"], voter, approve),
+        (approval["id"], voter, approve, voter_row["id"]),
     )
     audit.record(
         conn,
@@ -140,7 +197,7 @@ def vote(conn: Connection, op_hash: str, voter: str, approve: bool) -> dict:
         "approval",
         approval["id"],
         agent=voter,
-        detail={"vote": approve, "hash": op_hash},
+        detail={"vote": approve, "hash": approval["operation_hash"]},
     )
 
     counts = conn.execute(
@@ -168,9 +225,9 @@ def vote(conn: Connection, op_hash: str, voter: str, approve: bool) -> dict:
             f"approval.{new_status}",
             "approval",
             approval["id"],
-            detail={"hash": op_hash},
+            detail={"hash": approval["operation_hash"]},
         )
-    return get_approval(conn, op_hash)
+    return get_approval_by_id(conn, approval_id)
 
 
 def is_approved(conn: Connection, operation: dict[str, Any]) -> bool:
@@ -182,24 +239,42 @@ def is_approved(conn: Connection, operation: dict[str, Any]) -> bool:
     return approval["status"] == "approved" and approval["operation"] == operation
 
 
-def consume_approval(conn: Connection, operation: dict[str, Any], agent: str) -> None:
+def approved_instance(conn: Connection, operation: dict[str, Any]) -> dict | None:
+    try:
+        approval = get_approval(conn, operation_hash(operation))
+    except GateError:
+        return None
+    if approval["status"] == "approved" and approval["operation"] == operation:
+        return approval
+    return None
+
+
+def consume_approval(
+    conn: Connection, approval_id: int, operation: dict[str, Any], agent: str
+) -> None:
     """Atomically consume one approved exact-operation authorization."""
     begin_immediate(conn)
+    consumer = get_agent(conn, agent)
     op_hash = operation_hash(operation)
-    approval = get_approval(conn, op_hash)
+    approval = get_approval_by_id(conn, approval_id)
+    if approval["operation_hash"] != op_hash or approval["operation"] != operation:
+        raise GateError(
+            f"Approval {approval_id} is not bound to the requested operation."
+        )
     if approval["status"] != "approved":
         raise GateError(
             f"Approval {op_hash} is not consumable (status "
             f"{approval['status']}); it may already be used."
         )
     cur = conn.execute(
-        "UPDATE approvals SET status = 'consumed', consumed_at = unixepoch() "
+        "UPDATE approvals SET status = 'consumed', consumed_at = unixepoch(), "
+        "consumed_by_agent_id = ? "
         "WHERE id = ? AND status = 'approved'",
-        (approval["id"],),
+        (consumer["id"], approval["id"]),
     )
     if cur.rowcount != 1:
         raise GateError(
-            f"Approval {op_hash} was consumed concurrently; refusing to "
+            f"Approval {approval_id} was consumed concurrently; refusing to "
             "authorize twice."
         )
     audit.record(
@@ -321,12 +396,14 @@ def check_ref_update(
             "oldrev": oldrev,
             "newrev": newrev,
         }
-        if not is_approved(conn, operation):
+        approval = approved_instance(conn, operation)
+        if approval is None:
             raise PushRejected(
                 f"{operation['type']} on {refname} requires an approval "
                 f"bound to this exact update (hash {operation_hash(operation)})."
             )
-        consume_approval(conn, operation, agent=pusher or "")
+        assert pusher is not None
+        consume_approval(conn, approval["id"], operation, agent=pusher)
         audit.record(
             conn,
             "gate.protected_update_allowed",
@@ -358,6 +435,14 @@ def run_pre_receive(
     pusher = os.environ.get("QUORUMGIT_AGENT") or None
     try:
         begin_immediate(conn)
+        if pusher is None:
+            raise PushRejected(
+                "Pusher identity required; set QUORUMGIT_AGENT to a registered agent."
+            )
+        try:
+            get_agent(conn, pusher)
+        except RegistryError as exc:
+            raise PushRejected(f"Pusher identity is not registered: {pusher}") from exc
         saw_update = False
         for line in stdin_lines:
             parts = line.split()

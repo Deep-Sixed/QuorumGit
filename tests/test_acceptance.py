@@ -41,6 +41,7 @@ def test_full_workflow(committed_conn, cfg, tmp_path, initialized_store):
     agent_a, agent_b = f"a-{suffix}", f"b-{suffix}"
     registry.add_agent(conn, agent_a)
     registry.add_agent(conn, agent_b)
+    conn.execute("INSERT INTO agents (name) VALUES ('operator') ON CONFLICT DO NOTHING")
 
     task_a = work.create_task(
         conn, repo_name, "implement feature", objective="build the feature in src/"
@@ -150,10 +151,11 @@ def test_full_workflow(committed_conn, cfg, tmp_path, initialized_store):
             branch="feat/feature-2",
             scope_globs=["src/**"],
         )
-    gate.request_approval(conn, takeover_op, requested_by="operator")
-    gate.vote(conn, gate.operation_hash(takeover_op), "operator", True)
+    takeover_op["from_claim_id"] = holder["id"]
+    approval = gate.request_approval(conn, takeover_op, requested_by="operator")
+    gate.vote(conn, approval["id"], "operator", True)
     assert gate.is_approved(conn, takeover_op)
-    gate.consume_approval(conn, takeover_op, agent=agent_a)
+    gate.consume_approval(conn, approval["id"], takeover_op, agent=agent_a)
     claim_back, _, _ = work.claim_task(
         conn,
         task_a,

@@ -164,9 +164,11 @@ The flow, driven by the rejection messages themselves:
 #    protected_ref_update on refs/heads/main requires an approval
 #    bound to this exact update (hash sha256:ab12…).
 
-# 2. The operator approves that exact operation:
+# 2. A registered operator requests that exact operation, then votes on the
+#    returned approval instance ID:
 quorumgit approve request '{"type":"protected_ref_update","repository":"myproject","refname":"refs/heads/main","oldrev":"<old>","newrev":"<new>"}'
-quorumgit approve vote sha256:ab12… --agent operator
+# approval 17 hash=sha256:ab12… status=pending
+quorumgit approve vote 17 --agent operator
 
 # 3. The same push now lands. Pushing it again — or replaying the approval — is rejected:
 #    the approval was consumed atomically when the operation was accepted.
@@ -177,10 +179,11 @@ Rules that hold no matter what:
 - **An approval never bypasses branch reservations.** A claimed branch still accepts pushes only from its claiming agent; a branch frozen by an open handoff accepts none at all. The hook checks reservations *before* approvals.
 - **Denial has precedence and is terminal.** One `--deny` vote denies the approval; later yes votes are refused.
 - **Consumption is single-use under concurrency.** Two simultaneous pushes racing for one approval produce exactly one accepted push — the loser is rejected, not silently allowed.
+- **Votes bind to one approval instance.** A delayed vote for an older denied or consumed instance cannot decide a newer request with the same operation hash. Requesters, voters, consumers, and pushers must name registered agents.
 - **A consumed approval is spent, not blacklisted.** Consumption moves the approval to a terminal `consumed` state (with `consumed_at`) rather than reusing `denied`, and only one *live* (`pending` or `approved`) approval may exist per operation hash. The same operation can therefore be requested and approved again later as a new approval instance — which matters for takeovers, whose payload is stable and legitimately repeatable. What is never possible is one approval authorizing twice.
 - The default threshold is 1 (a human operator); the vote schema supports higher thresholds.
 
-Takeovers follow the same pattern: claiming a task someone else holds (`claim <task> --takeover`) prints the takeover operation to approve. The takeover is atomic — the incumbent is released, the replacement claim created, and the approval consumed in one transaction, or none of it happens. A refused takeover leaves the incumbent untouched and the approval unconsumed.
+Takeovers follow the same pattern: claiming a task someone else holds (`claim <task> --takeover`) prints the takeover operation to approve. Its payload includes the incumbent claim ID, so an unused approval cannot displace a later claim by the same agent. The takeover is atomic — the incumbent is released, the replacement claim created, and the approval consumed in one transaction, or none of it happens. A refused takeover leaves the incumbent untouched and the approval unconsumed.
 
 ## Command reference
 
@@ -203,7 +206,7 @@ Takeovers follow the same pattern: claiming a task someone else holds (`claim <t
 | `quorumgit handoff cancel <id>` | Cancel — creator only; clean retained worktree is removed |
 | `quorumgit handoff list / show <id>` | Inspect handoffs |
 | `quorumgit approve request <json> [--threshold <n>]` | Open an approval for an exact operation |
-| `quorumgit approve vote <hash> [--deny]` | Vote |
+| `quorumgit approve vote <approval-id> [--deny]` | Vote on one approval instance |
 | `quorumgit approve hash <json>` | Compute an operation's hash |
 | `quorumgit hook install --repo <name>` | Install the pre-receive hook (hub model) |
 | `quorumgit audit [--entity <e>] [--entity-id <id>] [--limit <n>]` | Read the audit trail |

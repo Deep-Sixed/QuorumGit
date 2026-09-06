@@ -34,6 +34,8 @@ def _pending_approval(conn, threshold=1):
         "repository": "vote-race",
         "n": uuid.uuid4().hex,
     }
+    for name in ("op", "voter-1", "voter-2"):
+        conn.execute("INSERT INTO agents (name) VALUES (?) ON CONFLICT DO NOTHING", (name,))
     gate.request_approval(conn, op, requested_by="op", threshold=threshold)
     return op
 
@@ -49,14 +51,16 @@ def _race_votes(initialized_store, op, first_vote, second_vote):
     def racer():
         started.set()
         try:
-            gate.vote(conn2, op_hash, "voter-2", second_vote)
+            approval_id = gate.get_approval(conn2, op_hash)["id"]
+            gate.vote(conn2, approval_id, "voter-2", second_vote)
             conn2.commit()
         except gate.GateError as exc:
             second_error.append(exc)
             conn2.rollback()
 
     try:
-        gate.vote(conn1, op_hash, "voter-1", first_vote)
+        approval_id = gate.get_approval(conn1, op_hash)["id"]
+        gate.vote(conn1, approval_id, "voter-1", first_vote)
         thread = threading.Thread(target=racer)
         thread.start()
         started.wait(timeout=10)
@@ -103,17 +107,19 @@ def test_concurrent_yes_votes_satisfy_threshold(initialized_store):
 def test_denial_is_terminal(conn):
     op = _pending_approval(conn)
     op_hash = gate.operation_hash(op)
-    gate.vote(conn, op_hash, "voter-1", False)
+    approval_id = gate.get_approval(conn, op_hash)["id"]
+    gate.vote(conn, approval_id, "voter-1", False)
     assert gate.get_approval(conn, op_hash)["status"] == "denied"
     with pytest.raises(gate.GateError, match="already denied"):
-        gate.vote(conn, op_hash, "voter-2", True)
+        gate.vote(conn, approval_id, "voter-2", True)
 
 
 def test_duplicate_voter_counts_once(conn):
     op = _pending_approval(conn, threshold=2)
     op_hash = gate.operation_hash(op)
-    gate.vote(conn, op_hash, "voter-1", True)
-    result = gate.vote(conn, op_hash, "voter-1", True)
+    approval_id = gate.get_approval(conn, op_hash)["id"]
+    gate.vote(conn, approval_id, "voter-1", True)
+    result = gate.vote(conn, approval_id, "voter-1", True)
     assert result["status"] == "pending"
 
 
@@ -141,8 +147,9 @@ def _approve_update(conn, repo_name, hub, clone, refname="refs/heads/main"):
         "oldrev": oldrev,
         "newrev": newrev,
     }
-    gate.request_approval(conn, op, requested_by="operator")
-    gate.vote(conn, gate.operation_hash(op), "operator", True)
+    conn.execute("INSERT INTO agents (name) VALUES ('operator') ON CONFLICT DO NOTHING")
+    approval = gate.request_approval(conn, op, requested_by="operator")
+    gate.vote(conn, approval["id"], "operator", True)
     conn.commit()
     return op
 
@@ -203,15 +210,19 @@ def test_refused_takeover_preserves_holder_and_approval(committed_conn, tmp_path
     task2 = work.create_task(conn, repo_name, "other work")
     work.claim_task(conn, task2, b, branch="feat/two", scope_globs=["docs/**"])
 
+    incumbent = work.active_claim_for_task(conn, task1)
+    assert incumbent is not None
     operation = {
         "type": "lease_takeover",
         "repository": repo_name,
         "task_id": task1,
+        "from_claim_id": incumbent["id"],
         "from_agent": a,
         "to_agent": c,
     }
-    gate.request_approval(conn, operation, requested_by="operator")
-    gate.vote(conn, gate.operation_hash(operation), "operator", True)
+    conn.execute("INSERT INTO agents (name) VALUES ('operator') ON CONFLICT DO NOTHING")
+    approval = gate.request_approval(conn, operation, requested_by="operator")
+    gate.vote(conn, approval["id"], "operator", True)
     conn.commit()
 
     refused = _cli(
