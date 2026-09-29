@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,23 @@ REQUIRED_TABLES = (
     "votes",
     "conflict_events",
     "audit_events",
+    "repository_approval_roles",
+)
+
+# Engine-level governance rules. A store missing any of these would still
+# have every table, so the contract checks them by name as well.
+REQUIRED_TRIGGERS = (
+    "audit_events_no_update",
+    "audit_events_no_delete",
+    "approvals_require_registered_requester",
+    "approvals_require_registered_consumer",
+    "votes_require_registered_voter",
+    "vote_updates_require_registered_voter",
+    "repositories_default_approval_roles",
+    "approvals_require_registered_repository",
+    "votes_require_eligible_voter",
+    "vote_updates_require_eligible_voter",
+    "approvals_consumer_is_not_approver",
 )
 
 
@@ -135,6 +154,22 @@ def connect(cfg: Config) -> Connection:
         conn.close()
         raise
     return conn
+
+
+@contextmanager
+def session(cfg: Config) -> Iterator[Connection]:
+    """One command's connection: commit on success, roll back on error, close.
+
+    sqlite3's own context manager ends the transaction but leaves the
+    connection open until garbage collection; closing it here releases the
+    database file as soon as the command is done with it.
+    """
+    conn = connect(cfg)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def _is_locked_error(exc: sqlite3.OperationalError) -> bool:
@@ -319,10 +354,9 @@ def verify_contract(target: Config | Connection | str | Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        missing = set(REQUIRED_TABLES) - tables
-        if missing:
+        if "schema_migrations" not in tables:
             raise ContractViolation(
-                f"Missing required tables: {sorted(missing)}. "
+                "Missing required tables: ['schema_migrations']. "
                 "Run `quorumgit init` to apply migrations."
             )
 
@@ -338,6 +372,25 @@ def verify_contract(target: Config | Connection | str | Path) -> None:
             raise ContractViolation(
                 f"Missing required migrations: {sorted(missing_migrations)}. "
                 "Run `quorumgit init` to apply migrations."
+            )
+
+        missing = set(REQUIRED_TABLES) - tables
+        if missing:
+            raise ContractViolation(
+                f"Missing required tables: {sorted(missing)}. "
+                "Run `quorumgit init` to apply migrations."
+            )
+
+        triggers = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+        }
+        missing_triggers = set(REQUIRED_TRIGGERS) - triggers
+        if missing_triggers:
+            raise ContractViolation(
+                f"Missing required governance triggers: {sorted(missing_triggers)}."
             )
 
         foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]

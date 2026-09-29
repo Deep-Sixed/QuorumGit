@@ -13,7 +13,7 @@ import pytest
 from quorumgit import gate, registry, store, work
 from quorumgit.config import Config
 from quorumgit.registry import RegistryError
-from tests.conftest import make_git_repo
+from tests.conftest import approve, ensure_agent, make_git_repo, register_repo
 from tests.test_cli_hub import _cli
 from tests.test_gate import _commit, _push, _setup
 
@@ -34,6 +34,12 @@ def _apply_001(cfg: Config):
         conn.execute(statement)
     conn.execute("INSERT INTO schema_migrations (version) VALUES ('001_core.sql')")
     return conn
+
+
+UPGRADE_MIGRATIONS = [
+    "002_approval_identities.sql",
+    "004_approval_authority.sql",
+]
 
 
 def _register_001_agent(conn, name: str) -> int:
@@ -78,17 +84,17 @@ def _insert_001_vote(conn, approval_id: int, voter: str) -> None:
     )
 
 
-def test_approval_requester_must_be_registered(conn):
-    operation = {"type": "test", "repository": "r"}
+def test_approval_requester_must_be_registered(conn, approval_repo):
+    operation = {"type": "test", "repository": approval_repo}
     before = conn.execute("SELECT count(*) FROM approvals").fetchone()[0]
     with pytest.raises(RegistryError, match="not registered"):
         gate.request_approval(conn, operation, requested_by="ghost")
     assert conn.execute("SELECT count(*) FROM approvals").fetchone()[0] == before
 
 
-def test_approval_voter_must_be_registered(conn):
+def test_approval_voter_must_be_registered(conn, approval_repo):
     _agents(conn, "requester")
-    operation = {"type": "test", "repository": "r"}
+    operation = {"type": "test", "repository": approval_repo}
     approval = gate.request_approval(conn, operation, requested_by="requester")
     before = conn.execute("SELECT count(*) FROM votes").fetchone()[0]
 
@@ -98,9 +104,10 @@ def test_approval_voter_must_be_registered(conn):
     assert conn.execute("SELECT count(*) FROM votes").fetchone()[0] == before
 
 
-def test_approval_consumer_must_be_registered(conn):
-    _agents(conn, "requester", "voter")
-    operation = {"type": "test", "repository": "r"}
+def test_approval_consumer_must_be_registered(conn, approval_repo):
+    _agents(conn, "requester")
+    ensure_agent(conn, "voter", "operator")
+    operation = {"type": "test", "repository": approval_repo}
     approval = gate.request_approval(conn, operation, requested_by="requester")
     gate.vote(conn, approval["id"], "voter", True)
 
@@ -109,10 +116,13 @@ def test_approval_consumer_must_be_registered(conn):
     assert gate.get_approval_by_id(conn, approval["id"])["status"] == "approved"
 
 
-def test_approval_consumer_must_present_matching_instance_and_operation(conn):
-    _agents(conn, "requester", "voter", "consumer")
-    first_operation = {"type": "first", "repository": "r"}
-    second_operation = {"type": "second", "repository": "r"}
+def test_approval_consumer_must_present_matching_instance_and_operation(
+    conn, approval_repo
+):
+    _agents(conn, "requester", "consumer")
+    ensure_agent(conn, "voter", "operator")
+    first_operation = {"type": "first", "repository": approval_repo}
+    second_operation = {"type": "second", "repository": approval_repo}
     first = gate.request_approval(conn, first_operation, requested_by="requester")
     second = gate.request_approval(conn, second_operation, requested_by="requester")
     gate.vote(conn, first["id"], "voter", True)
@@ -124,9 +134,11 @@ def test_approval_consumer_must_present_matching_instance_and_operation(conn):
     assert gate.get_approval_by_id(conn, second["id"])["status"] == "approved"
 
 
-def test_delayed_vote_cannot_target_new_approval_instance(conn):
-    _agents(conn, "requester", "first-voter", "late-voter")
-    operation = {"type": "repeat", "repository": "r"}
+def test_delayed_vote_cannot_target_new_approval_instance(conn, approval_repo):
+    _agents(conn, "requester")
+    ensure_agent(conn, "first-voter", "operator")
+    ensure_agent(conn, "late-voter", "operator")
+    operation = {"type": "repeat", "repository": approval_repo}
     first = gate.request_approval(conn, operation, requested_by="requester")
     gate.vote(conn, first["id"], "first-voter", False)
     second = gate.request_approval(conn, operation, requested_by="requester")
@@ -136,10 +148,12 @@ def test_delayed_vote_cannot_target_new_approval_instance(conn):
     assert gate.get_approval_by_id(conn, second["id"])["status"] == "pending"
 
 
-def test_cli_votes_by_approval_instance_id(committed_conn, cfg):
-    _agents(committed_conn, "cli-requester", "cli-voter")
+def test_cli_votes_by_approval_instance_id(committed_conn, cfg, tmp_path):
+    _agents(committed_conn, "cli-requester")
+    ensure_agent(committed_conn, "cli-voter", "operator")
+    repository = register_repo(committed_conn, tmp_path / "cli", prefix="cli")
     committed_conn.commit()
-    operation = {"type": "cli", "repository": "r", "nonce": uuid.uuid4().hex}
+    operation = {"type": "cli", "repository": repository, "nonce": uuid.uuid4().hex}
     requested = _cli(
         cfg,
         "approve",
@@ -150,6 +164,7 @@ def test_cli_votes_by_approval_instance_id(committed_conn, cfg):
     assert requested.returncode == 0, requested.stderr
     match = re.search(r"approval (\d+) hash=", requested.stdout)
     assert match is not None
+    assert "threshold=1" in requested.stdout
 
     voted = _cli(
         cfg,
@@ -162,16 +177,18 @@ def test_cli_votes_by_approval_instance_id(committed_conn, cfg):
     assert "status=approved" in voted.stdout
 
 
-def test_new_approval_rows_reference_registered_agents(conn):
-    _agents(conn, "requester", "voter", "consumer")
-    operation = {"type": "identity-columns", "repository": "r"}
+def test_new_approval_rows_reference_registered_agents(conn, approval_repo):
+    _agents(conn, "requester", "consumer")
+    ensure_agent(conn, "voter", "operator")
+    operation = {"type": "identity-columns", "repository": approval_repo}
     approval = gate.request_approval(conn, operation, requested_by="requester")
     gate.vote(conn, approval["id"], "voter", True)
     gate.consume_approval(conn, approval["id"], operation, agent="consumer")
 
     row = conn.execute(
         """
-        SELECT a.requested_by_agent_id, a.consumed_by_agent_id, v.voter_agent_id
+        SELECT a.requested_by_agent_id, a.consumed_by_agent_id, v.voter_agent_id,
+               a.repository_id
         FROM approvals a JOIN votes v ON v.approval_id = a.id
         WHERE a.id = ?
         """,
@@ -186,13 +203,16 @@ def test_contract_rejects_001_only_store_until_all_migrations_apply(tmp_path):
     conn.commit()
     conn.close()
 
-    message = "Missing required migrations: ['002_approval_identities.sql']"
+    message = (
+        "Missing required migrations: "
+        "['002_approval_identities.sql', '004_approval_authority.sql']"
+    )
     with pytest.raises(store.ContractViolation, match=re.escape(message)):
         store.verify_contract(cfg)
     with pytest.raises(store.ContractViolation, match=re.escape(message)):
         store.connect(cfg)
 
-    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    assert store.migrate(cfg) == UPGRADE_MIGRATIONS
     store.verify_contract(cfg)
     upgraded = store.connect(cfg)
     upgraded.close()
@@ -209,7 +229,7 @@ def test_identity_migration_preserves_and_backfills_history(tmp_path):
     conn.commit()
     conn.close()
 
-    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    assert store.migrate(cfg) == UPGRADE_MIGRATIONS
     migrated = store.connect(cfg)
     try:
         requester = migrated.execute(
@@ -230,7 +250,7 @@ def test_identity_migration_preserves_and_backfills_history(tmp_path):
         assert store.json_loads(invalidation[0], {})["reason"] == (
             "unregistered historical voter"
         )
-        with pytest.raises(sqlite3.IntegrityError, match="registered agent"):
+        with pytest.raises(sqlite3.IntegrityError, match="registered (agent|repository)"):
             migrated.execute(
                 "INSERT INTO approvals (operation_hash, operation) VALUES (?, ?)",
                 ("sha256:" + "1" * 64, store.json_dumps(operation)),
@@ -249,7 +269,7 @@ def test_migration_does_not_backfill_requester_registered_after_request(tmp_path
     conn.commit()
     conn.close()
 
-    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    assert store.migrate(cfg) == UPGRADE_MIGRATIONS
     migrated = store.connect(cfg)
     try:
         row = migrated.execute(
@@ -281,7 +301,7 @@ def test_migration_does_not_backfill_voter_registered_after_vote(tmp_path):
     conn.commit()
     conn.close()
 
-    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    assert store.migrate(cfg) == UPGRADE_MIGRATIONS
     migrated = store.connect(cfg)
     try:
         approval = migrated.execute(
@@ -334,8 +354,7 @@ def test_stale_takeover_approval_cannot_displace_reacquired_claim(
         "from_agent": owner,
         "to_agent": successor,
     }
-    approval = gate.request_approval(conn, operation, requested_by=operator)
-    gate.vote(conn, approval["id"], operator, True)
+    approval = approve(conn, operation, requested_by=successor, voters=(operator,))
     work.release_claim(conn, old_claim, owner)
     new_claim, _, _ = work.claim_task(
         conn, task, owner, "feat/new", ["src/**"]
