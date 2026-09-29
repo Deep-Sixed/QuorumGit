@@ -400,6 +400,16 @@ def path_in_scopes(path: str, scopes: list[str]) -> bool:
     return any(_glob_regex(normalize_scope(s)).match(path) for s in scopes)
 
 
+def paths_outside(paths: list[str], scopes: list[str]) -> list[str]:
+    """The paths no scope covers, in their original order."""
+    return [p for p in paths if not path_in_scopes(p, scopes)]
+
+
+def paths_within(paths: list[str], scopes: list[str]) -> list[str]:
+    """The paths some scope covers, in their original order."""
+    return [p for p in paths if path_in_scopes(p, scopes)]
+
+
 def verify_commit(
     repo_path: str, commit_oid: str, branch: str | None = None
 ) -> str:
@@ -547,6 +557,8 @@ def claim_task(
     lock_task(conn, task_id)
     task = get_task(conn, task_id)
     agent_row = get_agent(conn, agent)
+    if task["status"] == "done":
+        raise ClaimRefused(f"Task {task_id} is done; it cannot be claimed.")
     if not scope_globs:
         raise ClaimRefused("At least one --scope is required to claim a task.")
     scope_globs = list(dict.fromkeys(validate_scope(g) for g in scope_globs))
@@ -805,6 +817,51 @@ def release_claim(
         agent=agent or None,
         detail={"reason": reason},
     )
+
+
+def complete_task(conn: Connection, task_id: int, agent: str, note: str = "") -> int:
+    """Mark a task done. Only the holder of its live claim may do this.
+
+    Releases that claim (reason "done") and sets the task to the terminal
+    `done` status in one transaction. Returns the released claim ID.
+    """
+    lock_task(conn, task_id)
+    task = get_task(conn, task_id)
+    get_agent(conn, agent)
+    if task["status"] == "done":
+        raise WorkError(f"Task {task_id} is already done.")
+    claim = active_claim_for_task(conn, task_id)
+    if claim is None:
+        pending = open_handoff_for_task(conn, task_id)
+        if pending:
+            raise WorkError(
+                f"Task {task_id} is reserved for open handoff {pending['id']}; "
+                "accept it before marking the task done."
+            )
+        raise WorkError(
+            f"Task {task_id} has no live claim; claim it before marking it done."
+        )
+    if claim["agent"] != agent:
+        raise WorkError(
+            f"Task {task_id} is claimed by {claim['agent']} "
+            f"(claim {claim['id']}), not {agent}."
+        )
+    if claim["expired"]:
+        raise WorkError(
+            f"Claim {claim['id']} has expired; acquire a new claim before "
+            "marking the task done."
+        )
+    release_claim(conn, claim["id"], agent, reason="done")
+    set_task_status(conn, task_id, "done")
+    audit.record(
+        conn,
+        "task.done",
+        "task",
+        task_id,
+        agent=agent,
+        detail={"claim_id": claim["id"], "note": note},
+    )
+    return claim["id"]
 
 
 def add_checkpoint(

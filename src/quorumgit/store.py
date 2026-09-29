@@ -44,6 +44,8 @@ REQUIRED_TABLES = (
     "conflict_events",
     "audit_events",
     "repository_approval_roles",
+    "protected_paths",
+    "allowed_ref_namespaces",
 )
 
 # Engine-level governance rules. A store missing any of these would still
@@ -60,6 +62,7 @@ REQUIRED_TRIGGERS = (
     "votes_require_eligible_voter",
     "vote_updates_require_eligible_voter",
     "approvals_consumer_is_not_approver",
+    "repositories_default_ref_namespaces",
 )
 
 # Kept byte-identical to the statement existing stores were created with.
