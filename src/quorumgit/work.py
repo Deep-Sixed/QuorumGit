@@ -14,7 +14,7 @@ import subprocess
 from typing import Any
 
 from . import audit
-from .registry import get_agent, get_repository
+from .registry import get_agent, get_repository, require_operator
 from .store import Connection, begin_immediate, json_dumps
 
 DEFAULT_LEASE_HOURS = 8
@@ -852,6 +852,34 @@ def complete_task(conn: Connection, task_id: int, agent: str, note: str = "") ->
         detail={"claim_id": claim["id"], "note": note},
     )
     return claim["id"]
+
+
+def reopen_task(conn: Connection, task_id: int, agent: str, reason: str) -> None:
+    """Return a done task to `open` so it can be claimed again. Operator only.
+
+    `done` is terminal for everyone else, so undoing it is an authority
+    decision like changing approval policy, and the reason is audited.
+    """
+    lock_task(conn, task_id)
+    get_agent(conn, agent)
+    require_operator(conn, agent, "Reopening a done task")
+    if not reason.strip():
+        raise WorkError("Reopening a task requires a --reason.")
+    task = get_task(conn, task_id)
+    if task["status"] != "done":
+        raise WorkError(
+            f"Task {task_id} is {task['status']}, not done; only done tasks "
+            "can be reopened."
+        )
+    set_task_status(conn, task_id, "open")
+    audit.record(
+        conn,
+        "task.reopened",
+        "task",
+        task_id,
+        agent=agent,
+        detail={"reason": reason},
+    )
 
 
 def add_checkpoint(
