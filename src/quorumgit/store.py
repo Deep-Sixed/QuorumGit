@@ -66,6 +66,11 @@ REQUIRED_TRIGGERS = (
 )
 
 
+# Views the governance triggers read from; a store missing one would pass the
+# table and trigger checks yet fail on the next vote.
+REQUIRED_VIEWS = ("approval_effective_policy",)
+
+
 class StoreError(RuntimeError):
     pass
 
@@ -396,6 +401,18 @@ def verify_contract(target: Config | Connection | str | Path) -> None:
         if missing_triggers:
             raise ContractViolation(
                 f"Missing required governance triggers: {sorted(missing_triggers)}."
+            )
+
+        views = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'view'"
+            ).fetchall()
+        }
+        missing_views = set(REQUIRED_VIEWS) - views
+        if missing_views:
+            raise ContractViolation(
+                f"Missing required governance views: {sorted(missing_views)}."
             )
 
         foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]

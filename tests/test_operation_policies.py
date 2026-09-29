@@ -6,7 +6,8 @@ import sqlite3
 
 import pytest
 
-from quorumgit import audit, cli, gate, registry
+from quorumgit import audit, cli, gate, registry, store
+from quorumgit.config import Config
 from tests.conftest import OPERATOR, ensure_agent, make_git_repo
 
 
@@ -107,6 +108,46 @@ def test_raising_an_override_invalidates_existing_approvals(people, approval_rep
     assert gate.approved_instance(conn, operation, consumer="worker-1") is None
     with pytest.raises(gate.GateError, match="now requires 2"):
         gate.consume_approval(conn, approval["id"], operation, agent="worker-1")
+
+    # The same live instance is reopened and can collect the missing vote.
+    assert gate.request_approval(conn, operation, requested_by="worker-1")["id"] == (
+        approval["id"]
+    )
+    topped_up = gate.vote(conn, approval["id"], "op-2", True)
+    assert topped_up["status"] == "approved"
+    assert gate.approved_instance(conn, operation, consumer="worker-1") is not None
+    events = [e["event_type"] for e in audit.events(conn, entity="approval",
+                                                   entity_id=approval["id"])]
+    assert "approval.reopened" in events
+
+
+def test_a_stale_approval_can_also_be_denied(people, approval_repo):
+    conn = people
+    operation = _op(approval_repo, "ref_delete")
+    approval = gate.request_approval(conn, operation, requested_by="worker-1")
+    gate.vote(conn, approval["id"], OPERATOR, True)
+    # Still valid: no reopening, so it stays terminal for further votes.
+    with pytest.raises(gate.GateError, match="already approved"):
+        gate.vote(conn, approval["id"], "op-2", True)
+
+    registry.set_approval_policy(
+        conn, approval_repo, actor=OPERATOR, operation_type="ref_delete", threshold=2
+    )
+    assert gate.vote(conn, approval["id"], "op-2", False)["status"] == "denied"
+
+
+def test_contract_requires_the_effective_policy_view(tmp_path):
+    local = Config(data_dir=tmp_path / "contract", agent=None)
+    store.migrate(local)
+    conn = store.connect(local)
+    try:
+        conn.execute("DROP VIEW approval_effective_policy")
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(store.ContractViolation, match="approval_effective_policy"):
+        store.verify_contract(local)
+    store.destroy(local)
 
 
 def test_unset_override_fields_inherit_and_inherit_removes(people, approval_repo):

@@ -201,7 +201,8 @@ def _authorization_refusal(
     if eligible < policy["threshold"]:
         return (
             f"Approval {approval['id']} has {eligible} eligible approval(s); the "
-            f"repository policy now requires {policy['threshold']}."
+            f"repository policy now requires {policy['threshold']}. Eligible "
+            f"agents can vote on approval {approval['id']} to reach it."
         )
     return None
 
@@ -297,16 +298,45 @@ def vote(conn: Connection, approval_id: int, voter: str, approve: bool) -> dict:
     approval state. Denial has precedence and terminal states remain final.
     Only agents the repository's policy recognizes may vote, in either
     direction; the requester may not vote unless the policy allows it.
+
+    An approved instance that no longer meets the effective policy (its
+    threshold was raised, or approvers lost their eligibility) is reopened
+    for voting rather than left stuck: request_approval() keeps returning
+    that same live instance, so it must be able to collect the votes the
+    stricter policy now needs.
     """
     begin_immediate(conn)
     voter_row = get_agent(conn, voter)
     approval = get_approval_by_id(conn, approval_id)
-    if approval["status"] != "pending":
+    if approval["status"] not in ("pending", "approved"):
         raise GateError(f"Approval {approval_id} is already {approval['status']}.")
     policy = _policy_for(conn, approval)
+    stale = (
+        approval["status"] == "approved"
+        and _eligible_approvals(conn, approval, policy) < policy["threshold"]
+    )
+    if approval["status"] == "approved" and not stale:
+        raise GateError(f"Approval {approval_id} is already approved.")
     refusal = _vote_refusal(approval, policy, voter_row)
     if refusal is not None:
         raise GateError(f"Vote refused: {refusal}")
+    if stale:
+        conn.execute(
+            "UPDATE approvals SET status = 'pending', decided_at = NULL "
+            "WHERE id = ? AND status = 'approved'",
+            (approval["id"],),
+        )
+        audit.record(
+            conn,
+            "approval.reopened",
+            "approval",
+            approval["id"],
+            agent=voter,
+            detail={
+                "hash": approval["operation_hash"],
+                "threshold": policy["threshold"],
+            },
+        )
     conn.execute(
         """
         INSERT INTO votes (approval_id, voter, vote, voter_agent_id)
