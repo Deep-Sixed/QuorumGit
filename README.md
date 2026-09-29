@@ -196,7 +196,7 @@ Takeovers follow the same pattern: claiming a task someone else holds (`claim <t
 |---|---|
 | `quorumgit init` | Start/provision the store (idempotent) |
 | `quorumgit status` | Store health, contract check, row counts |
-| `quorumgit doctor [--repair]` | Detect and conservatively reconcile recorded managed-worktree drift |
+| `quorumgit doctor [--repair]` | Detect and conservatively reconcile managed-worktree drift and stuck ref updates |
 | `quorumgit destroy --yes` | Stop the store and delete its data |
 | `quorumgit repo add <name> <path> [--protected-ref <ref>]…` | Register a repository |
 | `quorumgit agent add <name>` | Register an agent identity |
@@ -219,6 +219,8 @@ Takeovers follow the same pattern: claiming a task someone else holds (`claim <t
 `repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
 
 `quorumgit doctor` only checks worktree paths already recorded by QuorumGit. `--repair` can mark a missing recorded checkout removed, prune its stale Git worktree metadata, or remove an orphaned released-claim checkout. Repairs use ordinary non-forced `git worktree remove`; dirty worktrees are reported instead of destroyed.
+
+`doctor` also finds governed ref updates stuck in `prepared` for more than five minutes — ones whose `committed`/`aborted` hook never recorded an outcome (a killed process, an unreachable store). It reads the outcome from the ref itself: at the update's new value (or gone, for a deletion) means Git committed; still at the old value means Git aborted, and `--repair` restores the approval that was consumed for it. A ref that has since moved elsewhere, or is still locked by Git, is reported for manual inspection and never guessed at.
 
 ## Configuration
 

@@ -70,28 +70,43 @@ def cmd_destroy(args, cfg) -> int:
 
 
 def cmd_doctor(args, cfg) -> int:
-    """Inspect and optionally reconcile recorded managed-worktree drift."""
+    """Inspect and optionally reconcile worktree drift and stuck ref updates."""
     with store.connect(cfg) as conn:
         findings = trees.doctor_worktrees(conn, repair=args.repair)
+        ref_findings = gate.doctor_ref_updates(conn, repair=args.repair)
         if args.repair:
             conn.commit()
-    if not findings:
-        print("worktrees: ok")
-        return 0
     unresolved = False
-    for finding in findings:
-        state = "repaired" if finding.get("repaired") else "detected"
+
+    def state_of(finding: dict) -> str:
+        nonlocal unresolved
         if finding.get("error"):
-            state = f"repair failed: {finding['error']}"
             unresolved = True
-        elif not finding.get("repaired"):
-            unresolved = True
+            prefix = "repair failed" if args.repair else "unresolvable"
+            return f"{prefix}: {finding['error']}"
+        if finding.get("repaired"):
+            return "repaired"
+        unresolved = True
+        return "detected"
+
+    for finding in findings:
         print(
             f"worktree {finding['worktree_id']} claim {finding['claim_id']}: "
-            f"{finding['issue']} — {state} — {finding['path']}"
+            f"{finding['issue']} — {state_of(finding)} — {finding['path']}"
         )
-    if args.repair and not unresolved:
-        print("worktrees: reconciled")
+    for finding in ref_findings:
+        outcome = f" (git {finding['outcome']})" if finding.get("outcome") else ""
+        print(
+            f"ref update {finding['ref_update_id']} {finding['repository']} "
+            f"{finding['refname']}: {finding['issue']}{outcome} — {state_of(finding)}"
+        )
+    if not findings:
+        print("worktrees: ok")
+    if not ref_findings:
+        print("ref updates: ok")
+    if not unresolved:
+        if args.repair and (findings or ref_findings):
+            print("reconciled.")
         return 0
     if not args.repair:
         print("re-run with `quorumgit doctor --repair` to reconcile safe cases.")

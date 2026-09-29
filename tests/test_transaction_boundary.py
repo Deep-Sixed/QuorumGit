@@ -341,3 +341,174 @@ def test_identity_lookup_ignores_the_hooks_git_dir(tmp_path, monkeypatch):
     other = make_git_repo(tmp_path / "other-repo")
     monkeypatch.setenv("GIT_DIR", str(hub / ".git"))
     assert registry.git_common_dir(other) == (other / ".git").resolve()
+
+
+# ----------------------------------------------------- doctor: stuck updates
+
+
+def _stuck_prepared_update(conn, tmp_path, cfg, monkeypatch):
+    """A protected update that reached `prepared` but never heard its outcome."""
+    repo_name, hub, clone, a, _b = _setup(conn, tmp_path)
+    _commit(clone, "src/stuck.py")
+    staged = _push(clone, a, "HEAD:refs/heads/staging", cfg=cfg)
+    assert staged.returncode == 0, staged.stderr
+    op, approval = _approve_main(conn, repo_name, hub, clone)
+
+    with monkeypatch.context() as scoped:
+        scoped.chdir(hub)
+        scoped.setenv("GIT_DIR", ".")
+        scoped.setenv("QUORUMGIT_AGENT", a)
+        line = [f"{op['oldrev']} {op['newrev']} refs/heads/main\n"]
+        assert gate.run_pre_receive(conn, repo_name, line) == 0
+        assert gate.run_reference_transaction(conn, repo_name, "prepared", line) == 0
+    update_id = conn.execute(
+        "SELECT id FROM ref_updates WHERE status = 'prepared' AND newrev = ?",
+        (op["newrev"],),
+    ).fetchone()[0]
+    conn.execute(
+        "UPDATE ref_updates SET created_at = created_at - ? WHERE id = ?",
+        (gate.PREPARED_STUCK_AFTER_SECONDS + 60, update_id),
+    )
+    conn.commit()
+    return hub, op, approval, update_id
+
+
+def _finding(conn, update_id: int, repair: bool = False) -> dict:
+    findings = [
+        f for f in gate.doctor_ref_updates(conn, repair=repair)
+        if f["ref_update_id"] == update_id
+    ]
+    assert len(findings) == 1, findings
+    return findings[0]
+
+
+def _status(conn, update_id: int) -> str:
+    return conn.execute(
+        "SELECT status FROM ref_updates WHERE id = ?", (update_id,)
+    ).fetchone()[0]
+
+
+def _move_ref(hub: Path, tmp_path: Path, refname: str, value: str) -> None:
+    # No store at this data dir, so QuorumGit's hook treats this as local
+    # maintenance and records nothing.
+    env = {**os.environ, "QUORUMGIT_DATA_DIR": str(tmp_path / "no-store")}
+    env.pop("QUORUMGIT_AGENT", None)
+    env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env["PATH"]
+    subprocess.run(
+        ["git", "--git-dir", str(hub), "update-ref", refname, value],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+def test_doctor_reconciles_a_stuck_update_git_committed(
+    committed_conn, tmp_path, cfg, monkeypatch
+):
+    conn = committed_conn
+    hub, op, approval, update_id = _stuck_prepared_update(conn, tmp_path, cfg, monkeypatch)
+    _move_ref(hub, tmp_path, "refs/heads/main", op["newrev"])
+
+    detected = _finding(conn, update_id)
+    assert detected["outcome"] == "committed" and not detected["repaired"]
+    assert _status(conn, update_id) == "prepared"
+
+    repaired = _finding(conn, update_id, repair=True)
+    conn.commit()
+    assert repaired["repaired"] and "error" not in repaired
+    assert _status(conn, update_id) == "committed"
+    assert gate.get_approval_by_id(conn, approval["id"])["status"] == "consumed"
+
+
+def test_doctor_reconciles_a_stuck_update_git_aborted(
+    committed_conn, tmp_path, cfg, monkeypatch
+):
+    conn = committed_conn
+    _hub, _op, approval, update_id = _stuck_prepared_update(
+        conn, tmp_path, cfg, monkeypatch
+    )
+    assert gate.get_approval_by_id(conn, approval["id"])["status"] == "consumed"
+
+    repaired = _finding(conn, update_id, repair=True)
+    conn.commit()
+    assert repaired["outcome"] == "aborted" and repaired["repaired"]
+    assert _status(conn, update_id) == "aborted"
+    assert gate.get_approval_by_id(conn, approval["id"])["status"] == "approved"
+    events = conn.execute(
+        "SELECT count(*) FROM audit_events WHERE entity = 'ref_update' "
+        "AND entity_id = ? AND event_type = 'gate.update_reconciled_aborted'",
+        (update_id,),
+    ).fetchone()
+    assert events is not None and events[0] == 1
+
+
+def test_doctor_refuses_to_guess_when_the_ref_has_moved_on(
+    committed_conn, tmp_path, cfg, monkeypatch
+):
+    conn = committed_conn
+    hub, op, approval, update_id = _stuck_prepared_update(
+        conn, tmp_path, cfg, monkeypatch
+    )
+    # A later commit that is neither the update's old nor its new value.
+    pusher = conn.execute(
+        "SELECT a.name FROM ref_updates u JOIN agents a ON a.id = u.pusher_agent_id "
+        "WHERE u.id = ?",
+        (update_id,),
+    ).fetchone()[0]
+    clone = tmp_path / "clone"
+    _commit(clone, "src/later.py")
+    later = _push(clone, pusher, "HEAD:refs/heads/later", cfg=cfg)
+    assert later.returncode == 0, later.stderr
+    elsewhere = _rev(["-C", str(clone)], "HEAD")
+    assert elsewhere not in (op["oldrev"], op["newrev"])
+    _move_ref(hub, tmp_path, "refs/heads/main", elsewhere)
+
+    finding = _finding(conn, update_id, repair=True)
+    conn.commit()
+    assert not finding["repaired"] and "moved" in finding["error"]
+    assert _status(conn, update_id) == "prepared"
+    assert gate.get_approval_by_id(conn, approval["id"])["status"] == "consumed"
+
+
+def test_doctor_leaves_a_locked_ref_alone(committed_conn, tmp_path, cfg, monkeypatch):
+    conn = committed_conn
+    hub, _op, _approval, update_id = _stuck_prepared_update(
+        conn, tmp_path, cfg, monkeypatch
+    )
+    lock = hub / "refs" / "heads" / "main.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("", encoding="utf-8")
+
+    finding = _finding(conn, update_id, repair=True)
+    conn.commit()
+    assert not finding["repaired"] and "locked" in finding["error"]
+    assert _status(conn, update_id) == "prepared"
+
+
+def test_doctor_ignores_a_recent_prepared_update(
+    committed_conn, tmp_path, cfg, monkeypatch
+):
+    conn = committed_conn
+    _hub, _op, _approval, update_id = _stuck_prepared_update(
+        conn, tmp_path, cfg, monkeypatch
+    )
+    conn.execute(
+        "UPDATE ref_updates SET created_at = unixepoch() WHERE id = ?", (update_id,)
+    )
+    conn.commit()
+    assert all(
+        f["ref_update_id"] != update_id for f in gate.doctor_ref_updates(conn)
+    )
+
+
+def test_doctor_cli_reports_stuck_updates(committed_conn, tmp_path, cfg, monkeypatch):
+    from tests.test_cli_hub import _cli
+
+    conn = committed_conn
+    _hub, _op, _approval, update_id = _stuck_prepared_update(
+        conn, tmp_path, cfg, monkeypatch
+    )
+    result = _cli(cfg, "doctor")
+    assert result.returncode == 1
+    assert f"ref update {update_id} " in result.stdout
+    assert "stuck_prepared (git aborted) — detected" in result.stdout

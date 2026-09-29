@@ -22,6 +22,7 @@ from .registry import (
     assert_repository_identity_unique,
     get_agent,
     get_repository,
+    path_scoped_git_env,
 )
 from .store import Connection, begin_immediate, json_dumps, json_loads
 from .work import (
@@ -805,6 +806,120 @@ def _resolve_updates(
                 detail={"refname": refname, "newrev": newrev},
             )
             break
+
+
+# A prepared update normally resolves within milliseconds, when Git commits or
+# aborts the locked transaction. One older than this lost its outcome hook
+# (killed process, unreachable store) and is reconciled from the ref itself.
+PREPARED_STUCK_AFTER_SECONDS = VALIDATION_TTL_SECONDS
+
+
+def _current_ref(repository_path: str, refname: str) -> str | None:
+    """The ref's object ID in the repository, or None when it does not exist."""
+    result = subprocess.run(
+        ["git", "-C", repository_path, "rev-parse", "--verify", "--quiet", refname],
+        capture_output=True,
+        text=True,
+        env=path_scoped_git_env(),
+        check=False,
+    )
+    if result.returncode == 0:
+        return result.stdout.strip().lower()
+    if result.returncode == 1:
+        return None
+    detail = (result.stderr or result.stdout).strip()
+    raise GateError(f"Unable to read {refname} in {repository_path}: {detail}")
+
+
+def _ref_is_locked(repository_path: str, refname: str) -> bool:
+    """True while Git holds the files-backend lock for the ref."""
+    result = subprocess.run(
+        ["git", "-C", repository_path, "rev-parse", "--git-path", f"{refname}.lock"],
+        capture_output=True,
+        text=True,
+        env=path_scoped_git_env(),
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    lock = Path(result.stdout.strip())
+    if not lock.is_absolute():
+        lock = Path(repository_path) / lock
+    return lock.exists()
+
+
+def doctor_ref_updates(conn: Connection, repair: bool = False) -> list[dict]:
+    """Report and conservatively reconcile ref updates stuck in `prepared`.
+
+    The outcome is read from the ref itself: at the new value (or gone, for
+    a deletion) means Git committed; still at the old value (or absent, for a
+    creation) means Git aborted, so the consumed approval is restored. A ref
+    that has since moved elsewhere, or is still locked, is reported for
+    manual inspection and never guessed at.
+    """
+    if repair:
+        begin_immediate(conn)
+    rows = conn.execute(
+        """
+        SELECT u.id, u.refname, u.oldrev, u.newrev, u.approval_id, r.name, r.path
+        FROM ref_updates u JOIN repositories r ON r.id = u.repository_id
+        WHERE u.status = 'prepared' AND u.created_at < unixepoch() - ?
+        ORDER BY u.id
+        """,
+        (PREPARED_STUCK_AFTER_SECONDS,),
+    ).fetchall()
+    findings: list[dict] = []
+    for update_id, refname, oldrev, newrev, approval_id, repo_name, repo_path in rows:
+        finding: dict[str, Any] = {
+            "ref_update_id": update_id,
+            "repository": repo_name,
+            "refname": refname,
+            "issue": "stuck_prepared",
+            "outcome": None,
+            "repaired": False,
+        }
+        findings.append(finding)
+        try:
+            if _ref_is_locked(repo_path, refname):
+                finding["error"] = "ref is still locked by Git; retry once it is released"
+                continue
+            current = _current_ref(repo_path, refname)
+        except GateError as exc:
+            finding["error"] = str(exc)
+            continue
+        new_value = None if _is_zero(newrev) else newrev
+        old_value = None if _is_zero(oldrev) else oldrev
+        if current == new_value:
+            finding["outcome"] = "committed"
+        elif current == old_value:
+            finding["outcome"] = "aborted"
+        else:
+            finding["error"] = (
+                f"{refname} has since moved to {current or 'deletion'}; the outcome "
+                "cannot be proven from the ref. Inspect it manually."
+            )
+            continue
+        if not repair:
+            continue
+        cur = conn.execute(
+            "UPDATE ref_updates SET status = ?, resolved_at = unixepoch() "
+            "WHERE id = ? AND status = 'prepared'",
+            (finding["outcome"], update_id),
+        )
+        if cur.rowcount != 1:
+            finding["error"] = "ref update changed while being reconciled"
+            continue
+        if finding["outcome"] == "aborted" and approval_id is not None:
+            _restore_approval(conn, update_id, approval_id)
+        audit.record(
+            conn,
+            f"gate.update_reconciled_{finding['outcome']}",
+            "ref_update",
+            update_id,
+            detail={"refname": refname, "current": current},
+        )
+        finding["repaired"] = True
+    return findings
 
 
 def run_reference_transaction(
