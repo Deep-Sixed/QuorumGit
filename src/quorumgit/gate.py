@@ -178,41 +178,33 @@ def quorum_threshold(eligible_approvers: int) -> int:
     return (2 * eligible_approvers) // 3 + 1
 
 
-def _eligible_approver_count(
-    conn: Connection,
-    approval: dict,
-    policy: dict,
-    exclude_agent_id: int | None = None,
-) -> int:
+def _eligible_approver_count(conn: Connection, approval: dict, policy: dict) -> int:
     """Registered agents who could cast a counting vote on this approval."""
     rows = conn.execute("SELECT id, name, role FROM agents").fetchall()
     return sum(
         1
         for agent_id, name, role in rows
-        if agent_id != exclude_agent_id
-        and _vote_refusal(approval, policy, {"id": agent_id, "name": name, "role": role})
+        if _vote_refusal(approval, policy, {"id": agent_id, "name": name, "role": role})
         is None
     )
 
 
-def required_approvals(
-    conn: Connection,
-    approval: dict,
-    policy: dict,
-    exclude_agent_id: int | None = None,
-) -> int:
+def required_approvals(conn: Connection, approval: dict, policy: dict) -> int:
     """Eligible yes votes this approval needs under the current policy.
 
     With quorum mode on, the requirement is 2/3 + 1 of the agents eligible to
-    approve this particular approval — excluding the requester (unless the
-    policy lets it vote), a takeover's beneficiary, and, at use time, the
-    consuming agent — and never less than the policy's fixed threshold.
-    Counting only eligible agents keeps those exclusions from making approval
-    impossible while other approvers exist.
+    vote on this particular approval — excluding the requester (unless the
+    policy lets it vote) and a takeover's beneficiary — and never less than
+    the policy's fixed threshold. Counting only eligible agents keeps those
+    exclusions from making approval impossible while other approvers exist.
+    The same requirement decides votes and is re-checked at use time, so an
+    approval's status never disagrees with whether it can be used; who may
+    use it is a separate rule (an approver can never carry out its own
+    approval).
     """
     if not policy["quorum"]:
         return policy["threshold"]
-    eligible = _eligible_approver_count(conn, approval, policy, exclude_agent_id)
+    eligible = _eligible_approver_count(conn, approval, policy)
     return max(policy["threshold"], quorum_threshold(eligible))
 
 
@@ -233,9 +225,7 @@ def _authorization_refusal(
                 "carry it out."
             )
     eligible = _eligible_approvals(conn, approval, policy)
-    required = required_approvals(
-        conn, approval, policy, consumer["id"] if consumer is not None else None
-    )
+    required = required_approvals(conn, approval, policy)
     if eligible < required:
         basis = " (2/3 + 1 of eligible approvers)" if policy["quorum"] else ""
         return (

@@ -80,6 +80,34 @@ def test_requester_exclusion_shrinks_the_eligible_set(quorum_store, tmp_path):
     gate.consume_approval(conn, approval["id"], _op(repo), agent="pusher")
 
 
+def test_status_and_usability_use_the_same_requirement(quorum_store, tmp_path):
+    """A non-voting operator carrying out the operation does not lower quorum.
+
+    Five operators are eligible on a worker's request, so 4 are needed. With 3
+    yes votes the approval is pending for everyone, including an operator who
+    did not vote; it becomes usable exactly when it becomes approved.
+    """
+    _local, conn = quorum_store
+    _operators(conn, "a", "b", "c", "d", "e")
+    registry.add_agent(conn, "worker")
+    repo = register_repo(conn, tmp_path / "q-consumer")
+    registry.set_approval_policy(conn, repo, actor="a", quorum=True)
+
+    op = _op(repo)
+    approval = gate.request_approval(conn, op, "worker")
+    assert approval["threshold"] == 4
+    for voter in ("a", "b", "c"):
+        approval = gate.vote(conn, approval["id"], voter, True)
+    assert approval["status"] == "pending"
+    assert gate.approved_instance(conn, op, consumer="d") is None
+    with pytest.raises(gate.GateError, match="not consumable"):
+        gate.consume_approval(conn, approval["id"], op, agent="d")
+
+    assert gate.vote(conn, approval["id"], "e", True)["status"] == "approved"
+    assert gate.approved_instance(conn, op, consumer="d") is not None
+    gate.consume_approval(conn, approval["id"], op, agent="d")
+
+
 def test_fixed_threshold_is_a_floor(quorum_store, tmp_path):
     _local, conn = quorum_store
     _operators(conn, "a", "b", "c", "d")
