@@ -173,6 +173,53 @@ def test_aborted_transaction_restores_the_consumed_approval(
     assert restored is not None and restored[0] == 1
 
 
+def test_abort_does_not_restore_over_a_newer_live_approval(
+    committed_conn, tmp_path, cfg, monkeypatch
+):
+    """Restoring must never leave two live approvals for one operation."""
+    conn = committed_conn
+    repo_name, hub, clone, a, _b = _setup(conn, tmp_path)
+    _commit(clone, "src/conflict.py")
+    staged = _push(clone, a, "HEAD:refs/heads/staging", cfg=cfg)
+    assert staged.returncode == 0, staged.stderr
+    op, first = _approve_main(conn, repo_name, hub, clone)
+
+    monkeypatch.chdir(hub)
+    monkeypatch.setenv("GIT_DIR", ".")
+    monkeypatch.setenv("QUORUMGIT_AGENT", a)
+    line = [f"{op['oldrev']} {op['newrev']} refs/heads/main\n"]
+    assert gate.run_pre_receive(conn, repo_name, line) == 0
+    assert gate.run_reference_transaction(conn, repo_name, "prepared", line) == 0
+    assert gate.get_approval_by_id(conn, first["id"])["status"] == "consumed"
+
+    # While the transaction is in flight the same operation is requested
+    # again; the consumed instance is not live, so this opens a new one.
+    second = gate.request_approval(conn, op, requested_by="operator")
+    conn.commit()
+    assert second["id"] != first["id"] and second["status"] == "pending"
+
+    assert gate.run_reference_transaction(conn, repo_name, "aborted", line) == 0
+    assert gate.get_approval_by_id(conn, first["id"])["status"] == "consumed"
+    assert gate.get_approval_by_id(conn, second["id"])["status"] == "pending"
+    live = conn.execute(
+        "SELECT count(*) FROM approvals WHERE operation_hash = ? "
+        "AND status IN ('pending', 'approved')",
+        (gate.operation_hash(op),),
+    ).fetchone()
+    assert live is not None and live[0] == 1
+    assert _ref_update_statuses(conn, "refs/heads/main", op["newrev"]) == ["aborted"]
+    events = {
+        row[0]
+        for row in conn.execute(
+            "SELECT event_type FROM audit_events WHERE entity = 'approval' "
+            "AND entity_id = ?",
+            (first["id"],),
+        ).fetchall()
+    }
+    assert "approval.restore_skipped" in events
+    assert "approval.restored" not in events
+
+
 def test_prepared_rejects_an_update_pre_receive_did_not_validate(
     committed_conn, tmp_path, monkeypatch
 ):
