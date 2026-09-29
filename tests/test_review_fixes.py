@@ -19,7 +19,7 @@ import pytest
 
 from quorumgit import gate, handoff, registry, store, trees, work
 from quorumgit.registry import RegistryError
-from tests.conftest import make_git_repo
+from tests.conftest import OPERATOR, approve, ensure_agent, make_git_repo, register_repo
 from tests.test_cli_hub import _cli
 from tests.test_gate import _commit, _push, _setup
 from tests.test_handoff import _handoff_record, _head
@@ -28,15 +28,18 @@ from tests.test_handoff import _handoff_record, _head
 # ------------------------------------------------------------ finding 1
 
 
-def _pending_approval(conn, threshold=1):
+def _pending_approval(conn, tmp_path, threshold=1):
+    repo_name = register_repo(conn, tmp_path / "vote-race", prefix="vote-race")
     op = {
         "type": "protected_ref_update",
-        "repository": "vote-race",
+        "repository": repo_name,
         "n": uuid.uuid4().hex,
     }
-    for name in ("op", "voter-1", "voter-2"):
-        conn.execute("INSERT INTO agents (name) VALUES (?) ON CONFLICT DO NOTHING", (name,))
-    gate.request_approval(conn, op, requested_by="op", threshold=threshold)
+    ensure_agent(conn, "op")
+    for name in (OPERATOR, "voter-1", "voter-2"):
+        ensure_agent(conn, name, "operator")
+    registry.set_approval_policy(conn, repo_name, actor=OPERATOR, threshold=threshold)
+    gate.request_approval(conn, op, requested_by="op")
     return op
 
 
@@ -78,10 +81,10 @@ def _race_votes(initialized_store, op, first_vote, second_vote):
         conn2.close()
 
 
-def test_concurrent_no_and_yes_denial_stands(initialized_store):
+def test_concurrent_no_and_yes_denial_stands(initialized_store, tmp_path):
     """A concurrent yes vote cannot override a denial."""
     setup = store.connect(initialized_store)
-    op = _pending_approval(setup, threshold=1)
+    op = _pending_approval(setup, tmp_path, threshold=1)
     setup.commit()
     setup.close()
     approval, second_error = _race_votes(
@@ -91,10 +94,10 @@ def test_concurrent_no_and_yes_denial_stands(initialized_store):
     assert second_error, "yes vote on a denied approval must raise"
 
 
-def test_concurrent_yes_votes_satisfy_threshold(initialized_store):
+def test_concurrent_yes_votes_satisfy_threshold(initialized_store, tmp_path):
     """Two concurrent yes votes on a threshold-2 approval both count."""
     setup = store.connect(initialized_store)
-    op = _pending_approval(setup, threshold=2)
+    op = _pending_approval(setup, tmp_path, threshold=2)
     setup.commit()
     setup.close()
     approval, second_error = _race_votes(
@@ -104,8 +107,8 @@ def test_concurrent_yes_votes_satisfy_threshold(initialized_store):
     assert approval["status"] == "approved"
 
 
-def test_denial_is_terminal(conn):
-    op = _pending_approval(conn)
+def test_denial_is_terminal(conn, tmp_path):
+    op = _pending_approval(conn, tmp_path)
     op_hash = gate.operation_hash(op)
     approval_id = gate.get_approval(conn, op_hash)["id"]
     gate.vote(conn, approval_id, "voter-1", False)
@@ -114,8 +117,8 @@ def test_denial_is_terminal(conn):
         gate.vote(conn, approval_id, "voter-2", True)
 
 
-def test_duplicate_voter_counts_once(conn):
-    op = _pending_approval(conn, threshold=2)
+def test_duplicate_voter_counts_once(conn, tmp_path):
+    op = _pending_approval(conn, tmp_path, threshold=2)
     op_hash = gate.operation_hash(op)
     approval_id = gate.get_approval(conn, op_hash)["id"]
     gate.vote(conn, approval_id, "voter-1", True)
@@ -147,9 +150,7 @@ def _approve_update(conn, repo_name, hub, clone, refname="refs/heads/main"):
         "oldrev": oldrev,
         "newrev": newrev,
     }
-    conn.execute("INSERT INTO agents (name) VALUES ('operator') ON CONFLICT DO NOTHING")
-    approval = gate.request_approval(conn, op, requested_by="operator")
-    gate.vote(conn, approval["id"], "operator", True)
+    approve(conn, op, requested_by="op")
     conn.commit()
     return op
 
@@ -220,9 +221,7 @@ def test_refused_takeover_preserves_holder_and_approval(committed_conn, tmp_path
         "from_agent": a,
         "to_agent": c,
     }
-    conn.execute("INSERT INTO agents (name) VALUES ('operator') ON CONFLICT DO NOTHING")
-    approval = gate.request_approval(conn, operation, requested_by="operator")
-    gate.vote(conn, approval["id"], "operator", True)
+    approve(conn, operation, requested_by=c)
     conn.commit()
 
     refused = _cli(

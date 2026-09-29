@@ -7,13 +7,18 @@ from __future__ import annotations
 
 import os
 import subprocess
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from quorumgit import store
+from quorumgit import gate, registry, store
 from quorumgit.config import Config
+
+# The shared store's designated approver. Workers request approvals; this
+# operator votes on them, so no test relies on self-authorization.
+OPERATOR = "operator"
 
 
 @pytest.fixture(scope="session")
@@ -90,3 +95,36 @@ def make_git_repo(path: Path) -> Path:
 @pytest.fixture()
 def git_repo(tmp_path) -> Path:
     return make_git_repo(tmp_path / "repo")
+
+
+def ensure_agent(conn, name: str, role: str | None = None) -> None:
+    """Register an agent if missing; with a role, also (re)assign it."""
+    conn.execute(
+        "INSERT INTO agents (name) VALUES (?) ON CONFLICT DO NOTHING", (name,)
+    )
+    if role is not None:
+        conn.execute("UPDATE agents SET role = ? WHERE name = ?", (role, name))
+
+
+def register_repo(conn, path: Path, prefix: str = "repo") -> str:
+    """Register a fresh real Git repository under a unique name."""
+    name = f"{prefix}-{uuid.uuid4().hex[:8]}"
+    registry.add_repository(conn, name, make_git_repo(path))
+    return name
+
+
+def approve(conn, operation: dict, requested_by: str, voters=(OPERATOR,)) -> dict:
+    """Request an exact operation as one agent and approve it as operators."""
+    ensure_agent(conn, requested_by)
+    for voter in voters:
+        ensure_agent(conn, voter, "operator")
+    approval = gate.request_approval(conn, operation, requested_by=requested_by)
+    for voter in voters:
+        approval = gate.vote(conn, approval["id"], voter, True)
+    return approval
+
+
+@pytest.fixture()
+def approval_repo(conn, tmp_path) -> str:
+    """A registered repository name for approval operations."""
+    return register_repo(conn, tmp_path / "approval-repo", prefix="approval")

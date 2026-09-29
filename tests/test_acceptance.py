@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 from quorumgit import gate, handoff, registry, store, trees, work
-from tests.conftest import make_git_repo
+from tests.conftest import OPERATOR, ensure_agent, make_git_repo
 
 
 def test_full_workflow(committed_conn, cfg, tmp_path, initialized_store):
@@ -41,7 +41,7 @@ def test_full_workflow(committed_conn, cfg, tmp_path, initialized_store):
     agent_a, agent_b = f"a-{suffix}", f"b-{suffix}"
     registry.add_agent(conn, agent_a)
     registry.add_agent(conn, agent_b)
-    conn.execute("INSERT INTO agents (name) VALUES ('operator') ON CONFLICT DO NOTHING")
+    ensure_agent(conn, OPERATOR, "operator")
 
     task_a = work.create_task(
         conn, repo_name, "implement feature", objective="build the feature in src/"
@@ -152,8 +152,10 @@ def test_full_workflow(committed_conn, cfg, tmp_path, initialized_store):
             scope_globs=["src/**"],
         )
     takeover_op["from_claim_id"] = holder["id"]
-    approval = gate.request_approval(conn, takeover_op, requested_by="operator")
-    gate.vote(conn, approval["id"], "operator", True)
+    approval = gate.request_approval(conn, takeover_op, requested_by=agent_a)
+    with pytest.raises(gate.GateError, match="Vote refused"):
+        gate.vote(conn, approval["id"], agent_a, True)
+    gate.vote(conn, approval["id"], OPERATOR, True)
     assert gate.is_approved(conn, takeover_op)
     gate.consume_approval(conn, approval["id"], takeover_op, agent=agent_a)
     claim_back, _, _ = work.claim_task(

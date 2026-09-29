@@ -119,18 +119,63 @@ def cmd_repo_list(args, cfg) -> int:
     return 0
 
 
+def cmd_repo_policy(args, cfg) -> int:
+    with store.connect(cfg) as conn:
+        changing = (
+            args.threshold is not None
+            or args.role
+            or args.requester_may_vote is not None
+        )
+        if changing:
+            policy = registry.set_approval_policy(
+                conn,
+                args.name,
+                actor=getattr(args, "agent", None) or cfg.agent,
+                threshold=args.threshold,
+                roles=args.role or None,
+                requester_may_vote=args.requester_may_vote,
+            )
+            conn.commit()
+        else:
+            repo = registry.get_repository(conn, args.name)
+            policy = registry.approval_policy(conn, repo["id"])
+    print(f"repository: {args.name}")
+    print(f"approval threshold: {policy['threshold']}")
+    print(f"approving roles: {', '.join(policy['roles'])}")
+    print(f"requester may vote: {'yes' if policy['requester_may_vote'] else 'no'}")
+    return 0
+
+
 def cmd_agent_add(args, cfg) -> int:
     with store.connect(cfg) as conn:
-        agent_id = registry.add_agent(conn, args.name)
+        agent_id = registry.add_agent(
+            conn,
+            args.name,
+            role=args.role,
+            actor=getattr(args, "agent", None) or cfg.agent,
+        )
         conn.commit()
-    print(f"agent {args.name} registered (id {agent_id}).")
+    print(f"agent {args.name} registered as {args.role} (id {agent_id}).")
+    return 0
+
+
+def cmd_agent_role(args, cfg) -> int:
+    with store.connect(cfg) as conn:
+        registry.set_agent_role(
+            conn,
+            args.name,
+            args.role,
+            actor=getattr(args, "agent", None) or cfg.agent,
+        )
+        conn.commit()
+    print(f"agent {args.name} is now a {args.role}.")
     return 0
 
 
 def cmd_agent_list(args, cfg) -> int:
     with store.connect(cfg) as conn:
         for agent in registry.list_agents(conn):
-            print(f"{agent['id']}\t{agent['name']}")
+            print(f"{agent['id']}\t{agent['name']}\t{agent['role']}")
     return 0
 
 
@@ -173,11 +218,17 @@ def cmd_claim(args, cfg) -> int:
                     "from_agent": holder["agent"],
                     "to_agent": agent,
                 }
-                takeover_approval = gate.approved_instance(conn, takeover_operation)
+                takeover_approval = gate.approved_instance(
+                    conn, takeover_operation, consumer=agent
+                )
                 if takeover_approval is None:
+                    refusal = gate.approval_refusal(
+                        conn, takeover_operation, consumer=agent
+                    )
                     print(
                         "[quorumgit] REFUSED: lease takeover requires approval.\n"
-                        f"operation hash: "
+                        + (f"{refusal}\n" if refusal else "")
+                        + "operation hash: "
                         f"{gate.operation_hash(takeover_operation)}\n"
                         "Request/approve it via `quorumgit approve request/vote` "
                         "with operation:\n"
@@ -219,11 +270,16 @@ def cmd_claim(args, cfg) -> int:
                 return 1
         wt = None
         if not args.no_worktree:
-            wt = trees.create_worktree(conn, claim_id, cfg.worktrees_dir)
+            wt = trees.continue_or_create_worktree(conn, claim_id, cfg.worktrees_dir)
         conn.commit()
     print(f"claim {claim_id} acquired ({classification}).")
     if wt:
         print(f"worktree: {wt['path']}")
+        if wt.get("continued_from_claim_id"):
+            print(
+                "continued retained worktree of claim "
+                f"{wt['continued_from_claim_id']} (uncommitted work preserved)"
+            )
         print(f"branch: {wt['branch']}")
     else:
         print(f"branch: {args.branch} (no worktree — work from your own clone "
@@ -358,13 +414,12 @@ def _operation_from_args(args) -> dict:
 def cmd_approve_request(args, cfg) -> int:
     with store.connect(cfg) as conn:
         approval = gate.request_approval(
-            conn, _operation_from_args(args), requested_by=_agent(args, cfg),
-            threshold=args.threshold,
+            conn, _operation_from_args(args), requested_by=_agent(args, cfg)
         )
         conn.commit()
     print(
         f"approval {approval['id']} hash={approval['operation_hash']} "
-        f"status={approval['status']}"
+        f"status={approval['status']} threshold={approval['threshold']}"
     )
     return 0
 
@@ -444,9 +499,31 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--protected-ref", action="append", default=[]),
     ), parent=repo)
     add("list", cmd_repo_list, parent=repo)
+    add("policy", cmd_repo_policy, lambda sp: (
+        sp.add_argument("name"),
+        sp.add_argument("--agent", help="operator making the change"),
+        sp.add_argument("--threshold", type=int,
+                        help="eligible yes votes required"),
+        sp.add_argument("--role", action="append", default=[],
+                        choices=registry.ROLES,
+                        help="role whose votes count (repeatable; replaces "
+                             "the current set)"),
+        sp.add_argument("--requester-may-vote", dest="requester_may_vote",
+                        action=argparse.BooleanOptionalAction, default=None),
+    ), parent=repo)
 
     agent = sub.add_parser("agent").add_subparsers(dest="sub", required=True)
-    add("add", cmd_agent_add, lambda sp: sp.add_argument("name"), parent=agent)
+    add("add", cmd_agent_add, lambda sp: (
+        sp.add_argument("name"),
+        sp.add_argument("--role", choices=registry.ROLES,
+                        default=registry.DEFAULT_ROLE),
+        sp.add_argument("--agent", help="operator registering a non-worker"),
+    ), parent=agent)
+    add("role", cmd_agent_role, lambda sp: (
+        sp.add_argument("name"),
+        sp.add_argument("role", choices=registry.ROLES),
+        sp.add_argument("--agent", help="operator making the change"),
+    ), parent=agent)
     add("list", cmd_agent_list, parent=agent)
 
     task = sub.add_parser("task").add_subparsers(dest="sub", required=True)
@@ -526,7 +603,6 @@ def build_parser() -> argparse.ArgumentParser:
     add("request", cmd_approve_request, lambda sp: (
         sp.add_argument("operation", help="operation JSON object"),
         sp.add_argument("--agent"),
-        sp.add_argument("--threshold", type=int, default=1),
     ), parent=ap)
     add("vote", cmd_approve_vote, lambda sp: (
         sp.add_argument("approval_id", type=int),

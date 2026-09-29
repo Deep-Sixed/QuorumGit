@@ -8,6 +8,7 @@ filesystem so a database rollback is never mistaken for a filesystem rollback.
 
 from __future__ import annotations
 
+import secrets
 import subprocess
 from pathlib import Path
 
@@ -42,6 +43,25 @@ def _git_common_dir(repo_path: str | Path) -> Path:
     return common.resolve()
 
 
+def managed_worktree_path(
+    worktrees_dir: Path, repository_id: int, claim_id: int
+) -> Path:
+    """Filesystem location for a new managed worktree.
+
+    Built only from database-generated integer IDs and a random suffix:
+    repository and agent names are display identities and never become path
+    components, so no registered name can steer a checkout outside the
+    directory QuorumGit owns. The suffix keeps the path fresh even when SQLite
+    reuses the rowid of a rolled-back claim whose checkout was left behind.
+    """
+    root = Path(worktrees_dir).resolve()
+    leaf = f"claim-{int(claim_id)}-{secrets.token_hex(4)}"
+    path = (root / f"repo-{int(repository_id)}" / leaf).resolve()
+    if not path.is_relative_to(root):
+        raise WorktreeError(f"Managed worktree path escapes {root}: {path}")
+    return path
+
+
 def create_worktree(
     conn: Connection, claim_id: int, worktrees_dir: Path, base_ref: str = "HEAD"
 ) -> dict:
@@ -52,14 +72,7 @@ def create_worktree(
     repo_path = task["repository_path"]
     branch = claim["branch"]
 
-    # Claim identity is part of the managed path. Re-claiming the same task by
-    # the same agent therefore creates a fresh path without colliding with the
-    # historical UNIQUE(worktrees.path) row from an earlier claim.
-    wt_path = (
-        worktrees_dir
-        / task["repository"]
-        / f"task-{task['id']}-{claim['agent']}-claim-{claim_id}"
-    )
+    wt_path = managed_worktree_path(worktrees_dir, task["repository_id"], claim_id)
     wt_path.parent.mkdir(parents=True, exist_ok=True)
     if wt_path.exists():
         raise WorktreeError(f"Worktree path already exists: {wt_path}")
@@ -119,6 +132,112 @@ def worktree_for_claim(conn: Connection, claim_id: int) -> dict | None:
     if row is None:
         return None
     return {"id": row[0], "path": row[1], "branch": row[2], "removed_at": row[3]}
+
+
+def _retained_worktree_for_branch(
+    conn: Connection, repository_id: int, branch: str, exclude_claim_id: int
+) -> dict | None:
+    """A live recorded worktree with this branch checked out, if any."""
+    row = conn.execute(
+        """
+        SELECT w.id, w.path, w.branch, c.id, c.task_id, c.released_at,
+               c.release_reason,
+               EXISTS (
+                   SELECT 1 FROM handoffs h
+                   WHERE h.from_claim_id = c.id AND h.status = 'open'
+               )
+        FROM worktrees w
+        JOIN claims c ON c.id = w.claim_id
+        JOIN tasks t ON t.id = c.task_id
+        WHERE t.repository_id = ? AND w.branch = ? AND w.removed_at IS NULL
+          AND c.id <> ?
+        ORDER BY w.id DESC
+        LIMIT 1
+        """,
+        (repository_id, branch, exclude_claim_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row[0],
+        "path": row[1],
+        "branch": row[2],
+        "claim_id": row[3],
+        "task_id": row[4],
+        "released_at": row[5],
+        "release_reason": row[6],
+        "open_handoff": bool(row[7]),
+    }
+
+
+def continue_or_create_worktree(
+    conn: Connection, claim_id: int, worktrees_dir: Path, base_ref: str = "HEAD"
+) -> dict:
+    """Give a new claim its worktree, continuing a retained one when it exists.
+
+    A claim that supersedes an earlier claim on the same task and branch —
+    after lease expiry, an approved takeover, or a release that kept its
+    checkout — cannot get a second checkout: Git refuses to check one branch
+    out twice. Instead the retained checkout, with any unfinished work in it,
+    is verified and transferred to the new claim, and the transfer is audited.
+    A retained checkout belonging to a different task is never adopted.
+    """
+    claim = get_claim(conn, claim_id)
+    if claim["released_at"] is not None:
+        raise WorktreeError(f"Claim {claim_id} is released.")
+    task = get_task(conn, claim["task_id"])
+    retained = _retained_worktree_for_branch(
+        conn, task["repository_id"], claim["branch"], exclude_claim_id=claim_id
+    )
+    if retained is None or not Path(retained["path"]).exists():
+        # A recorded checkout whose directory is gone holds no work to
+        # continue; doctor reports and reconciles that record separately.
+        return create_worktree(conn, claim_id, worktrees_dir, base_ref)
+
+    where = (
+        f"Branch {claim['branch']!r} is still checked out in retained worktree "
+        f"{retained['path']} (claim {retained['claim_id']}, task "
+        f"{retained['task_id']})"
+    )
+    if retained["task_id"] != task["id"]:
+        raise WorktreeError(
+            f"{where}. It belongs to another task and will not be adopted; "
+            "its owner should release it with --remove-worktree, or claim with "
+            "--no-worktree."
+        )
+    if retained["released_at"] is None or retained["open_handoff"]:
+        raise WorktreeError(f"{where}, which is still reserved; refusing to adopt it.")
+    issue, error = checkout_identity_issue(
+        task["repository_path"], retained["path"], retained["branch"]
+    )
+    if issue is not None:
+        raise WorktreeError(
+            f"{where}, but its checkout no longer matches the record ({issue}"
+            + (f": {error}" if error else "")
+            + "). Inspect it manually; refusing to adopt it."
+        )
+
+    transfer_worktree(conn, retained["id"], claim_id)
+    audit.record(
+        conn,
+        "worktree.continued",
+        "worktree",
+        retained["id"],
+        agent=claim["agent"],
+        detail={
+            "path": retained["path"],
+            "branch": retained["branch"],
+            "from_claim_id": retained["claim_id"],
+            "to_claim_id": claim_id,
+            "from_release_reason": retained["release_reason"],
+        },
+    )
+    return {
+        "id": retained["id"],
+        "path": retained["path"],
+        "branch": retained["branch"],
+        "continued_from_claim_id": retained["claim_id"],
+    }
 
 
 def transfer_worktree(conn: Connection, worktree_id: int, new_claim_id: int) -> None:
@@ -203,6 +322,30 @@ def cleanup_released_worktree(
     return True
 
 
+def checkout_identity_issue(
+    repo_path: str | Path, wt_path: str | Path, branch: str
+) -> tuple[str | None, str | None]:
+    """Compare an existing checkout with its recorded repository and branch.
+
+    Returns (issue, error): issue is None when the checkout is the recorded
+    repository's worktree with the recorded branch checked out.
+    """
+    try:
+        expected_common = _git_common_dir(repo_path)
+        actual_common = _git_common_dir(wt_path)
+        actual_root = Path(_git(wt_path, "rev-parse", "--show-toplevel")).resolve()
+        actual_branch = _git(wt_path, "rev-parse", "--symbolic-full-name", "HEAD")
+    except WorktreeError as exc:
+        return "unverifiable_checkout", str(exc)
+    if actual_common != expected_common or actual_root != Path(wt_path).resolve():
+        return "repository_mismatch", None
+    if actual_branch == "HEAD":
+        return "detached_head", None
+    if actual_branch != f"refs/heads/{branch}":
+        return "branch_mismatch", None
+    return None, None
+
+
 def doctor_worktrees(conn: Connection, repair: bool = False) -> list[dict]:
     """Report and conservatively repair drift in recorded managed worktrees.
 
@@ -243,27 +386,9 @@ def doctor_worktrees(conn: Connection, repair: bool = False) -> list[dict]:
         issue: str | None = None
         identity_error = None
         if exists:
-            try:
-                expected_common = _git_common_dir(repo_path)
-                actual_common = _git_common_dir(wt["path"])
-                actual_root = Path(
-                    _git(wt["path"], "rev-parse", "--show-toplevel")
-                ).resolve()
-                actual_branch = _git(
-                    wt["path"], "rev-parse", "--symbolic-full-name", "HEAD"
-                )
-                if (
-                    actual_common != expected_common
-                    or actual_root != Path(wt["path"]).resolve()
-                ):
-                    issue = "repository_mismatch"
-                elif actual_branch == "HEAD":
-                    issue = "detached_head"
-                elif actual_branch != f"refs/heads/{wt['branch']}":
-                    issue = "branch_mismatch"
-            except WorktreeError as exc:
-                issue = "unverifiable_checkout"
-                identity_error = str(exc)
+            issue, identity_error = checkout_identity_issue(
+                repo_path, wt["path"], wt["branch"]
+            )
         if issue is not None:
             pass
         elif wt["removed_at"] is None and not exists:
