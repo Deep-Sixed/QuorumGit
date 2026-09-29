@@ -76,6 +76,7 @@ def git_common_dir(path: str | Path) -> Path:
         ["git", "-C", str(repo_path), "rev-parse", "--git-common-dir"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()

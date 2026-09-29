@@ -65,7 +65,7 @@ contract: ok
 
 `init` creates the state directory, applies migrations, and verifies the runtime contract (required migrations, tables, and governance triggers, foreign keys on, WAL journal mode). It is idempotent — re-run it any time.
 
-`quorumgit status` shows the store path, contract state, and row counts. If the store is down or incomplete, every command exits non-zero: there is **one storage backend and no fallback**, by design.
+`quorumgit status` shows the store path, contract state, and row counts. If the store is missing or incomplete, every command exits non-zero: there is **one storage backend and no fallback**, by design.
 
 ## Quick start (five minutes)
 
@@ -120,7 +120,7 @@ QUORUMGIT_AGENT=agent-two quorumgit handoff accept 1
 # remaining work: wire into CLI, integration tests
 ```
 
-Creating a handoff releases the original claim but keeps its worktree; accepting transfers that same worktree to the new claim. When the claim has a worktree, the handoff records the worktree's `HEAD` as the last commit (`--last-commit` is only used when there is no worktree).
+Creating a handoff releases the original claim but keeps its worktree; accepting transfers that same worktree to the new claim. When the claim has an active worktree, the handoff records the worktree's `HEAD` as the last commit; `--last-commit` is used when there is none (hub model, or a worktree removed by `doctor --repair`).
 
 What just *didn't* happen, silently: a second agent claiming task 1 (**BLOCKED**), claiming another task on branch `feat/x` (**CONFLICTING**), or claiming a task whose scopes overlap `src/**` (**OVERLAPPING**, refused unless explicitly overridden and audited). While the handoff was open, the task, branch, and declared scopes were **reserved** for continuation until agent-two accepted.
 
@@ -228,7 +228,7 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit renew <claim> [--lease-hours <h>]` | Extend a live, unexpired lease; expired claims must be acquired again |
 | `quorumgit checkpoint <claim> [--commit <oid>] [--note <n>]` | Record verified progress |
 | `quorumgit release <claim> [--remove-worktree] [--reason <r>]` | Release a claim; the task returns to `open` |
-| `quorumgit handoff create <claim> --completed <c> --remaining <r> [--to <agent>] [--files-changed <f>]… [--blockers <b>]… [--validation <v>] [--last-commit <oid>]` | Hand work off (`--last-commit` only when the claim has no worktree) |
+| `quorumgit handoff create <claim> --completed <c> --remaining <r> [--to <agent>] [--files-changed <f>]… [--blockers <b>]… [--validation <v>] [--last-commit <oid>]` | Hand work off (`--last-commit` only when the claim has no active worktree) |
 | `quorumgit handoff accept <id> [--lease-hours <h>]` | Continue handed-off work (addressee, or anyone if unaddressed) |
 | `quorumgit handoff decline <id>` | Decline — addressee only; removes the retained worktree, and is refused if it has uncommitted changes |
 | `quorumgit handoff cancel <id>` | Cancel — creator only; removes the retained worktree, and is refused if it has uncommitted changes |

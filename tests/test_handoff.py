@@ -144,6 +144,7 @@ def test_branch_frozen_during_handoff_gap(committed_conn, tmp_path, cfg):
             capture_output=True,
             text=True,
             env={**os.environ, **env_base, **kw},
+            check=True,
         )
 
     git("checkout", "-B", "feat/freeze")
@@ -164,6 +165,7 @@ def test_branch_frozen_during_handoff_gap(committed_conn, tmp_path, cfg):
             + os.pathsep
             + os.environ["PATH"],
         },
+        check=False,
     )
     assert result.returncode != 0
     assert "frozen pending handoff" in result.stderr

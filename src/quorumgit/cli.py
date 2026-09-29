@@ -54,7 +54,7 @@ def cmd_status(args, cfg) -> int:
         return 1
     with store.session(cfg) as conn:
         for table in ("repositories", "agents", "tasks", "claims", "handoffs"):
-            row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()  # noqa: S608 — fixed identifier set
+            row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()
             assert row is not None
             print(f"{table}: {row[0]}")
     return 0
@@ -313,9 +313,9 @@ def cmd_checkpoint(args, cfg) -> int:
     with store.session(cfg) as conn:
         commit = args.commit
         if not commit:
-            wt = trees.worktree_for_claim(conn, args.claim_id)
+            wt = trees.active_worktree_for_claim(conn, args.claim_id)
             if wt is None:
-                print("No worktree for this claim; pass --commit <oid>.",
+                print("No active worktree for this claim; pass --commit <oid>.",
                       file=sys.stderr)
                 return 1
             commit = trees.head_commit(wt["path"])
@@ -332,10 +332,11 @@ def cmd_checkpoint(args, cfg) -> int:
 def cmd_handoff_create(args, cfg) -> int:
     agent = _agent(args, cfg)
     with store.session(cfg) as conn:
-        wt = trees.worktree_for_claim(conn, args.claim_id)
+        wt = trees.active_worktree_for_claim(conn, args.claim_id)
         last_commit = trees.head_commit(wt["path"]) if wt else args.last_commit
         if not last_commit:
-            print("Provide --last-commit (no worktree found).", file=sys.stderr)
+            print("Provide --last-commit (no active worktree for this claim).",
+                  file=sys.stderr)
             return 1
         record = {
             "completed": args.completed,

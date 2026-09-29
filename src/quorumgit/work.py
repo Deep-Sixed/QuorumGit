@@ -333,6 +333,7 @@ def verify_commit(
                 f"{commit_oid}^{{commit}}",
             ],
             capture_output=True,
+            check=False,
         ).returncode
         == 0
     )
@@ -353,6 +354,7 @@ def verify_commit(
                     f"refs/heads/{branch}",
                 ],
                 capture_output=True,
+                check=False,
             ).returncode
             == 0
         )
@@ -369,6 +371,7 @@ def verify_commit(
                         f"refs/heads/{branch}",
                     ],
                     capture_output=True,
+                    check=False,
                 ).returncode
                 == 0
             )

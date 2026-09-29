@@ -104,7 +104,7 @@ def test_begin_immediate_waiter_acquires_after_holder_releases(initialized_store
             elapsed.append(time.monotonic() - began)
             acquired.set()
             waiter.rollback()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — surface any worker failure to the test thread
             errors.append(exc)
 
     try:
