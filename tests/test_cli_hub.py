@@ -20,9 +20,6 @@ def _cli(cfg, *args: str, agent: str | None = None):
     env = {
         **os.environ,
         "QUORUMGIT_DATA_DIR": str(cfg.data_dir),
-        # A native crash (e.g. Windows 0xC0000005) otherwise leaves no output
-        # at all; faulthandler prints the Python stack that was running.
-        "PYTHONFAULTHANDLER": "1",
     }
     env.pop("QUORUMGIT_AGENT", None)
     if agent:
