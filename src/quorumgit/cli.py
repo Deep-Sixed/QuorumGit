@@ -407,10 +407,37 @@ def _operation_from_args(args) -> dict:
 
 
 def cmd_approve_request(args, cfg) -> int:
+    requester = _agent(args, cfg)
+    if (args.operation is None) == (args.push is None):
+        print("Give either an operation JSON object or --push <ref>.",
+              file=sys.stderr)
+        return 2
     with store.connect(cfg) as conn:
+        if args.push is not None:
+            if not args.repo:
+                print("--push requires --repo <name>.", file=sys.stderr)
+                return 2
+            if args.delete == bool(args.source):
+                print("--push requires exactly one of --from <clone> or --delete.",
+                      file=sys.stderr)
+                return 2
+            operation = gate.derive_push_operation(
+                conn,
+                args.repo,
+                args.push,
+                args.pusher or requester,
+                source=args.source,
+                rev=args.rev,
+                delete=args.delete,
+            )
+            if operation is None:
+                print("This push needs no approval; nothing requested.")
+                return 0
+            print(f"operation: {json.dumps(operation, sort_keys=True)}")
+        else:
+            operation = _operation_from_args(args)
         approval = gate.request_approval(
-            conn, _operation_from_args(args), requested_by=_agent(args, cfg),
-            threshold=args.threshold,
+            conn, operation, requested_by=requester, threshold=args.threshold,
         )
         conn.commit()
     print(
@@ -595,7 +622,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     ap = sub.add_parser("approve").add_subparsers(dest="sub", required=True)
     add("request", cmd_approve_request, lambda sp: (
-        sp.add_argument("operation", help="operation JSON object"),
+        sp.add_argument("operation", nargs="?", help="operation JSON object"),
+        sp.add_argument("--push", metavar="REF",
+                        help="derive the operation for pushing this ref "
+                             "(branch name or full refname) instead of "
+                             "passing JSON"),
+        sp.add_argument("--repo", help="registered repository (with --push)"),
+        sp.add_argument("--from", dest="source", metavar="CLONE",
+                        help="repository holding the commit to push "
+                             "(with --push)"),
+        sp.add_argument("--rev", default="HEAD",
+                        help="commit to push, resolved in --from "
+                             "(default HEAD)"),
+        sp.add_argument("--delete", action="store_true",
+                        help="derive a deletion of the ref (with --push)"),
+        sp.add_argument("--pusher",
+                        help="agent that will push (default: the requester)"),
         sp.add_argument("--agent"),
         sp.add_argument("--threshold", type=int, default=1),
     ), parent=ap)

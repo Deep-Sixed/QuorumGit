@@ -181,9 +181,12 @@ The flow, driven by the rejection messages themselves:
 #    bound to this exact update (hash sha256:ab12…).
 
 # 2. Any registered agent requests that exact operation, and an approver votes
-#    on the returned approval instance ID. The approver must be registered too:
+#    on the returned approval instance ID. The approver must be registered too.
+#    --push derives the operation from the commit in your clone, so nobody
+#    has to write the JSON by hand:
 quorumgit agent add operator
-quorumgit approve request '{"type":"protected_ref_update","repository":"myproject","refname":"refs/heads/main","oldrev":"<old>","newrev":"<new>"}'
+quorumgit approve request --repo myproject --push main --from ./my-clone --agent agent-one
+# operation: {"newrev": "<new>", "oldrev": "<old>", "refname": "refs/heads/main", "repository": "myproject", "type": "protected_ref_update"}
 # approval 17 hash=sha256:ab12… status=pending
 quorumgit approve vote 17 --agent operator
 
@@ -218,6 +221,8 @@ quorumgit repo policy myproject                  # show the current policy
 
 Every roster and policy change is audited. Without a roster or separation of duties, the open policy above applies — "operator" is then a convention, not a role, and keeping approvals in human hands depends on how agent identities are used (see the threat model).
 
+`approve request --push` runs the hook's own derivation against the hub, with your clone's object store attached read-only (the way Git exposes incoming objects to a pre-receive hook). It fetches and writes nothing, reads the old revision from the hub's current ref, resolves `--rev` (default `HEAD`) in `--from`, and produces the same operation the hook will compute — protected update, force push, deletion (`--delete`), or out-of-scope update with its path list — for the agent named by `--pusher` (default: the requester). It applies the same branch reservations as the hook, so a push the hook would refuse outright is refused here too. If the hub's ref moves before you push, the operation no longer matches: derive and request again.
+
 Takeovers follow the same pattern: claiming a task someone else holds (`claim <task> --takeover`) prints the takeover operation to approve. Its payload includes the incumbent claim ID, so an unused approval cannot displace a later claim by the same agent. The takeover is atomic — the incumbent is released, the replacement claim created, and the approval consumed in one transaction, or none of it happens. A refused takeover leaves the incumbent untouched and the approval unconsumed.
 
 ## Command reference
@@ -243,6 +248,7 @@ Takeovers follow the same pattern: claiming a task someone else holds (`claim <t
 | `quorumgit handoff cancel <id>` | Cancel — creator only; removes the retained worktree, and is refused if it has uncommitted changes |
 | `quorumgit handoff list [--status <s>] / show <id>` | Inspect handoffs |
 | `quorumgit approve request <json> [--threshold <n>]` | Open an approval for an exact operation |
+| `quorumgit approve request --repo <name> --push <ref> (--from <clone> [--rev <commit>] \| --delete) [--pusher <agent>]` | Derive the operation a push will need, before pushing, and open an approval for it (prints nothing to approve if the push is ungoverned) |
 | `quorumgit approve vote <approval-id> [--deny]` | Vote on one approval instance |
 | `quorumgit approve hash <json>` | Compute an operation's hash |
 | `quorumgit hook install --repo <name>` | Install the pre-receive hook (hub model) |

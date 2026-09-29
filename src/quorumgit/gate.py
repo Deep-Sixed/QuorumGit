@@ -23,6 +23,7 @@ from .registry import (
     assert_repository_identity_unique,
     get_agent,
     get_repository,
+    git_common_dir,
 )
 from .store import Connection, begin_immediate, json_dumps, json_loads
 from .work import live_claim_for_branch, open_handoff_for_branch
@@ -407,7 +408,9 @@ def _is_zero(oid: str) -> bool:
     return set(oid) == {"0"}
 
 
-def _is_fast_forward(git_dir: str, oldrev: str, newrev: str) -> bool:
+def _is_fast_forward(
+    git_dir: str, oldrev: str, newrev: str, env: dict[str, str] | None = None
+) -> bool:
     result = subprocess.run(
         [
             "git",
@@ -420,13 +423,16 @@ def _is_fast_forward(git_dir: str, oldrev: str, newrev: str) -> bool:
         ],
         capture_output=True,
         check=False,
+        env=env,
     )
     if result.returncode not in (0, 1):
         raise PushRejected("Unable to determine fast-forward status.")
     return result.returncode == 0
 
 
-def _new_commit_paths(git_dir: str, newrev: str) -> list[str]:
+def _new_commit_paths(
+    git_dir: str, newrev: str, env: dict[str, str] | None = None
+) -> list[str]:
     """Paths changed by the commits this push introduces.
 
     Only commits not yet reachable from any existing ref are inspected, so a
@@ -440,6 +446,7 @@ def _new_commit_paths(git_dir: str, newrev: str) -> list[str]:
         ["git", "--git-dir", git_dir, "rev-list", newrev, "--not", "--all"],
         capture_output=True,
         check=False,
+        env=env,
     )
     if commits.returncode != 0:
         raise PushRejected("Unable to list the commits introduced by this push.")
@@ -463,6 +470,7 @@ def _new_commit_paths(git_dir: str, newrev: str) -> list[str]:
         input=commits.stdout,
         capture_output=True,
         check=False,
+        env=env,
     )
     if result.returncode != 0:
         raise PushRejected("Unable to determine the paths changed by this push.")
@@ -507,17 +515,26 @@ def _verify_repository_binding(
     return repo
 
 
-def check_ref_update(
+def governed_operation(
     conn: Connection,
-    repository: str,
+    repo: dict,
     git_dir: str,
     pusher: str | None,
     oldrev: str,
     newrev: str,
     refname: str,
-) -> None:
-    """Enforce governance for one ref update. Raises PushRejected."""
-    repo = _verify_repository_binding(conn, repository, git_dir)
+    env: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    """The approval-gated operation a ref update amounts to, if any.
+
+    Raises PushRejected when branch reservations forbid the update outright
+    (approvals never override them). Returns None for an ungoverned update.
+    This is the single derivation shared by the pre-receive hook and
+    `approve request --push`, so a request built before pushing binds to the
+    exact payload the hook recomputes. `env` lets the offline derivation see
+    the pusher's not-yet-pushed objects through an object alternate.
+    """
+    repository = repo["name"]
     branch = refname.removeprefix("refs/heads/")
     deletion = _is_zero(newrev)
     out_of_scope: list[str] = []
@@ -540,7 +557,7 @@ def check_ref_update(
             # Declared scopes are enforced on what the push actually changes,
             # not only on what the claim said it would change.
             out_of_scope = work.paths_outside_scopes(
-                _new_commit_paths(git_dir, newrev),
+                _new_commit_paths(git_dir, newrev, env),
                 work.claim_scopes(conn, claim["id"]),
             )
 
@@ -548,30 +565,124 @@ def check_ref_update(
     forced = (
         not deletion
         and not _is_zero(oldrev)
-        and not _is_fast_forward(git_dir, oldrev, newrev)
+        and not _is_fast_forward(git_dir, oldrev, newrev, env)
     )
 
-    if protected or deletion or forced or out_of_scope:
-        if protected:
-            op_type = "protected_ref_update"
-        elif deletion:
-            op_type = "ref_delete"
-        elif forced:
-            op_type = "force_update"
-        else:
-            op_type = "out_of_scope_update"
-        operation: dict[str, Any] = {
-            "type": op_type,
-            "repository": repository,
-            "refname": refname,
-            "oldrev": oldrev,
-            "newrev": newrev,
+    if not (protected or deletion or forced or out_of_scope):
+        return None
+    if protected:
+        op_type = "protected_ref_update"
+    elif deletion:
+        op_type = "ref_delete"
+    elif forced:
+        op_type = "force_update"
+    else:
+        op_type = "out_of_scope_update"
+    operation: dict[str, Any] = {
+        "type": op_type,
+        "repository": repository,
+        "refname": refname,
+        "oldrev": oldrev,
+        "newrev": newrev,
+    }
+    if out_of_scope:
+        operation["out_of_scope_paths"] = out_of_scope
+    return operation
+
+
+def _git_out(args: list[str], what: str, env: dict[str, str] | None = None) -> str:
+    result = subprocess.run(
+        ["git", *args], capture_output=True, text=True, check=False, env=env
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise GateError(f"{what}{': ' + detail if detail else ''}")
+    return result.stdout.strip()
+
+
+def derive_push_operation(
+    conn: Connection,
+    repository: str,
+    refname: str,
+    pusher: str,
+    *,
+    source: str | Path | None = None,
+    rev: str = "HEAD",
+    delete: bool = False,
+) -> dict[str, Any] | None:
+    """Derive, before pushing, the exact operation the hook will require.
+
+    The hub's current value of the ref is the old revision; the new revision
+    is resolved in the pusher's own repository (`source`). Nothing is fetched
+    or written: the hub is inspected with the source's object store attached
+    as a read-only alternate, the same way Git exposes incoming objects to a
+    real pre-receive hook, and the hook's own derivation is reused. Returns
+    None when the push needs no approval.
+    """
+    if not refname.startswith("refs/"):
+        refname = f"refs/heads/{refname}"
+    repo = get_repository(conn, repository)
+    get_agent(conn, pusher)
+    hub_git_dir = str(assert_repository_identity_unique(conn, repo))
+    current = subprocess.run(
+        ["git", "--git-dir", hub_git_dir, "rev-parse", "--verify", "--quiet",
+         f"{refname}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    exists = current.returncode == 0
+
+    env: dict[str, str] | None = None
+    if delete:
+        if not exists:
+            raise GateError(f"{refname} does not exist in {repository}; nothing to delete.")
+        oldrev = current.stdout.strip()
+        newrev = "0" * len(oldrev)
+    else:
+        if source is None:
+            raise GateError("Deriving a push needs --from <your clone>.")
+        source_path = Path(source).resolve()
+        newrev = _git_out(
+            ["-C", str(source_path), "rev-parse", "--verify", f"{rev}^{{commit}}"],
+            f"Cannot resolve {rev!r} to a commit in {source_path}",
+        )
+        try:
+            source_common = git_common_dir(source_path)
+        except RegistryError as exc:
+            raise GateError(str(exc)) from exc
+        env = {
+            **os.environ,
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(source_common / "objects"),
         }
-        if out_of_scope:
-            operation["out_of_scope_paths"] = out_of_scope
+        oldrev = current.stdout.strip() if exists else "0" * len(newrev)
+        if exists and oldrev == newrev:
+            raise GateError(f"{refname} is already at {newrev}; nothing to push.")
+    return governed_operation(
+        conn, repo, hub_git_dir, pusher, oldrev, newrev, refname, env=env
+    )
+
+
+def check_ref_update(
+    conn: Connection,
+    repository: str,
+    git_dir: str,
+    pusher: str | None,
+    oldrev: str,
+    newrev: str,
+    refname: str,
+) -> None:
+    """Enforce governance for one ref update. Raises PushRejected."""
+    repo = _verify_repository_binding(conn, repository, git_dir)
+    operation = governed_operation(
+        conn, repo, git_dir, pusher, oldrev, newrev, refname
+    )
+
+    if operation is not None:
         approval = approved_instance(conn, operation)
         if approval is None:
             scope_note = ""
+            out_of_scope = operation.get("out_of_scope_paths", [])
             if out_of_scope:
                 shown = ", ".join(out_of_scope[:10])
                 more = len(out_of_scope) - 10
@@ -581,10 +692,15 @@ def check_ref_update(
                     f" It changes paths outside the pusher's claimed scopes: "
                     f"{shown}."
                 )
+            if operation["type"] == "ref_delete":
+                how = f"--push {refname} --delete"
+            else:
+                how = f"--push {refname} --from <your clone> --rev {newrev}"
             raise PushRejected(
                 f"{operation['type']} on {refname} requires an approval "
                 f"bound to this exact update (hash {operation_hash(operation)})."
-                f"{scope_note}"
+                f"{scope_note} Request it with: quorumgit approve request "
+                f"--repo {repository} {how}"
             )
         assert pusher is not None
         consume_approval(conn, approval["id"], operation, agent=pusher)
