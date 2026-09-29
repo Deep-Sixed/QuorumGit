@@ -121,6 +121,14 @@ def worktree_for_claim(conn: Connection, claim_id: int) -> dict | None:
     return {"id": row[0], "path": row[1], "branch": row[2], "removed_at": row[3]}
 
 
+def active_worktree_for_claim(conn: Connection, claim_id: int) -> dict | None:
+    """The claim's worktree, or None if it has none or it was removed."""
+    wt = worktree_for_claim(conn, claim_id)
+    if wt is None or wt["removed_at"] is not None:
+        return None
+    return wt
+
+
 def transfer_worktree(conn: Connection, worktree_id: int, new_claim_id: int) -> None:
     """Reassign a worktree to a new claim (handoff continuation)."""
     conn.execute(
