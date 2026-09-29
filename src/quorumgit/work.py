@@ -8,7 +8,9 @@ the moment another operation supersedes it. No background process exists.
 from __future__ import annotations
 
 import math
+import re
 import subprocess
+from functools import lru_cache
 from typing import Any
 
 from . import audit
@@ -316,6 +318,66 @@ def scopes_overlap(a: str, b: str) -> bool:
     """Conservative overlap test that errs toward flagging."""
     pa, pb = _glob_prefix(a), _glob_prefix(b)
     return pa.startswith(pb) or pb.startswith(pa)
+
+
+@lru_cache(maxsize=512)
+def _glob_regex(glob: str) -> re.Pattern[str]:
+    """Translate a path glob into an anchored regular expression.
+
+    ``**`` spans any number of directories (``**/`` may match none), ``*`` and
+    ``?`` stay within one path segment, and ``[...]`` is a character class. A
+    glob with no wildcard, or one ending in ``/``, names a file or directory
+    and matches everything beneath it.
+    """
+    pattern = glob.removeprefix("./").lstrip("/")
+    if _glob_prefix(pattern) == pattern:
+        return re.compile(re.escape(pattern.rstrip("/")) + "(?:/.*)?")
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif ch == "*":
+            out.append("[^/]*")
+            i += 1
+        elif ch == "?":
+            out.append("[^/]")
+            i += 1
+        elif ch == "[":
+            end = pattern.find("]", i + 2 if pattern[i + 1 : i + 2] in ("!", "]") else i + 1)
+            if end == -1:
+                out.append(re.escape(ch))
+                i += 1
+                continue
+            body = pattern[i + 1 : end]
+            if body.startswith("!"):
+                body = "^" + body[1:]
+            out.append("(?!/)[" + body.replace("\\", "\\\\") + "]")
+            i = end + 1
+        else:
+            out.append(re.escape(ch))
+            i += 1
+    return re.compile("".join(out))
+
+
+def path_in_scope(path: str, glob: str) -> bool:
+    """True when a repository-relative path falls under a scope glob."""
+    return _glob_regex(glob).fullmatch(path) is not None
+
+
+def paths_outside(paths: list[str], globs: list[str]) -> list[str]:
+    """The paths no glob covers, in their original order."""
+    return [p for p in paths if not any(path_in_scope(p, g) for g in globs)]
+
+
+def paths_within(paths: list[str], globs: list[str]) -> list[str]:
+    """The paths some glob covers, in their original order."""
+    return [p for p in paths if any(path_in_scope(p, g) for g in globs)]
 
 
 def verify_commit(

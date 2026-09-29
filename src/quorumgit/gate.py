@@ -1,7 +1,10 @@
 """Approval gate and pre-receive enforcement.
 
 Protected operations require an approval whose hash binds to the exact
-operation payload. Who may authorize is owned by the operation's repository:
+operation payload. What a push touches is derived from the Git objects it
+carries (see git_objects), never from what an agent declared it would modify:
+changes outside the pushing claim's scopes and changes to protected paths are
+approval-governed just like protected refs, force pushes, and deletions. Who may authorize is owned by the operation's repository:
 its approval policy names the threshold, the roles whose votes count, and
 whether the requester may vote. An agent that approved an operation may never
 be the one that carries it out. Enforcement is fail-closed: any hook error
@@ -19,17 +22,24 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from . import audit
+from . import audit, git_objects
 from .canonical import stable_hash
+from .git_objects import ZERO_OID, is_zero
 from .registry import (
     RegistryError,
     approval_policy,
     assert_repository_identity_unique,
     get_agent,
     get_repository,
+    git_common_dir,
 )
 from .store import Connection, begin_immediate, json_dumps, json_loads
-from .work import live_claim_for_branch, open_handoff_for_branch
+from .work import (
+    live_claim_for_branch,
+    open_handoff_for_branch,
+    paths_outside,
+    paths_within,
+)
 
 HOOK_MARKER = "# quorumgit-managed-pre-receive v1"
 
@@ -431,32 +441,6 @@ def consume_approval(
 # --------------------------------------------------------------- hook logic
 
 
-ZERO_OID = "0" * 40
-
-
-def _is_zero(oid: str) -> bool:
-    return set(oid) == {"0"}
-
-
-def _is_fast_forward(git_dir: str, oldrev: str, newrev: str) -> bool:
-    result = subprocess.run(
-        [
-            "git",
-            "--git-dir",
-            git_dir,
-            "merge-base",
-            "--is-ancestor",
-            oldrev,
-            newrev,
-        ],
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode not in (0, 1):
-        raise PushRejected("Unable to determine fast-forward status.")
-    return result.returncode == 0
-
-
 def _invoking_git_common_dir(git_dir: str) -> Path:
     result = subprocess.run(
         ["git", "--git-dir", git_dir, "rev-parse", "--git-common-dir"],
@@ -493,6 +477,103 @@ def _verify_repository_binding(
     return repo
 
 
+def ref_namespace_refusal(repo: dict, refname: str) -> str | None:
+    """Why this repository refuses any push to refname, or None."""
+    allowed = repo["allowed_ref_namespaces"]
+    if any(refname.startswith(prefix) for prefix in allowed):
+        return None
+    return (
+        f"{refname} is outside {repo['name']!r}'s allowed ref namespaces "
+        f"({', '.join(allowed) or 'none'}); an operator can allow it with "
+        f"`quorumgit repo allow-ref {repo['name']} <prefix>`."
+    )
+
+
+def _claim_scopes(conn: Connection, claim_id: int) -> list[str]:
+    return [
+        row[0]
+        for row in conn.execute(
+            "SELECT path_glob FROM scopes WHERE claim_id = ? ORDER BY id",
+            (claim_id,),
+        ).fetchall()
+    ]
+
+
+def governed_operations(
+    conn: Connection,
+    repo: dict,
+    refname: str,
+    oldrev: str,
+    newrev: str,
+    git_dir: str | Path,
+    paths: list[str],
+) -> list[dict]:
+    """Every approval one ref update needs, derived from what it carries.
+
+    ``paths`` are the paths the update brings in (git_objects.changed_paths).
+    Ref-level governance (protected ref, force push, deletion) comes first,
+    then content governance: paths outside the scopes of the claim on the
+    branch, and paths under the repository's protected paths. Each operation
+    binds the exact revisions, so its hash is reproducible by anyone who can
+    see the same objects — the hook and ``approve prepare`` alike.
+    """
+    base = {
+        "repository": repo["name"],
+        "refname": refname,
+        "oldrev": oldrev,
+        "newrev": newrev,
+    }
+    operations: list[dict] = []
+    deletion = is_zero(newrev)
+    forced = (
+        not deletion
+        and not is_zero(oldrev)
+        and not git_objects.is_ancestor(git_dir, oldrev, newrev)
+    )
+    if refname in repo["protected_refs"]:
+        operations.append({"type": "protected_ref_update", **base})
+    elif deletion:
+        operations.append({"type": "ref_delete", **base})
+    elif forced:
+        operations.append({"type": "force_update", **base})
+
+    if refname.startswith("refs/heads/") and paths:
+        branch = refname.removeprefix("refs/heads/")
+        claim = live_claim_for_branch(conn, repo["id"], branch)
+        if claim is not None:
+            outside = paths_outside(paths, _claim_scopes(conn, claim["id"]))
+            if outside:
+                operations.append({
+                    "type": "out_of_scope_push",
+                    **base,
+                    "claim_id": claim["id"],
+                    "paths": outside,
+                })
+    protected = paths_within(paths, repo["protected_paths"])
+    if protected:
+        operations.append({"type": "protected_path_update", **base, "paths": protected})
+    return operations
+
+
+def _describe_paths(paths: list[str], limit: int = 10) -> str:
+    shown = ", ".join(paths[:limit])
+    if len(paths) > limit:
+        shown += f", … ({len(paths) - limit} more)"
+    return shown
+
+
+def _requirement_message(operation: dict, refusal: str | None) -> str:
+    message = (
+        f"{operation['type']} on {operation['refname']} requires an approval "
+        f"bound to this exact update (hash {operation_hash(operation)})."
+    )
+    if operation.get("paths"):
+        message += f" Paths: {_describe_paths(operation['paths'])}."
+    if refusal:
+        message += f" {refusal}"
+    return message
+
+
 def check_ref_update(
     conn: Connection,
     repository: str,
@@ -504,6 +585,9 @@ def check_ref_update(
 ) -> None:
     """Enforce governance for one ref update. Raises PushRejected."""
     repo = _verify_repository_binding(conn, repository, git_dir)
+    refusal = ref_namespace_refusal(repo, refname)
+    if refusal is not None:
+        raise PushRejected(refusal)
     branch = refname.removeprefix("refs/heads/")
 
     if refname.startswith("refs/heads/"):
@@ -521,42 +605,45 @@ def check_ref_update(
                 f"{pusher or 'unidentified — set QUORUMGIT_AGENT'}."
             )
 
-    protected = refname in repo["protected_refs"]
-    deletion = _is_zero(newrev)
-    forced = (
-        not deletion
-        and not _is_zero(oldrev)
-        and not _is_fast_forward(git_dir, oldrev, newrev)
-    )
-
-    if protected or deletion or forced:
-        operation = {
-            "type": "protected_ref_update"
-            if protected
-            else ("ref_delete" if deletion else "force_update"),
-            "repository": repository,
-            "refname": refname,
-            "oldrev": oldrev,
-            "newrev": newrev,
-        }
-        approval = approved_instance(conn, operation, consumer=pusher)
-        if approval is None:
-            refusal = approval_refusal(conn, operation, consumer=pusher)
-            raise PushRejected(
-                f"{operation['type']} on {refname} requires an approval "
-                f"bound to this exact update (hash {operation_hash(operation)})."
-                + (f" {refusal}" if refusal else "")
-            )
-        assert pusher is not None
-        consume_approval(conn, approval["id"], operation, agent=pusher)
-        audit.record(
-            conn,
-            "gate.protected_update_allowed",
-            "repository",
-            repo["id"],
-            agent=pusher,
-            detail=operation,
+    try:
+        paths = git_objects.changed_paths(
+            git_dir, oldrev, newrev, git_objects.ref_tips(git_dir)
         )
+        operations = governed_operations(
+            conn, repo, refname, oldrev, newrev, git_dir, paths
+        )
+    except git_objects.GitObjectError as exc:
+        raise PushRejected(f"Unable to inspect pushed objects: {exc}") from exc
+
+    if operations:
+        granted: list[tuple[dict, dict]] = []
+        missing: list[str] = []
+        for operation in operations:
+            approval = approved_instance(conn, operation, consumer=pusher)
+            if approval is None:
+                missing.append(_requirement_message(
+                    operation, approval_refusal(conn, operation, consumer=pusher)
+                ))
+            else:
+                granted.append((approval, operation))
+        if missing:
+            if len(operations) > 1:
+                missing.append(
+                    "Run `quorumgit approve prepare` from your clone to list "
+                    "and request every approval this push needs."
+                )
+            raise PushRejected(" ".join(missing))
+        assert pusher is not None
+        for approval, operation in granted:
+            consume_approval(conn, approval["id"], operation, agent=pusher)
+            audit.record(
+                conn,
+                "gate.protected_update_allowed",
+                "repository",
+                repo["id"],
+                agent=pusher,
+                detail=operation,
+            )
         return
 
     audit.record(
@@ -565,8 +652,90 @@ def check_ref_update(
         "repository",
         repo["id"],
         agent=pusher,
-        detail={"refname": refname, "oldrev": oldrev, "newrev": newrev},
+        detail={
+            "refname": refname,
+            "oldrev": oldrev,
+            "newrev": newrev,
+            "paths": len(paths),
+        },
     )
+
+
+# ---------------------------------------------------------- push planning
+
+
+def _full_refname(ref: str) -> str:
+    return ref if ref.startswith("refs/") else f"refs/heads/{ref}"
+
+
+def prepare_push(
+    conn: Connection,
+    repository: str,
+    ref: str,
+    local_path: str | Path,
+    new: str | None = "HEAD",
+    *,
+    pusher: str | None = None,
+) -> dict:
+    """What pushing ``new`` to ``ref`` would require, without pushing anything.
+
+    Objects are read from the agent's clone at ``local_path`` and ref state
+    from the registered repository, and the same derivation the hook uses
+    produces the operations, so their hashes match what the hook will
+    demand. ``new=None`` plans a deletion. Nothing is written.
+    """
+    repo = get_repository(conn, repository)
+    refname = _full_refname(ref)
+    hub_dir = git_common_dir(repo["path"])
+    local_dir = git_objects.absolute_git_dir(local_path)
+    oldrev = git_objects.ref_value(hub_dir, refname)
+    newrev = ZERO_OID if new is None else git_objects.resolve_object(local_dir, new)
+    if not is_zero(oldrev) and not git_objects.object_exists(local_dir, oldrev):
+        raise GateError(
+            f"{refname} is at {oldrev} in {repository!r}, which your clone does "
+            "not have; fetch before preparing this push."
+        )
+    known = [
+        tip for tip in git_objects.ref_tips(hub_dir)
+        if git_objects.object_exists(local_dir, tip)
+    ]
+    paths = git_objects.changed_paths(local_dir, oldrev, newrev, known)
+
+    refusals: list[str] = []
+    namespace = ref_namespace_refusal(repo, refname)
+    if namespace is not None:
+        refusals.append(namespace)
+    claim = None
+    if refname.startswith("refs/heads/"):
+        branch = refname.removeprefix("refs/heads/")
+        pending = open_handoff_for_branch(conn, repo["id"], branch)
+        if pending:
+            refusals.append(
+                f"Branch {branch!r} is frozen pending handoff {pending['id']}."
+            )
+        claim = live_claim_for_branch(conn, repo["id"], branch)
+        if claim is not None:
+            claim = {**claim, "scopes": _claim_scopes(conn, claim["id"])}
+            if pusher is not None and claim["agent"] != pusher:
+                refusals.append(
+                    f"Branch {branch!r} is claimed by {claim['agent']} "
+                    f"(claim {claim['id']}), not {pusher}."
+                )
+    operations = governed_operations(
+        conn, repo, refname, oldrev, newrev, local_dir, paths
+    )
+    return {
+        "repository": repo["name"],
+        "refname": refname,
+        "oldrev": oldrev,
+        "newrev": newrev,
+        "paths": paths,
+        "claim": claim,
+        "refusals": refusals,
+        "operations": [
+            {"operation": op, "hash": operation_hash(op)} for op in operations
+        ],
+    }
 
 
 def run_pre_receive(
