@@ -25,6 +25,7 @@ def _git(repo_path: str | Path, *args: str) -> str:
         ["git", "-C", str(repo_path), *args],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         raise WorktreeError(
@@ -74,7 +75,8 @@ def create_worktree(
                 "--verify",
                 "--quiet",
                 f"refs/heads/{branch}",
-            ]
+            ],
+            check=False,
         ).returncode
         == 0
     )

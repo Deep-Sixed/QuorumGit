@@ -29,6 +29,7 @@ def _cli(cfg, *args: str, agent: str | None = None):
         capture_output=True,
         text=True,
         env=env,
+        check=False,
     )
 
 

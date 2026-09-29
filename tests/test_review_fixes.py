@@ -24,7 +24,6 @@ from tests.test_cli_hub import _cli
 from tests.test_gate import _commit, _push, _setup
 from tests.test_handoff import _handoff_record, _head
 
-
 # ------------------------------------------------------------ finding 1
 
 
@@ -295,7 +294,7 @@ def test_task_lock_serializes_release_with_takeover_check(initialized_store, tmp
         try:
             work.release_claim(releaser, claim, owner)
             releaser.commit()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — surface any worker failure to the test thread
             errors.append(exc)
             releaser.rollback()
         finally:
@@ -338,7 +337,7 @@ def _addressed_handoff(conn, git_repo):
 
 
 def test_decline_requires_registered_addressee(conn, git_repo):
-    task, hid, a, b, c = _addressed_handoff(conn, git_repo)
+    _task, hid, a, b, c = _addressed_handoff(conn, git_repo)
 
     with pytest.raises(RegistryError, match="not registered"):
         handoff.decline_handoff(conn, hid, "unregistered-intruder")
@@ -416,7 +415,7 @@ def _race_accept_and_decline(initialized_store, git_repo, winner):
         try:
             losing_action()
             second.commit()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — surface any worker failure to the test thread
             errors.append(exc)
             second.rollback()
         finally:
