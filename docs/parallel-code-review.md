@@ -9,15 +9,17 @@ execution of the Electron application.
 
 ## Adopted: inspect the actual checkout
 
-`electron/ipc/git.ts:getWorktreeStatus` reads the current branch rather than
-assuming the task's original branch is still checked out.
-`electron/ipc/git-adoption.integration.test.ts` exercises branch changes and
-detached HEAD with real Git. This is directly useful for QuorumGit: a directory
+[`electron/ipc/git.ts`](https://github.com/johannesjo/parallel-code/blob/3d29839bad68eeec55e5e41a1306dac6898909ca/electron/ipc/git.ts)
+`getWorktreeStatus` reads the current branch rather than assuming the task's
+original branch is still checked out.
+[`electron/ipc/git-adoption.integration.test.ts`](https://github.com/johannesjo/parallel-code/blob/3d29839bad68eeec55e5e41a1306dac6898909ca/electron/ipc/git-adoption.integration.test.ts)
+exercises branch changes and detached HEAD with real Git. This is directly useful for QuorumGit: a directory
 can exist while its checkout no longer matches recorded ownership.
 
 Doctor now compares the checkout root, Git common directory, and full branch
-ref with the recorded repository and branch. It reports mismatches and refuses
-automatic repair for those records. It does not silently adopt another branch
+ref with the recorded repository and branch. It reports mismatches
+(`repository_mismatch`, `branch_mismatch`, `detached_head`,
+`unverifiable_checkout`) and refuses automatic repair for those records. It does not silently adopt another branch
 or delete a checkout whose identity changed. This is a diagnostic improvement,
 not protection against a local process changing Git state after inspection.
 
@@ -40,5 +42,3 @@ not protection against a local process changing Git state after inspection.
   bypass exact-operation approvals or delete retained work.
 - An Electron agent launcher, mobile monitor, and agent comparison UI are a
   different product scope from the current embedded governance CLI.
-
-PR #8 builds on merged PR #7, main at `0faef92ec2170e6b5ecdca6ce7e5c318b668b581`.
