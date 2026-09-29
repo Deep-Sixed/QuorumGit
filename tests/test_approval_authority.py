@@ -359,7 +359,10 @@ def test_upgrade_leaves_no_agent_with_authority(tmp_path):
     conn.commit()
     conn.close()
 
-    assert store.migrate(local) == ["004_approval_authority.sql"]
+    assert store.migrate(local) == [
+        "004_approval_authority.sql",
+        "005_approval_quorum.sql",
+    ]
     upgraded = store.connect(local)
     try:
         assert registry.get_agent(upgraded, "self-approver")["role"] == "worker"
@@ -368,6 +371,7 @@ def test_upgrade_leaves_no_agent_with_authority(tmp_path):
             "threshold": 1,
             "requester_may_vote": False,
             "roles": ["operator"],
+            "quorum": False,
         }
         backfilled = gate.get_approval_by_id(upgraded, approval_id)
         assert backfilled["repository_id"] == repo["id"]

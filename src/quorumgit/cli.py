@@ -125,6 +125,7 @@ def cmd_repo_policy(args, cfg) -> int:
             args.threshold is not None
             or args.role
             or args.requester_may_vote is not None
+            or args.quorum is not None
         )
         if changing:
             policy = registry.set_approval_policy(
@@ -134,13 +135,27 @@ def cmd_repo_policy(args, cfg) -> int:
                 threshold=args.threshold,
                 roles=args.role or None,
                 requester_may_vote=args.requester_may_vote,
+                quorum=args.quorum,
             )
             conn.commit()
         else:
             repo = registry.get_repository(conn, args.name)
             policy = registry.approval_policy(conn, repo["id"])
+        approvers = sum(
+            1
+            for agent in registry.list_agents(conn)
+            if agent["role"] in policy["roles"]
+        )
     print(f"repository: {args.name}")
-    print(f"approval threshold: {policy['threshold']}")
+    if policy["quorum"]:
+        print(
+            "approval threshold: 2/3 + 1 of the agents eligible to approve "
+            f"each operation, at least {policy['threshold']} "
+            f"({approvers} agent(s) hold an approving role; "
+            f"{gate.quorum_threshold(approvers)} of {approvers} before exclusions)"
+        )
+    else:
+        print(f"approval threshold: {policy['threshold']}")
     print(f"approving roles: {', '.join(policy['roles'])}")
     print(f"requester may vote: {'yes' if policy['requester_may_vote'] else 'no'}")
     return 0
@@ -511,6 +526,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "the current set)"),
         sp.add_argument("--requester-may-vote", dest="requester_may_vote",
                         action=argparse.BooleanOptionalAction, default=None),
+        sp.add_argument("--quorum", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="require 2/3 + 1 of the eligible approvers "
+                             "(never fewer than --threshold)"),
     ), parent=repo)
 
     agent = sub.add_parser("agent").add_subparsers(dest="sub", required=True)

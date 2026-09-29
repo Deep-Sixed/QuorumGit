@@ -39,6 +39,7 @@ def _apply_001(cfg: Config):
 UPGRADE_MIGRATIONS = [
     "002_approval_identities.sql",
     "004_approval_authority.sql",
+    "005_approval_quorum.sql",
 ]
 
 
@@ -203,10 +204,7 @@ def test_contract_rejects_001_only_store_until_all_migrations_apply(tmp_path):
     conn.commit()
     conn.close()
 
-    message = (
-        "Missing required migrations: "
-        "['002_approval_identities.sql', '004_approval_authority.sql']"
-    )
+    message = f"Missing required migrations: {UPGRADE_MIGRATIONS}"
     with pytest.raises(store.ContractViolation, match=re.escape(message)):
         store.verify_contract(cfg)
     with pytest.raises(store.ContractViolation, match=re.escape(message)):

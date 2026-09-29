@@ -209,8 +209,8 @@ def get_repository(conn: Connection, name: str) -> dict:
 def approval_policy(conn: Connection, repository_id: int) -> dict:
     """The repository-owned rule for who may authorize its operations."""
     row = conn.execute(
-        "SELECT approval_threshold, requester_may_vote FROM repositories "
-        "WHERE id = ?",
+        "SELECT approval_threshold, requester_may_vote, approval_quorum "
+        "FROM repositories WHERE id = ?",
         (repository_id,),
     ).fetchone()
     if row is None:
@@ -227,6 +227,7 @@ def approval_policy(conn: Connection, repository_id: int) -> dict:
         "threshold": row[0],
         "requester_may_vote": bool(row[1]),
         "roles": roles,
+        "quorum": bool(row[2]),
     }
 
 
@@ -238,6 +239,7 @@ def set_approval_policy(
     threshold: int | None = None,
     roles: list[str] | None = None,
     requester_may_vote: bool | None = None,
+    quorum: bool | None = None,
 ) -> dict:
     begin_immediate(conn)
     repo = get_repository(conn, repository)
@@ -268,6 +270,11 @@ def set_approval_policy(
         conn.execute(
             "UPDATE repositories SET requester_may_vote = ? WHERE id = ?",
             (1 if requester_may_vote else 0, repo["id"]),
+        )
+    if quorum is not None:
+        conn.execute(
+            "UPDATE repositories SET approval_quorum = ? WHERE id = ?",
+            (1 if quorum else 0, repo["id"]),
         )
     after = approval_policy(conn, repo["id"])
     if after != before:

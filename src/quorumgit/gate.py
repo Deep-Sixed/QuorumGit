@@ -168,6 +168,49 @@ def _eligible_approvals(
     )
 
 
+def quorum_threshold(eligible_approvers: int) -> int:
+    """Integer-stable 2/3 + 1 quorum over the eligible approvers."""
+    return (2 * eligible_approvers) // 3 + 1
+
+
+def _eligible_approver_count(
+    conn: Connection,
+    approval: dict,
+    policy: dict,
+    exclude_agent_id: int | None = None,
+) -> int:
+    """Registered agents who could cast a counting vote on this approval."""
+    rows = conn.execute("SELECT id, name, role FROM agents").fetchall()
+    return sum(
+        1
+        for agent_id, name, role in rows
+        if agent_id != exclude_agent_id
+        and _vote_refusal(approval, policy, {"id": agent_id, "name": name, "role": role})
+        is None
+    )
+
+
+def required_approvals(
+    conn: Connection,
+    approval: dict,
+    policy: dict,
+    exclude_agent_id: int | None = None,
+) -> int:
+    """Eligible yes votes this approval needs under the current policy.
+
+    With quorum mode on, the requirement is 2/3 + 1 of the agents eligible to
+    approve this particular approval — excluding the requester (unless the
+    policy lets it vote), a takeover's beneficiary, and, at use time, the
+    consuming agent — and never less than the policy's fixed threshold.
+    Counting only eligible agents keeps those exclusions from making approval
+    impossible while other approvers exist.
+    """
+    if not policy["quorum"]:
+        return policy["threshold"]
+    eligible = _eligible_approver_count(conn, approval, policy, exclude_agent_id)
+    return max(policy["threshold"], quorum_threshold(eligible))
+
+
 def _authorization_refusal(
     conn: Connection, approval: dict, consumer: dict | None
 ) -> str | None:
@@ -185,10 +228,14 @@ def _authorization_refusal(
                 "carry it out."
             )
     eligible = _eligible_approvals(conn, approval, policy)
-    if eligible < policy["threshold"]:
+    required = required_approvals(
+        conn, approval, policy, consumer["id"] if consumer is not None else None
+    )
+    if eligible < required:
+        basis = " (2/3 + 1 of eligible approvers)" if policy["quorum"] else ""
         return (
             f"Approval {approval['id']} has {eligible} eligible approval(s); the "
-            f"repository policy now requires {policy['threshold']}."
+            f"repository policy now requires {required}{basis}."
         )
     return None
 
@@ -226,7 +273,11 @@ def request_approval(
     if existing is not None:
         return _approval_dict(existing)
 
-    threshold = approval_policy(conn, repo["id"])["threshold"]
+    threshold = required_approvals(
+        conn,
+        {"requested_by_agent_id": requester["id"], "operation": operation},
+        approval_policy(conn, repo["id"]),
+    )
     row = conn.execute(
         """
         INSERT INTO approvals (
@@ -320,7 +371,9 @@ def vote(conn: Connection, approval_id: int, voter: str, approve: bool) -> dict:
     assert denials is not None
     if denials[0] > 0:
         new_status = "denied"
-    elif _eligible_approvals(conn, approval, policy) >= policy["threshold"]:
+    elif _eligible_approvals(conn, approval, policy) >= required_approvals(
+        conn, approval, policy
+    ):
         new_status = "approved"
     else:
         new_status = "pending"
