@@ -54,6 +54,7 @@ REQUIRED_TABLES = (
     "repository_approval_roles",
     "protected_paths",
     "allowed_ref_namespaces",
+    "ref_updates",
 )
 
 # Engine-level governance rules. A store missing any of these would still
