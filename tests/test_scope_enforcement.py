@@ -146,8 +146,8 @@ def test_hook_holds_claimed_branch_to_its_scopes(committed_conn, tmp_path, cfg):
     assert "outside claim" in outside.stderr
     assert "README.md" in outside.stderr
 
-    # Undo the out-of-scope commit; merging another branch's accepted work in
-    # does not attribute that branch's files to the claim holder.
+    # Undo the out-of-scope commit. Another agent's branch is not mainline:
+    # merging its work in brings its files into this claim, so they count.
     _git(clone, "reset", "--hard", "HEAD~1")
     _commit(clone, "docs/elsewhere.md", branch="feat/base")
     base = _push(clone, b, "feat/base", cfg=cfg)
@@ -155,7 +155,9 @@ def test_hook_holds_claimed_branch_to_its_scopes(committed_conn, tmp_path, cfg):
     _git(clone, "checkout", "feat/scoped")
     _git(clone, "merge", "--no-edit", "feat/base")
     merged = _push(clone, a, "feat/scoped", cfg=cfg)
-    assert merged.returncode == 0, merged.stderr
+    assert merged.returncode != 0
+    assert "out_of_scope_push" in merged.stderr
+    assert "docs/elsewhere.md" in merged.stderr
 
 
 def test_hook_scope_check_covers_new_claimed_branches(committed_conn, tmp_path, cfg):

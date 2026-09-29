@@ -498,11 +498,15 @@ def governed_operations(
     newrev: str,
     git_dir: str | Path,
     paths: list[str],
+    scope_paths: list[str],
 ) -> list[dict]:
     """Every approval one ref update needs, derived from what it carries.
 
-    ``paths`` are the paths the update brings in (git_objects.changed_paths).
-    Ref-level governance (protected ref, force push, deletion) comes first,
+    ``paths`` are the paths the update brings into the repository, measured
+    against every existing ref; they are checked against protected paths.
+    ``scope_paths`` are measured against the mainline only
+    (git_objects.mainline_tips), so work first pushed to another branch still
+    counts against the claim that brings it in. Ref-level governance (protected ref, force push, deletion) comes first,
     then content governance: paths outside the scopes of the claim on the
     branch, and paths under the repository's protected paths. Each operation
     binds the exact revisions, so its hash is reproducible by anyone who can
@@ -528,11 +532,11 @@ def governed_operations(
     elif forced:
         operations.append({"type": "force_update", **base})
 
-    if refname.startswith("refs/heads/") and paths:
+    if refname.startswith("refs/heads/") and scope_paths:
         branch = refname.removeprefix("refs/heads/")
         claim = live_claim_for_branch(conn, repo["id"], branch)
         if claim is not None:
-            outside = paths_outside(paths, claim_scopes(conn, claim["id"]))
+            outside = paths_outside(scope_paths, claim_scopes(conn, claim["id"]))
             if outside:
                 operations.append({
                     "type": "out_of_scope_push",
@@ -605,8 +609,14 @@ def check_ref_update(
         paths = git_objects.changed_paths(
             git_dir, oldrev, newrev, git_objects.ref_tips(git_dir)
         )
+        scope_paths = git_objects.changed_paths(
+            git_dir,
+            oldrev,
+            newrev,
+            git_objects.mainline_tips(git_dir, repo["protected_refs"]),
+        )
         operations = governed_operations(
-            conn, repo, refname, oldrev, newrev, git_dir, paths
+            conn, repo, refname, oldrev, newrev, git_dir, paths, scope_paths
         )
     except git_objects.GitObjectError as exc:
         raise PushRejected(f"Unable to inspect pushed objects: {exc}") from exc
@@ -712,6 +722,13 @@ def prepare_push(
             "matches what the hook will see."
         )
     paths = git_objects.changed_paths(local_dir, oldrev, newrev, known)
+    # Mainline tips are hub ref tips, so the check above covers them too.
+    scope_paths = git_objects.changed_paths(
+        local_dir,
+        oldrev,
+        newrev,
+        git_objects.mainline_tips(hub_dir, repo["protected_refs"]),
+    )
 
     refusals: list[str] = []
     namespace = ref_namespace_refusal(repo, refname)
@@ -734,7 +751,7 @@ def prepare_push(
                     f"(claim {claim['id']}), not {pusher}."
                 )
     operations = governed_operations(
-        conn, repo, refname, oldrev, newrev, local_dir, paths
+        conn, repo, refname, oldrev, newrev, local_dir, paths, scope_paths
     )
     return {
         "repository": repo["name"],
