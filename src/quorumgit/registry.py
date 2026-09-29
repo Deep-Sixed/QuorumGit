@@ -64,28 +64,6 @@ def _protected_refs(conn: Connection, repository_id: int) -> list[str]:
     ]
 
 
-# Variables Git exports to hooks that select a repository. A lookup of a
-# specific path must not inherit them, or every path resolves to the hook's
-# repository.
-_REPOSITORY_SELECTING_ENV = (
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_QUARANTINE_PATH",
-)
-
-
-def path_scoped_git_env() -> dict[str, str]:
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if key not in _REPOSITORY_SELECTING_ENV
-    }
-
-
 def _protected_paths(conn: Connection, repository_id: int) -> list[str]:
     return [
         row[0]
@@ -119,6 +97,28 @@ def _repository_dict(conn: Connection, row) -> dict:
     }
 
 
+# Variables Git exports to hooks that select a repository. A lookup of a
+# specific path must not inherit them, or every path resolves to the hook's
+# repository.
+_REPOSITORY_SELECTING_ENV = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_QUARANTINE_PATH",
+)
+
+
+def path_scoped_git_env() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _REPOSITORY_SELECTING_ENV
+    }
+
+
 def git_common_dir(path: str | Path) -> Path:
     """Return the canonical Git common directory for a repository path.
 
@@ -131,8 +131,8 @@ def git_common_dir(path: str | Path) -> Path:
         ["git", "-C", str(repo_path), "rev-parse", "--git-common-dir"],
         capture_output=True,
         text=True,
-        env=path_scoped_git_env(),
         check=False,
+        env=path_scoped_git_env(),
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()

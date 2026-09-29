@@ -28,6 +28,14 @@ DEFAULT_BUSY_TIMEOUT_SECONDS = 5.0
 MINIMUM_SQLITE_VERSION = (3, 38, 0)
 MIGRATION_SEPARATOR = "-- quorumgit-statement"
 
+# Kept byte-identical to the statement existing stores were created with.
+SCHEMA_MIGRATIONS_DDL = """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+            )
+            """
+
 REQUIRED_TABLES = (
     "schema_migrations",
     "repositories",
@@ -64,14 +72,6 @@ REQUIRED_TRIGGERS = (
     "approvals_consumer_is_not_approver",
     "repositories_default_ref_namespaces",
 )
-
-# Kept byte-identical to the statement existing stores were created with.
-SCHEMA_MIGRATIONS_DDL = """
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version TEXT PRIMARY KEY,
-                applied_at INTEGER NOT NULL DEFAULT (unixepoch())
-            )
-            """
 
 
 class StoreError(RuntimeError):
@@ -363,10 +363,9 @@ def _reference_schema() -> dict[tuple[str, str], tuple[str, str | None]]:
     """The schema this QuorumGit build expects: every migration replayed in memory.
 
     Deriving the fingerprint from the migrations themselves keeps it exact
-    without a hand-maintained list: each table, index (including the partial
+    without a hand-maintained list: every table, index (including the partial
     unique indexes that enforce single ownership and single live approvals)
-    and trigger (including the append-only audit guards) must be present with
-    the same definition.
+    and trigger must be present with the same definition.
     """
     conn = sqlite3.connect(":memory:")
     try:
@@ -392,9 +391,7 @@ def _verify_schema_objects(conn: Connection) -> None:
     }
     # Extra tables are inert data; an extra index or trigger can change what
     # governance writes succeed or what they do, so it is a violation.
-    unexpected = {
-        key for key in set(actual) - set(expected) if key[0] != "table"
-    }
+    unexpected = {key for key in set(actual) - set(expected) if key[0] != "table"}
     problems = []
     if missing:
         problems.append(f"missing {_describe(missing)}")
@@ -453,7 +450,6 @@ def verify_contract(target: Config | Connection | str | Path) -> None:
                 f"Store has migrations this QuorumGit does not know: "
                 f"{sorted(unknown_migrations)}. It was written by a newer version."
             )
-        _verify_schema_objects(conn)
 
         missing = set(REQUIRED_TABLES) - tables
         if missing:
@@ -473,6 +469,7 @@ def verify_contract(target: Config | Connection | str | Path) -> None:
             raise ContractViolation(
                 f"Missing required governance triggers: {sorted(missing_triggers)}."
             )
+        _verify_schema_objects(conn)
 
         foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
         journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()

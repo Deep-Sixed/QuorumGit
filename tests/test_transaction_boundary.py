@@ -10,6 +10,7 @@ schema object the governance rules depend on, not only table names.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -336,7 +337,10 @@ def _tamper(cfg: Config, *statements: str) -> None:
 )
 def test_contract_rejects_a_missing_governance_trigger(fresh_store, trigger):
     _tamper(fresh_store, f"DROP TRIGGER {trigger}")
-    with pytest.raises(store.ContractViolation, match=f"missing trigger {trigger}"):
+    with pytest.raises(
+        store.ContractViolation,
+        match=re.escape(f"Missing required governance triggers: [{trigger!r}]"),
+    ):
         store.verify_contract(fresh_store)
     with pytest.raises(store.ContractViolation):
         store.connect(fresh_store)

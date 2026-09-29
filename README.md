@@ -64,7 +64,7 @@ migrations applied: ['001_core.sql', '002_approval_identities.sql', '004_approva
 contract: ok
 ```
 
-`init` creates the state directory, applies migrations, and verifies the runtime contract: required tables and migrations, foreign keys on, WAL journal mode, and **every schema object the governance rules depend on**. The expected schema is derived by replaying the bundled migrations in memory, so a store whose append-only audit triggers, single-owner/single-live-approval unique indexes, or identity triggers are missing or altered — or that carries extra indexes or triggers — fails the contract instead of silently losing an invariant. Every command runs this check. It is idempotent — re-run it any time.
+`init` creates the state directory, applies migrations, and verifies the runtime contract: required migrations, tables, and governance triggers, foreign keys on, WAL journal mode, and **every schema object the governance rules depend on**. The expected schema is derived by replaying the bundled migrations in memory, so a store whose triggers or unique indexes are missing or altered — or that carries extra indexes or triggers, or was migrated by a newer version — fails the contract instead of silently losing an invariant. Every command runs this check. It is idempotent — re-run it any time.
 
 `quorumgit status` shows the store path, contract state, and row counts. If the store is missing or incomplete, every command exits non-zero: there is **one storage backend and no fallback**, by design.
 
@@ -127,7 +127,7 @@ QUORUMGIT_AGENT=agent-two quorumgit handoff accept 1
 # remaining work: wire into CLI, integration tests
 ```
 
-Creating a handoff releases the original claim but keeps its worktree; accepting transfers that same worktree to the new claim. The handoff records `--last-commit` as the continuation point when given (any commit spec, stored as the full OID), otherwise the worktree's `HEAD`; a claim without an active worktree must pass `--last-commit`.
+Creating a handoff releases the original claim but keeps its worktree; accepting transfers that same worktree to the new claim. The handoff records `--last-commit` as the continuation point when given (any commit spec, stored as the full OID), otherwise the active worktree's `HEAD`; a claim without an active worktree (hub model, or a worktree removed by `doctor --repair`) must pass `--last-commit`.
 
 What just *didn't* happen, silently: a second agent claiming task 1 (**BLOCKED**), claiming another task on branch `feat/x` (**CONFLICTING**), or claiming a task whose scopes overlap `src/**` (**OVERLAPPING**, refused unless explicitly overridden and audited). While the handoff was open, the task, branch, and declared scopes were **reserved** for continuation until agent-two accepted.
 
@@ -295,7 +295,7 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit renew <claim> [--lease-hours <h>]` | Extend a live, unexpired lease; expired claims must be acquired again |
 | `quorumgit checkpoint <claim> [--commit <commit>] [--note <n>]` | Record verified progress |
 | `quorumgit release <claim> [--remove-worktree] [--reason <r>]` | Release a claim; the task returns to `open` |
-| `quorumgit handoff create <claim> --completed <c> --remaining <r> [--to <agent>] [--files-changed <f>]… [--blockers <b>]… [--validation <v>] [--last-commit <commit>]` | Hand work off (from `--last-commit` when given, else the worktree's HEAD) |
+| `quorumgit handoff create <claim> --completed <c> --remaining <r> [--to <agent>] [--files-changed <f>]… [--blockers <b>]… [--validation <v>] [--last-commit <commit>]` | Hand work off (from `--last-commit` when given, else the active worktree's HEAD) |
 | `quorumgit handoff accept <id> [--lease-hours <h>]` | Continue handed-off work (addressee, or anyone if unaddressed) |
 | `quorumgit handoff decline <id>` | Decline — addressee only; removes the retained worktree, and is refused if it has uncommitted changes |
 | `quorumgit handoff cancel <id>` | Cancel — creator only; removes the retained worktree, and is refused if it has uncommitted changes |
