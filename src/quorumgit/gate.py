@@ -127,7 +127,9 @@ def _policy_for(conn: Connection, approval: dict) -> dict:
             f"Approval {approval['id']} predates repository approval policy "
             "and names no registered repository; request it again."
         )
-    return approval_policy(conn, approval["repository_id"])
+    return approval_policy(
+        conn, approval["repository_id"], approval["operation"].get("type")
+    )
 
 
 def _vote_refusal(approval: dict, policy: dict, voter: dict) -> str | None:
@@ -237,7 +239,7 @@ def request_approval(
     if existing is not None:
         return _approval_dict(existing)
 
-    threshold = approval_policy(conn, repo["id"])["threshold"]
+    threshold = approval_policy(conn, repo["id"], operation.get("type"))["threshold"]
     row = conn.execute(
         """
         INSERT INTO approvals (

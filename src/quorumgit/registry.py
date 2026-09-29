@@ -240,8 +240,28 @@ def get_repository(conn: Connection, name: str) -> dict:
     return _repository_dict(conn, row)
 
 
-def approval_policy(conn: Connection, repository_id: int) -> dict:
-    """The repository-owned rule for who may authorize its operations."""
+# Operation types QuorumGit itself demands approvals for. Per-operation
+# policy overrides may name only these.
+OPERATION_TYPES = (
+    "protected_ref_update",
+    "force_update",
+    "ref_delete",
+    "out_of_scope_push",
+    "protected_path_update",
+    "lease_takeover",
+)
+
+
+def _validate_operation_type(operation_type: str) -> str:
+    if operation_type not in OPERATION_TYPES:
+        raise RegistryError(
+            f"Unknown operation type {operation_type!r}; expected one of: "
+            f"{', '.join(OPERATION_TYPES)}."
+        )
+    return operation_type
+
+
+def _default_policy(conn: Connection, repository_id: int) -> dict:
     row = conn.execute(
         "SELECT approval_threshold, requester_may_vote FROM repositories "
         "WHERE id = ?",
@@ -264,6 +284,64 @@ def approval_policy(conn: Connection, repository_id: int) -> dict:
     }
 
 
+def operation_policy_overrides(conn: Connection, repository_id: int) -> dict:
+    """Per-operation overrides as stored: None or [] means "inherit"."""
+    overrides: dict[str, dict] = {}
+    for policy_id, operation_type, threshold, requester_may_vote in conn.execute(
+        "SELECT id, operation_type, approval_threshold, requester_may_vote "
+        "FROM operation_approval_policies WHERE repository_id = ? "
+        "ORDER BY operation_type",
+        (repository_id,),
+    ).fetchall():
+        overrides[operation_type] = {
+            "threshold": threshold,
+            "requester_may_vote": (
+                None if requester_may_vote is None else bool(requester_may_vote)
+            ),
+            "roles": [
+                r[0]
+                for r in conn.execute(
+                    "SELECT role FROM operation_approval_roles "
+                    "WHERE policy_id = ? ORDER BY role",
+                    (policy_id,),
+                ).fetchall()
+            ],
+        }
+    return overrides
+
+
+def approval_policy(
+    conn: Connection, repository_id: int, operation_type: str | None = None
+) -> dict:
+    """Who may authorize an operation of this type in this repository.
+
+    The repository's default policy, with whatever the override for the
+    operation type specifies laid over it. Without a type, the default.
+    """
+    policy = _default_policy(conn, repository_id)
+    if operation_type is None:
+        return policy
+    override = operation_policy_overrides(conn, repository_id).get(operation_type)
+    if override is None:
+        return policy
+    return {
+        "threshold": override["threshold"] or policy["threshold"],
+        "requester_may_vote": (
+            policy["requester_may_vote"]
+            if override["requester_may_vote"] is None
+            else override["requester_may_vote"]
+        ),
+        "roles": override["roles"] or policy["roles"],
+    }
+
+
+def _validated_roles(roles: list[str]) -> list[str]:
+    wanted = sorted({_validate_role(role) for role in roles})
+    if not wanted:
+        raise RegistryError("At least one approving role is required.")
+    return wanted
+
+
 def set_approval_policy(
     conn: Connection,
     repository: str,
@@ -272,48 +350,135 @@ def set_approval_policy(
     threshold: int | None = None,
     roles: list[str] | None = None,
     requester_may_vote: bool | None = None,
+    operation_type: str | None = None,
+    inherit: bool = False,
 ) -> dict:
+    """Change a repository's default policy, or its override for one type.
+
+    With ``operation_type``, the given fields are stored as that type's
+    override; fields left unset keep inheriting the default. ``inherit``
+    removes the override entirely. Returns the resulting effective policy.
+    """
     begin_immediate(conn)
     repo = get_repository(conn, repository)
     require_operator(conn, actor, "Changing approval policy")
-    before = approval_policy(conn, repo["id"])
-    if threshold is not None:
-        if threshold < 1:
-            raise RegistryError("Approval threshold must be at least 1.")
-        conn.execute(
-            "UPDATE repositories SET approval_threshold = ? WHERE id = ?",
-            (threshold, repo["id"]),
+    if threshold is not None and threshold < 1:
+        raise RegistryError("Approval threshold must be at least 1.")
+    wanted = _validated_roles(roles) if roles is not None else None
+
+    if operation_type is None:
+        if inherit:
+            raise RegistryError("--inherit applies only to an --operation override.")
+        before = _default_policy(conn, repo["id"])
+        _set_default_policy(conn, repo["id"], threshold, wanted, requester_may_vote)
+        after = _default_policy(conn, repo["id"])
+        detail: dict = {"before": before, "after": after}
+    else:
+        _validate_operation_type(operation_type)
+        overrides = operation_policy_overrides(conn, repo["id"])
+        before = overrides.get(operation_type)
+        _set_operation_override(
+            conn, repo["id"], operation_type, threshold, wanted,
+            requester_may_vote, inherit,
         )
-    if roles is not None:
-        wanted = sorted({_validate_role(role) for role in roles})
-        if not wanted:
-            raise RegistryError("At least one approving role is required.")
-        conn.execute(
-            "DELETE FROM repository_approval_roles WHERE repository_id = ?",
-            (repo["id"],),
-        )
-        for role in wanted:
-            conn.execute(
-                "INSERT INTO repository_approval_roles (repository_id, role) "
-                "VALUES (?, ?)",
-                (repo["id"], role),
-            )
-    if requester_may_vote is not None:
-        conn.execute(
-            "UPDATE repositories SET requester_may_vote = ? WHERE id = ?",
-            (1 if requester_may_vote else 0, repo["id"]),
-        )
-    after = approval_policy(conn, repo["id"])
-    if after != before:
+        after = operation_policy_overrides(conn, repo["id"]).get(operation_type)
+        detail = {"operation_type": operation_type, "before": before, "after": after}
+    if detail["after"] != detail["before"]:
         audit.record(
             conn,
             "repository.policy_changed",
             "repository",
             repo["id"],
             agent=actor,
-            detail={"before": before, "after": after},
+            detail=detail,
         )
-    return after
+    return approval_policy(conn, repo["id"], operation_type)
+
+
+def _set_default_policy(
+    conn: Connection,
+    repository_id: int,
+    threshold: int | None,
+    roles: list[str] | None,
+    requester_may_vote: bool | None,
+) -> None:
+    if threshold is not None:
+        conn.execute(
+            "UPDATE repositories SET approval_threshold = ? WHERE id = ?",
+            (threshold, repository_id),
+        )
+    if roles is not None:
+        conn.execute(
+            "DELETE FROM repository_approval_roles WHERE repository_id = ?",
+            (repository_id,),
+        )
+        for role in roles:
+            conn.execute(
+                "INSERT INTO repository_approval_roles (repository_id, role) "
+                "VALUES (?, ?)",
+                (repository_id, role),
+            )
+    if requester_may_vote is not None:
+        conn.execute(
+            "UPDATE repositories SET requester_may_vote = ? WHERE id = ?",
+            (1 if requester_may_vote else 0, repository_id),
+        )
+
+
+def _set_operation_override(
+    conn: Connection,
+    repository_id: int,
+    operation_type: str,
+    threshold: int | None,
+    roles: list[str] | None,
+    requester_may_vote: bool | None,
+    inherit: bool,
+) -> None:
+    if inherit:
+        if threshold is not None or roles is not None or requester_may_vote is not None:
+            raise RegistryError(
+                "--inherit removes the override; it cannot be combined with "
+                "--threshold, --role, or --requester-may-vote."
+            )
+        conn.execute(
+            "DELETE FROM operation_approval_policies "
+            "WHERE repository_id = ? AND operation_type = ?",
+            (repository_id, operation_type),
+        )
+        return
+    row = conn.execute(
+        """
+        INSERT INTO operation_approval_policies (repository_id, operation_type)
+        VALUES (?, ?)
+        ON CONFLICT (repository_id, operation_type) DO UPDATE
+            SET operation_type = excluded.operation_type
+        RETURNING id
+        """,
+        (repository_id, operation_type),
+    ).fetchone()
+    assert row is not None
+    policy_id = row[0]
+    if threshold is not None:
+        conn.execute(
+            "UPDATE operation_approval_policies SET approval_threshold = ? "
+            "WHERE id = ?",
+            (threshold, policy_id),
+        )
+    if requester_may_vote is not None:
+        conn.execute(
+            "UPDATE operation_approval_policies SET requester_may_vote = ? "
+            "WHERE id = ?",
+            (1 if requester_may_vote else 0, policy_id),
+        )
+    if roles is not None:
+        conn.execute(
+            "DELETE FROM operation_approval_roles WHERE policy_id = ?", (policy_id,)
+        )
+        for role in roles:
+            conn.execute(
+                "INSERT INTO operation_approval_roles (policy_id, role) VALUES (?, ?)",
+                (policy_id, role),
+            )
 
 
 def _validate_path_glob(glob: str) -> str:

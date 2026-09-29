@@ -134,30 +134,55 @@ def cmd_repo_list(args, cfg) -> int:
     return 0
 
 
+def _describe_policy(policy: dict) -> str:
+    return (
+        f"threshold {policy['threshold']}; roles "
+        f"{', '.join(policy['roles']) or 'none'}; requester may vote: "
+        f"{'yes' if policy['requester_may_vote'] else 'no'}"
+    )
+
+
 def cmd_repo_policy(args, cfg) -> int:
     with store.session(cfg) as conn:
         changing = (
             args.threshold is not None
             or args.role
             or args.requester_may_vote is not None
+            or args.inherit
         )
         if changing:
-            policy = registry.set_approval_policy(
+            registry.set_approval_policy(
                 conn,
                 args.name,
                 actor=getattr(args, "agent", None) or cfg.agent,
                 threshold=args.threshold,
                 roles=args.role or None,
                 requester_may_vote=args.requester_may_vote,
+                operation_type=args.operation,
+                inherit=args.inherit,
             )
             conn.commit()
-        else:
-            repo = registry.get_repository(conn, args.name)
-            policy = registry.approval_policy(conn, repo["id"])
+        repo = registry.get_repository(conn, args.name)
+        default = registry.approval_policy(conn, repo["id"])
+        overridden = registry.operation_policy_overrides(conn, repo["id"])
+        effective = {
+            operation_type: registry.approval_policy(conn, repo["id"], operation_type)
+            for operation_type in registry.OPERATION_TYPES
+        }
     print(f"repository: {args.name}")
-    print(f"approval threshold: {policy['threshold']}")
-    print(f"approving roles: {', '.join(policy['roles'])}")
-    print(f"requester may vote: {'yes' if policy['requester_may_vote'] else 'no'}")
+    if args.operation is not None:
+        state = "override" if args.operation in overridden else "inherits default"
+        print(f"{args.operation} ({state}): {_describe_policy(effective[args.operation])}")
+        return 0
+    print(f"approval threshold: {default['threshold']}")
+    print(f"approving roles: {', '.join(default['roles'])}")
+    print(f"requester may vote: {'yes' if default['requester_may_vote'] else 'no'}")
+    if overridden:
+        print("per-operation overrides:")
+        for operation_type in overridden:
+            print(f"  {operation_type}: {_describe_policy(effective[operation_type])}")
+    else:
+        print("per-operation overrides: none")
     with store.session(cfg) as conn:
         repo = registry.get_repository(conn, args.name)
     print(f"protected refs: {', '.join(repo['protected_refs']) or '-'}")
@@ -635,6 +660,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "the current set)"),
         sp.add_argument("--requester-may-vote", dest="requester_may_vote",
                         action=argparse.BooleanOptionalAction, default=None),
+        sp.add_argument("--operation", choices=registry.OPERATION_TYPES,
+                        help="show or change the override for one operation "
+                             "type instead of the repository default"),
+        sp.add_argument("--inherit", action="store_true",
+                        help="with --operation: remove the override so the "
+                             "type inherits the default again"),
     ), parent=repo)
     add("protect-path", cmd_repo_protect_path, lambda sp: (
         sp.add_argument("name"),
