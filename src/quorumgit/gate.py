@@ -35,6 +35,7 @@ from .registry import (
 )
 from .store import Connection, begin_immediate, json_dumps, json_loads
 from .work import (
+    claim_scopes,
     live_claim_for_branch,
     open_handoff_for_branch,
     paths_outside,
@@ -489,16 +490,6 @@ def ref_namespace_refusal(repo: dict, refname: str) -> str | None:
     )
 
 
-def _claim_scopes(conn: Connection, claim_id: int) -> list[str]:
-    return [
-        row[0]
-        for row in conn.execute(
-            "SELECT path_glob FROM scopes WHERE claim_id = ? ORDER BY id",
-            (claim_id,),
-        ).fetchall()
-    ]
-
-
 def governed_operations(
     conn: Connection,
     repo: dict,
@@ -541,7 +532,7 @@ def governed_operations(
         branch = refname.removeprefix("refs/heads/")
         claim = live_claim_for_branch(conn, repo["id"], branch)
         if claim is not None:
-            outside = paths_outside(paths, _claim_scopes(conn, claim["id"]))
+            outside = paths_outside(paths, claim_scopes(conn, claim["id"]))
             if outside:
                 operations.append({
                     "type": "out_of_scope_push",
@@ -567,7 +558,12 @@ def _requirement_message(operation: dict, refusal: str | None) -> str:
         f"{operation['type']} on {operation['refname']} requires an approval "
         f"bound to this exact update (hash {operation_hash(operation)})."
     )
-    if operation.get("paths"):
+    if operation["type"] == "out_of_scope_push":
+        message += (
+            f" The push changes paths outside claim {operation['claim_id']}'s "
+            f"scopes: {_describe_paths(operation['paths'])}."
+        )
+    elif operation.get("paths"):
         message += f" Paths: {_describe_paths(operation['paths'])}."
     if refusal:
         message += f" {refusal}"
@@ -715,7 +711,7 @@ def prepare_push(
             )
         claim = live_claim_for_branch(conn, repo["id"], branch)
         if claim is not None:
-            claim = {**claim, "scopes": _claim_scopes(conn, claim["id"])}
+            claim = {**claim, "scopes": claim_scopes(conn, claim["id"])}
             if pusher is not None and claim["agent"] != pusher:
                 refusals.append(
                     f"Branch {branch!r} is claimed by {claim['agent']} "

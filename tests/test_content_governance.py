@@ -81,7 +81,7 @@ def _required(plan: dict) -> dict[str, dict]:
     ],
 )
 def test_path_in_scope(path, glob, expected):
-    assert work.path_in_scope(path, glob) is expected
+    assert work.path_in_scopes(path, [glob]) is expected
 
 
 # ------------------------------------------------------- changed-path derivation

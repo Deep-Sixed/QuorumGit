@@ -8,9 +8,9 @@ the moment another operation supersedes it. No background process exists.
 from __future__ import annotations
 
 import math
+import posixpath
 import re
 import subprocess
-from functools import lru_cache
 from typing import Any
 
 from . import audit
@@ -193,13 +193,7 @@ def live_claims_in_repository(
     ).fetchall()
     result: list[dict] = []
     for row in rows:
-        scopes = [
-            r[0]
-            for r in conn.execute(
-                "SELECT path_glob FROM scopes WHERE claim_id = ? ORDER BY id",
-                (row[0],),
-            ).fetchall()
-        ]
+        scopes = claim_scopes(conn, row[0])
         result.append(
             {
                 "id": row[0],
@@ -210,6 +204,16 @@ def live_claims_in_repository(
             }
         )
     return result
+
+
+def claim_scopes(conn: Connection, claim_id: int) -> list[str]:
+    return [
+        r[0]
+        for r in conn.execute(
+            "SELECT path_glob FROM scopes WHERE claim_id = ? ORDER BY id",
+            (claim_id,),
+        ).fetchall()
+    ]
 
 
 def open_handoff_for_task(conn: Connection, task_id: int) -> dict | None:
@@ -306,6 +310,30 @@ def live_claim_for_branch(
 # --------------------------------------------------------- scope comparison
 
 
+def normalize_scope(glob: str) -> str:
+    """Canonical repository-relative spelling of a scope glob.
+
+    `./src/**`, `src//**`, `/src/**` and `src\\**` all name `src/**`; a scope
+    naming the whole repository (`.`, `/`) becomes `**`. Never raises, so it is
+    safe on historical rows; validate_scope() rejects unusable input.
+    """
+    text = glob.strip().replace("\\", "/")
+    if not text:
+        return ""
+    text = posixpath.normpath(text).lstrip("/")
+    return "**" if text in ("", ".") else text
+
+
+def validate_scope(glob: str) -> str:
+    """Normalize a newly declared scope, refusing ones outside the repository."""
+    scope = normalize_scope(glob)
+    if not scope:
+        raise ClaimRefused("Scopes must be non-empty path globs.")
+    if scope == ".." or scope.startswith("../"):
+        raise ClaimRefused(f"Scope {glob!r} escapes the repository root.")
+    return scope
+
+
 def _glob_prefix(glob: str) -> str:
     """Literal path prefix of a glob (up to the first wildcard character)."""
     for i, ch in enumerate(glob):
@@ -315,31 +343,32 @@ def _glob_prefix(glob: str) -> str:
 
 
 def scopes_overlap(a: str, b: str) -> bool:
-    """Conservative overlap test that errs toward flagging."""
-    pa, pb = _glob_prefix(a), _glob_prefix(b)
+    """Conservative overlap test that errs toward flagging.
+
+    Both sides are normalized and compared case-insensitively, because a
+    case-insensitive checkout (macOS, Windows) treats `Src/` and `src/` as one
+    directory; on case-sensitive systems this only adds conservative flags.
+    """
+    pa = _glob_prefix(normalize_scope(a)).casefold()
+    pb = _glob_prefix(normalize_scope(b)).casefold()
     return pa.startswith(pb) or pb.startswith(pa)
 
 
-@lru_cache(maxsize=512)
-def _glob_regex(glob: str) -> re.Pattern[str]:
-    """Translate a path glob into an anchored regular expression.
+def _glob_regex(scope: str) -> re.Pattern[str]:
+    """Compile a normalized scope into a full-path matcher.
 
-    ``**`` spans any number of directories (``**/`` may match none), ``*`` and
-    ``?`` stay within one path segment, and ``[...]`` is a character class. A
-    glob with no wildcard, or one ending in ``/``, names a file or directory
-    and matches everything beneath it.
+    `**` spans directories, `*` and `?` stay within one path segment, and
+    `[...]` is a character class. A scope without wildcards names a file or a
+    directory, so it also matches everything beneath it.
     """
-    pattern = glob.removeprefix("./").lstrip("/")
-    if _glob_prefix(pattern) == pattern:
-        return re.compile(re.escape(pattern.rstrip("/")) + "(?:/.*)?")
     out: list[str] = []
     i = 0
-    while i < len(pattern):
-        ch = pattern[i]
-        if pattern.startswith("**/", i):
+    while i < len(scope):
+        ch = scope[i]
+        if scope.startswith("**/", i):
             out.append("(?:.*/)?")
             i += 3
-        elif pattern.startswith("**", i):
+        elif scope.startswith("**", i):
             out.append(".*")
             i += 2
         elif ch == "*":
@@ -348,36 +377,36 @@ def _glob_regex(glob: str) -> re.Pattern[str]:
         elif ch == "?":
             out.append("[^/]")
             i += 1
-        elif ch == "[":
-            end = pattern.find("]", i + 2 if pattern[i + 1 : i + 2] in ("!", "]") else i + 1)
-            if end == -1:
-                out.append(re.escape(ch))
-                i += 1
-                continue
-            body = pattern[i + 1 : end]
-            if body.startswith("!"):
-                body = "^" + body[1:]
-            out.append("(?!/)[" + body.replace("\\", "\\\\") + "]")
+        elif ch == "[" and (end := scope.find("]", i + 2)) != -1 and (
+            scope[i + 1 : end] != "!"
+        ):
+            body = scope[i + 1 : end]
+            negate = body.startswith("!")
+            body = re.sub(r"([\\^\[\]])", r"\\\1", body[1:] if negate else body)
+            out.append(f"[{'^' if negate else ''}{body}]")
             i = end + 1
         else:
             out.append(re.escape(ch))
             i += 1
-    return re.compile("".join(out))
+    pattern = "".join(out)
+    if not any(c in scope for c in "*?["):
+        pattern += "(?:/.*)?"
+    return re.compile(pattern + r"\Z", re.DOTALL)
 
 
-def path_in_scope(path: str, glob: str) -> bool:
-    """True when a repository-relative path falls under a scope glob."""
-    return _glob_regex(glob).fullmatch(path) is not None
+def path_in_scopes(path: str, scopes: list[str]) -> bool:
+    """True when a repository path is covered by any of the declared scopes."""
+    return any(_glob_regex(normalize_scope(s)).match(path) for s in scopes)
 
 
-def paths_outside(paths: list[str], globs: list[str]) -> list[str]:
-    """The paths no glob covers, in their original order."""
-    return [p for p in paths if not any(path_in_scope(p, g) for g in globs)]
+def paths_outside(paths: list[str], scopes: list[str]) -> list[str]:
+    """The paths no scope covers, in their original order."""
+    return [p for p in paths if not path_in_scopes(p, scopes)]
 
 
-def paths_within(paths: list[str], globs: list[str]) -> list[str]:
-    """The paths some glob covers, in their original order."""
-    return [p for p in paths if any(path_in_scope(p, g) for g in globs)]
+def paths_within(paths: list[str], scopes: list[str]) -> list[str]:
+    """The paths some scope covers, in their original order."""
+    return [p for p in paths if path_in_scopes(p, scopes)]
 
 
 def verify_commit(
@@ -518,8 +547,11 @@ def claim_task(
     lock_task(conn, task_id)
     task = get_task(conn, task_id)
     agent_row = get_agent(conn, agent)
+    if task["status"] == "done":
+        raise ClaimRefused(f"Task {task_id} is done; it cannot be claimed.")
     if not scope_globs:
         raise ClaimRefused("At least one --scope is required to claim a task.")
+    scope_globs = list(dict.fromkeys(validate_scope(g) for g in scope_globs))
 
     if not via_handoff:
         pending = open_handoff_for_task(conn, task_id)
@@ -775,6 +807,51 @@ def release_claim(
         agent=agent or None,
         detail={"reason": reason},
     )
+
+
+def complete_task(conn: Connection, task_id: int, agent: str, note: str = "") -> int:
+    """Mark a task done. Only the holder of its live claim may do this.
+
+    Releases that claim (reason "done") and sets the task to the terminal
+    `done` status in one transaction. Returns the released claim ID.
+    """
+    lock_task(conn, task_id)
+    task = get_task(conn, task_id)
+    get_agent(conn, agent)
+    if task["status"] == "done":
+        raise WorkError(f"Task {task_id} is already done.")
+    claim = active_claim_for_task(conn, task_id)
+    if claim is None:
+        pending = open_handoff_for_task(conn, task_id)
+        if pending:
+            raise WorkError(
+                f"Task {task_id} is reserved for open handoff {pending['id']}; "
+                "accept it before marking the task done."
+            )
+        raise WorkError(
+            f"Task {task_id} has no live claim; claim it before marking it done."
+        )
+    if claim["agent"] != agent:
+        raise WorkError(
+            f"Task {task_id} is claimed by {claim['agent']} "
+            f"(claim {claim['id']}), not {agent}."
+        )
+    if claim["expired"]:
+        raise WorkError(
+            f"Claim {claim['id']} has expired; acquire a new claim before "
+            "marking the task done."
+        )
+    release_claim(conn, claim["id"], agent, reason="done")
+    set_task_status(conn, task_id, "done")
+    audit.record(
+        conn,
+        "task.done",
+        "task",
+        task_id,
+        agent=agent,
+        detail={"claim_id": claim["id"], "note": note},
+    )
+    return claim["id"]
 
 
 def add_checkpoint(

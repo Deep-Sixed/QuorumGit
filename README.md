@@ -31,7 +31,7 @@ Eight concepts, in the order you meet them:
 |---|---|
 | **Repository** | A registered Git repo that QuorumGit governs. |
 | **Agent** | A registered identity with one role — `worker` (the default), `reviewer`, or `operator`. Set via `QUORUMGIT_AGENT` or `--agent`. |
-| **Task** | A unit of work against one repository. |
+| **Task** | A unit of work against one repository. Its holder closes it with `task done`; a done task can never be claimed again. |
 | **Claim** | An agent's exclusive lease on a task: names a branch, declares at least one write **scope** (path glob), and expires at a timestamp (default lease: 8 hours, set with `--lease-hours`). Expired leases make the task reclaimable and cannot be renewed — evaluated at read time, no timers. |
 | **Worktree** | An isolated `git worktree` created per claim. Agents never share a mutable checkout; Git itself refuses to check one branch out twice. A claim that supersedes an earlier claim on the same task and branch continues its retained checkout instead of creating a second one. |
 | **Handoff** | A structured continuation record (done / remaining / exact commit / blockers) that transfers work to a successor instead of abandoning it. |
@@ -43,7 +43,7 @@ Everything an agent does — claim, renew, checkpoint, hand off, release — wri
 
 ## Installation
 
-Requirements: **Python 3.11–3.14**, **git**. There is no database to install, no server to run, and no extension to provision: the store is a single SQLite 3 database file under `QUORUMGIT_DATA_DIR`, accessed through Python's standard-library [`sqlite3`](https://docs.python.org/3/library/sqlite3.html) module. QuorumGit has no third-party runtime dependencies. The Python interpreter must be linked against SQLite 3.38 or newer (every supported CPython release from python.org, Homebrew, and current Linux distributions is); `quorumgit` refuses to open the store otherwise.
+Requirements: **Python 3.11–3.14**, **Git 2.17 or newer** (the first release with `git worktree remove`). There is no database to install, no server to run, and no extension to provision: the store is a single SQLite 3 database file under `QUORUMGIT_DATA_DIR`, accessed through Python's standard-library [`sqlite3`](https://docs.python.org/3/library/sqlite3.html) module. QuorumGit has no third-party runtime dependencies. The Python interpreter must be linked against SQLite 3.38 or newer (every supported CPython release from python.org, Homebrew, and current Linux distributions is); `quorumgit` refuses to open the store otherwise.
 
 > **Platform note.** Linux, macOS, and Windows are supported on every Python from 3.11 to 3.14.
 
@@ -103,7 +103,13 @@ When the agent stops working, either release:
 quorumgit release 1 --remove-worktree
 ```
 
-Releasing returns the task to `open`, so any agent can claim it again. There is currently no command that marks a task finished — release means "I am no longer working on this", not "this is done".
+Releasing returns the task to `open`, so any agent can claim it again — release means "I am no longer working on this". When the work is finished, the claim holder closes the task instead:
+
+```bash
+quorumgit task done 1 --note "merged in #42" --remove-worktree
+```
+
+`task done` releases the claim and moves the task to the terminal `done` status in one transaction; no one can claim it afterwards. Only the agent holding the task's live, unexpired claim can run it (accept an open handoff first). `--remove-worktree` uses the same non-forced removal as `release`, so a worktree with uncommitted changes refuses the whole command and nothing changes.
 
 …or hand the work to someone else with everything they need to continue:
 
@@ -137,7 +143,7 @@ Every claim attempt is classified against all live claims before it is granted, 
 | `CONFLICTING` | branch already claimed by another task | refused |
 | `BLOCKED` | task already held by an unexpired claim | refused; takeover requires approval |
 
-Scope overlap uses a conservative literal-prefix test (the prefix of one glob up to its first wildcard against the other's) — it errs toward flagging.
+Scopes are normalized when declared (`./src/**`, `/src/**`, `src//**` and `src\**` all become `src/**`; scopes that escape the repository root are refused). Scope overlap then uses a conservative literal-prefix test (the prefix of one glob up to its first wildcard against the other's), compared case-insensitively — it errs toward flagging.
 
 ## Two deployment models
 
@@ -164,7 +170,7 @@ QUORUMGIT_AGENT=agent-two git push origin feat/x    # rejected — branch is cla
 git push origin feat/x                              # rejected — unidentified
 ```
 
-Owning the branch is necessary but not sufficient: the hook also checks **what the push changes** against the scopes agent-one claimed (see [Content governance](#content-governance)).
+Owning the branch is necessary but not sufficient: when the branch has a live claim, every commit the push introduces must only touch paths inside that claim's scopes, or carry an `out_of_scope_push` approval for exactly the paths outside them (see [Content governance](#content-governance)). In the local model agents commit directly in their worktree, so no hook runs and scopes remain coordination metadata.
 
 The hook learns who is pushing from `QUORUMGIT_AGENT` in its own environment, which Git passes through only when the remote is a **local path** (as `origin` is above). Over SSH or HTTP the variable does not reach the hook, so every push is rejected as unidentified. The hook also opens the store under its own `QUORUMGIT_DATA_DIR`, so pushers must use the same data directory as the rest of the deployment.
 
@@ -280,6 +286,7 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit repo protect-path <name> <glob> [--remove]` | Require an approval for any push changing matching paths (operator only) |
 | `quorumgit repo allow-ref <name> <prefix> [--remove]` | Allow pushes to a ref namespace such as `refs/tags/` (operator only) |
 | `quorumgit task add --repo <name> --title <t> [--objective <o>]` | Create a task |
+| `quorumgit task done <task> [--note <n>] [--remove-worktree]` | Close a task for good — live claim holder only; releases the claim |
 | `quorumgit claim <task> --branch <b> --scope <glob>… [--no-worktree] [--takeover] [--override-overlap] [--lease-hours <h>]` | Claim a task |
 | `quorumgit renew <claim> [--lease-hours <h>]` | Extend a live, unexpired lease; expired claims must be acquired again |
 | `quorumgit checkpoint <claim> [--commit <oid>] [--note <n>]` | Record verified progress |
@@ -296,7 +303,7 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit hook install --repo <name>` | Install the pre-receive hook (hub model) |
 | `quorumgit audit [--entity <e>] [--entity-id <id>] [--limit <n>]` | Read the audit trail |
 
-`repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Commands that act as an agent (`claim`, `renew`, `release`, `checkpoint`, `handoff create/accept/decline/cancel`, `approve request/vote`, `approve prepare`, and the operator actions `agent add`, `agent role`, `repo policy`, `repo protect-path`, `repo allow-ref`) also take `--agent <name>`, which overrides `QUORUMGIT_AGENT`. At least one `--scope` is required to claim. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
+`repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Commands that act as an agent (`claim`, `renew`, `release`, `task done`, `checkpoint`, `handoff create/accept/decline/cancel`, `approve request/vote`, `approve prepare`, and the operator actions `agent add`, `agent role`, `repo policy`, `repo protect-path`, `repo allow-ref`) also take `--agent <name>`, which overrides `QUORUMGIT_AGENT`. At least one `--scope` is required to claim. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
 
 `quorumgit doctor` only checks worktree paths already recorded by QuorumGit. It reports:
 
