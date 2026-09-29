@@ -191,6 +191,67 @@ def test_merging_mainline_into_a_claimed_branch_stays_in_scope(
     assert merged.returncode == 0, merged.stderr
 
 
+def test_staging_work_on_another_branch_does_not_escape_the_claim(
+    committed_conn, tmp_path, cfg
+):
+    conn = committed_conn
+    repo_name, _hub, clone, a, _b = _setup(conn, tmp_path)
+    _claimed_branch(conn, repo_name, a, "feat/docs", ["docs/**"])
+    _git(clone, "checkout", "-b", "feat/docs")
+    _edit(clone, "src/auth.py", message="stray")
+
+    direct = _push(clone, a, "feat/docs", cfg=cfg)
+    assert direct.returncode != 0
+    assert "out_of_scope_push" in direct.stderr
+
+    # Unclaimed branches carry no scopes, so this is accepted...
+    staged = _push(clone, a, "HEAD:refs/heads/scratch", cfg=cfg)
+    assert staged.returncode == 0, staged.stderr
+    # ...but the same commit still counts when it reaches the claimed branch.
+    plan = gate.prepare_push(conn, repo_name, "feat/docs", clone, pusher=a)
+    required = _required(plan)
+    assert set(required) == {"out_of_scope_push"}
+    assert required["out_of_scope_push"]["operation"]["paths"] == ["src/auth.py"]
+    bypass = _push(clone, a, "feat/docs", cfg=cfg)
+    assert bypass.returncode != 0
+    assert "src/auth.py" in bypass.stderr
+    # The planner derives exactly the hash the hook demanded.
+    assert required["out_of_scope_push"]["hash"] in bypass.stderr
+
+
+def test_new_claimed_branch_is_measured_from_the_default_branch(
+    committed_conn, tmp_path, cfg
+):
+    """Without protected refs, the hub's default branch is still the mainline,
+    so a new claimed branch is charged only for its own commits."""
+    conn = committed_conn
+    suffix = uuid.uuid4().hex[:8]
+    hub = tmp_path / "open-hub.git"
+    seed = tmp_path / "open-seed"
+    seed.mkdir()
+    _git(seed, "init", "-b", "main")
+    _edit(seed, "infra/prod.tf", "README.md", message="history outside the scope")
+    _git(tmp_path, "clone", "--bare", str(seed), str(hub))
+    repo_name = f"open-{suffix}"
+    registry.add_repository(conn, repo_name, hub)
+    agent = f"agent-{suffix}"
+    registry.add_agent(conn, agent)
+    gate.install_hook(conn, repo_name)
+    conn.commit()
+    assert registry.get_repository(conn, repo_name)["protected_refs"] == []
+
+    _claimed_branch(conn, repo_name, agent, "feat/api", ["src/api/**"])
+    clone = tmp_path / "open-clone"
+    _git(tmp_path, "clone", str(hub), str(clone))
+    _git(clone, "checkout", "-b", "feat/api")
+    _edit(clone, "src/api/routes.py", message="feature")
+
+    plan = gate.prepare_push(conn, repo_name, "feat/api", clone, pusher=agent)
+    assert plan["operations"] == []
+    pushed = _push(clone, agent, "feat/api", cfg=cfg)
+    assert pushed.returncode == 0, pushed.stderr
+
+
 # ----------------------------------------------------------- protected paths
 
 

@@ -191,7 +191,9 @@ push → identify pusher → branch reservations → allowed ref namespace
      → ALLOW, or REQUIRE the matching approval(s)
 ```
 
-- **Changed paths** are the paths introduced by commits that are new to the repository — reachable from the pushed revision and from no existing ref. Content already in the hub was governed when it first arrived, so merging `main` into a feature branch does not attribute `main`'s changes to the pusher; a merge contributes only the paths it changes relative to *every* parent (conflict resolutions and hand edits). Root commits are compared with the empty tree. Deletions carry no content.
+- **Changed paths** are the paths introduced by the commits a push brings in; a merge contributes only the paths it changes relative to *every* parent (conflict resolutions and hand edits), root commits are compared with the empty tree, and deletions carry no content. Which commits count as "brought in" depends on the check:
+  - For **protected paths**, commits reachable from no existing ref. Every push to every ref is checked against protected paths, so content already in the hub was governed when it first arrived.
+  - For a **claim's scopes**, commits not reachable from the branch's previous value, the hub's default branch (`HEAD`), or a protected ref. Merging `main` into a feature branch therefore does not attribute `main`'s changes to the pusher, but merging another agent's branch does, and so does pushing a commit to an unclaimed branch first and then to the claimed one: unclaimed branches carry no scopes, so their content is not treated as already governed.
 - **Out-of-scope changes need an approval, not a new claim.** When a claimed branch receives changes to paths none of its scopes cover, the push requires an `out_of_scope_push` approval naming the claim and exactly those paths. Scope globs use `**` (any number of directories), `*` and `?` (within one path segment), and `[...]`; a glob with no wildcard, or ending in `/`, covers a file or everything beneath a directory. Branches with no live claim carry no scopes, so only the other checks apply to them.
 - **Protected paths** need a `protected_path_update` approval whenever a push changes them, on any ref and whoever owns the branch:
 
@@ -342,7 +344,7 @@ QuorumGit v1 coordinates **cooperating agents**; the adversary is *accident, not
 - Agent identity is asserted (`QUORUMGIT_AGENT`), not cryptographically authenticated. Any local process can claim to be any agent.
 - The trust root is write access to the database and the filesystem. An actor with either can bypass governance.
 - The hooks govern `git push` only. Direct ref manipulation inside a repository bypasses them.
-- Content is governed when it first reaches the hub. Scopes are checked only on claimed branches, so changes pushed to an unclaimed branch (subject to protected paths) and later merged into a claimed one are not re-attributed to the claim.
+- A claim's scopes are measured against the mainline: the default branch and the protected refs. Content that reached the mainline is not charged to a claim that later merges it, so if the default branch is not protected, a change pushed there directly (subject to protected paths) is never checked against any claim. Protect the default branch.
 - Approval hashes provide exact-payload binding and tamper-evidence, not approver authentication.
 - Roles separate duties between cooperating agents. Because identity is asserted, a process willing to impersonate an operator can still do so; role separation stops an agent from authorizing its own work by accident or by default, not a determined impersonator.
 

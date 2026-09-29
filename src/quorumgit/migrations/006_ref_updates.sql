@@ -1,6 +1,7 @@
 -- Bind a push's pre-receive validation to Git's own reference transaction.
 -- pre-receive records each exact ref update it validated, with the paths it
--- derived from the received objects. The reference-transaction hook
+-- derived from the received objects (against every ref for protected paths,
+-- against the mainline for claim scopes). The reference-transaction hook
 -- re-validates it and consumes its approvals while Git holds the ref locks
 -- ("prepared"), then records whether Git committed or aborted the update. An
 -- approval is therefore never spent on an update that did not happen, and
@@ -21,6 +22,9 @@ CREATE TABLE ref_updates (
     pusher_agent_id INTEGER NOT NULL REFERENCES agents(id),
     paths TEXT NOT NULL DEFAULT '[]' CHECK (
         json_valid(paths) AND json_type(paths) = 'array'
+    ),
+    scope_paths TEXT NOT NULL DEFAULT '[]' CHECK (
+        json_valid(scope_paths) AND json_type(scope_paths) = 'array'
     ),
     status TEXT NOT NULL DEFAULT 'validated'
         CHECK (status IN ('validated', 'prepared', 'committed', 'aborted')),

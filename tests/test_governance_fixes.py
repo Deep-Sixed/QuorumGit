@@ -3,8 +3,8 @@
 1. (Superseded by the repository approval policy tests on main.)
 2. A successor claim on another branch still gets a fresh worktree; same-branch
    continuation is covered by main's worktree continuation tests.
-3. Scope globs are normalized before overlap comparison.
-4. Pushes to a claimed branch are held to the claim's declared scopes.
+3. and 4. (Scope normalization and push-time scope checks: now covered by
+   main's tests/test_scope_enforcement.py and tests/test_content_governance.py.)
 5. Commit specs resolve to full OIDs and user errors never print tracebacks.
 6. `handoff create --last-commit` is honored when a worktree exists.
 """
@@ -22,7 +22,6 @@ import pytest
 from quorumgit import handoff, registry, trees, work
 from tests.conftest import make_git_repo
 from tests.test_cli_hub import _cli
-from tests.test_gate import _commit, _push, _setup
 
 GIT_ENV = {
     **os.environ,
@@ -101,124 +100,6 @@ def test_reclaim_on_a_different_branch_creates_a_fresh_worktree(
     new_wt = trees.worktree_for_claim(conn, new_claim)
     assert new_wt is not None and new_wt["branch"] == "feat/new"
     assert _worktree(conn, old_claim)["removed_at"] is None
-
-
-# ---------------------------------------------------------------- finding 3
-
-
-@pytest.mark.parametrize(
-    ("raw", "normalized"),
-    [
-        ("./src/**", "src/**"),
-        ("src//api/**", "src/api/**"),
-        ("/src/**", "src/**"),
-        ("src\\api\\**", "src/api/**"),
-        (".", "**"),
-        ("src/../lib/**", "lib/**"),
-    ],
-)
-def test_normalize_scope(raw, normalized):
-    assert work.normalize_scope(raw) == normalized
-
-
-@pytest.mark.parametrize(
-    ("a", "b"),
-    [
-        ("./src/**", "src/**"),
-        ("src\\api\\**", "src/api/handlers.py"),
-        ("Src/**", "src/app.py"),
-        ("src/../lib/**", "lib/x.py"),
-    ],
-)
-def test_differently_spelled_scopes_overlap(a, b):
-    assert work.scopes_overlap(a, b)
-    assert work.scopes_overlap(b, a)
-
-
-def test_scopes_escaping_the_repository_are_refused(conn, tmp_path):
-    _repo, _path, task, (a, _b, _op) = _local_setup(conn, tmp_path)
-    with pytest.raises(work.ClaimRefused, match="escapes the repository"):
-        work.claim_task(conn, task, a, "feat/escape", ["../other/**"])
-
-
-def test_dot_slash_scope_is_classified_overlapping(conn, tmp_path):
-    repo, _path, task, (a, b, _op) = _local_setup(conn, tmp_path)
-    work.claim_task(conn, task, a, "feat/one", ["src/**"])
-    other = work.create_task(conn, repo, "second")
-    with pytest.raises(work.ClaimRefused, match="overlap"):
-        work.claim_task(conn, other, b, "feat/two", ["./src/**"])
-
-    claim_id, classification, _ = work.claim_task(
-        conn, other, b, "feat/two", ["./src/**"], override_overlap=True
-    )
-    assert classification == "OVERLAPPING"
-    assert work.claim_scopes(conn, claim_id) == ["src/**"]
-
-
-# ---------------------------------------------------------------- finding 4
-
-
-@pytest.mark.parametrize(
-    ("scope", "path", "inside"),
-    [
-        ("src/**", "src/a/b.py", True),
-        ("src/**", "srcx/a.py", False),
-        ("src/*.py", "src/a.py", True),
-        ("src/*.py", "src/a/b.py", False),
-        ("docs", "docs/guide.md", True),
-        ("docs", "docs", True),
-        ("docs", "docs2/x", False),
-        ("**/*.md", "README.md", True),
-        ("**/*.md", "a/b/c.md", True),
-        ("src/[ab].py", "src/a.py", True),
-        ("src/[!ab].py", "src/a.py", False),
-        ("**", "anything/at/all", True),
-    ],
-)
-def test_path_in_scopes(scope, path, inside):
-    assert work.path_in_scopes(path, [scope]) is inside
-
-
-def test_hook_holds_claimed_branch_to_its_scopes(committed_conn, tmp_path, cfg):
-    conn = committed_conn
-    repo_name, _hub, clone, a, b = _setup(conn, tmp_path)
-    task = work.create_task(conn, repo_name, "scoped work")
-    work.claim_task(conn, task, a, branch="feat/scoped", scope_globs=["src/**"])
-    conn.commit()
-
-    _commit(clone, "src/inside.py", branch="feat/scoped")
-    inside = _push(clone, a, "feat/scoped", cfg=cfg)
-    assert inside.returncode == 0, inside.stderr
-
-    _commit(clone, "README.md", branch="feat/scoped")
-    outside = _push(clone, a, "feat/scoped", cfg=cfg)
-    assert outside.returncode != 0
-    assert "outside claim" in outside.stderr
-    assert "README.md" in outside.stderr
-
-    # Undo the out-of-scope commit; merging another branch's accepted work in
-    # does not attribute that branch's files to the claim holder.
-    _git(clone, "reset", "--hard", "HEAD~1")
-    _commit(clone, "docs/elsewhere.md", branch="feat/base")
-    base = _push(clone, b, "feat/base", cfg=cfg)
-    assert base.returncode == 0, base.stderr
-    _git(clone, "checkout", "feat/scoped")
-    _git(clone, "merge", "--no-edit", "feat/base")
-    merged = _push(clone, a, "feat/scoped", cfg=cfg)
-    assert merged.returncode == 0, merged.stderr
-
-
-def test_hook_scope_check_covers_new_claimed_branches(committed_conn, tmp_path, cfg):
-    conn = committed_conn
-    repo_name, _hub, clone, a, _b = _setup(conn, tmp_path)
-    task = work.create_task(conn, repo_name, "new branch")
-    work.claim_task(conn, task, a, branch="feat/fresh", scope_globs=["src/**"])
-    conn.commit()
-
-    _commit(clone, "docs/outside.md", branch="feat/fresh")
-    rejected = _push(clone, a, "feat/fresh", cfg=cfg)
-    assert rejected.returncode != 0
-    assert "docs/outside.md" in rejected.stderr
 
 
 # ---------------------------------------------------------------- finding 5
