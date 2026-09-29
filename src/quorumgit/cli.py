@@ -119,6 +119,56 @@ def cmd_repo_list(args, cfg) -> int:
     return 0
 
 
+def cmd_repo_approver_add(args, cfg) -> int:
+    with store.connect(cfg) as conn:
+        registry.add_approver(conn, args.repo, args.agent_name)
+        conn.commit()
+    print(f"{args.agent_name} is now an approver for {args.repo}.")
+    return 0
+
+
+def cmd_repo_approver_remove(args, cfg) -> int:
+    with store.connect(cfg) as conn:
+        registry.remove_approver(conn, args.repo, args.agent_name)
+        conn.commit()
+    print(f"{args.agent_name} is no longer an approver for {args.repo}.")
+    return 0
+
+
+def cmd_repo_approver_list(args, cfg) -> int:
+    with store.connect(cfg) as conn:
+        for name in registry.get_repository(conn, args.repo)["approvers"]:
+            print(name)
+    return 0
+
+
+def cmd_repo_policy(args, cfg) -> int:
+    with store.connect(cfg) as conn:
+        if args.separate_duties is not None:
+            registry.set_separate_duties(conn, args.repo, args.separate_duties)
+            conn.commit()
+        repo = registry.get_repository(conn, args.repo)
+    approvers = repo["approvers"]
+    if approvers:
+        print(f"approvers: {', '.join(approvers)}")
+        print(
+            f"quorum: {gate.quorum_threshold(len(approvers))} of "
+            f"{len(approvers)} (2/3 + 1)"
+        )
+    else:
+        print("approvers: any registered agent")
+        print("quorum: the threshold given with each request (default 1)")
+    if repo["separate_duties"]:
+        print("separate duties: on — the requester's vote is refused and the "
+              "agent using an approval cannot count its own vote")
+        if approvers:
+            print("  (quorum is counted over the approvers eligible for each "
+                  "approval)")
+    else:
+        print("separate duties: off")
+    return 0
+
+
 def cmd_agent_add(args, cfg) -> int:
     with store.connect(cfg) as conn:
         agent_id = registry.add_agent(conn, args.name)
@@ -445,6 +495,26 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--protected-ref", action="append", default=[]),
     ), parent=repo)
     add("list", cmd_repo_list, parent=repo)
+    approver = repo.add_parser("approver").add_subparsers(dest="action", required=True)
+    add("add", cmd_repo_approver_add, lambda sp: (
+        sp.add_argument("repo"),
+        sp.add_argument("agent_name"),
+    ), parent=approver)
+    add("remove", cmd_repo_approver_remove, lambda sp: (
+        sp.add_argument("repo"),
+        sp.add_argument("agent_name"),
+    ), parent=approver)
+    add("list", cmd_repo_approver_list,
+        lambda sp: sp.add_argument("repo"), parent=approver)
+    add("policy", cmd_repo_policy, lambda sp: (
+        sp.add_argument("repo"),
+        sp.add_argument("--separate-duties", dest="separate_duties",
+                        action="store_true", default=None,
+                        help="forbid agents from approving their own requests, "
+                             "pushes, or takeovers"),
+        sp.add_argument("--no-separate-duties", dest="separate_duties",
+                        action="store_false"),
+    ), parent=repo)
 
     agent = sub.add_parser("agent").add_subparsers(dest="sub", required=True)
     add("add", cmd_agent_add, lambda sp: sp.add_argument("name"), parent=agent)

@@ -19,6 +19,7 @@ from . import audit, work
 from .canonical import stable_hash
 from .registry import (
     RegistryError,
+    approvers_for_repository,
     assert_repository_identity_unique,
     get_agent,
     get_repository,
@@ -87,6 +88,95 @@ def _approval_dict(row) -> dict:
         "status": row[4],
         "consumed_at": row[5],
     }
+
+
+def quorum_threshold(approver_count: int) -> int:
+    """Integer-stable 2/3 + 1 quorum over an approver roster."""
+    return (2 * approver_count) // 3 + 1
+
+
+def approval_policy(conn: Connection, repository: str) -> dict:
+    """The approval policy governing operations on a repository.
+
+    Operations naming an unregistered repository, or a repository with no
+    roster and separation of duties off, keep the open policy: any registered
+    agent may vote and the requested threshold applies.
+    """
+    row = conn.execute(
+        "SELECT id, separate_duties FROM repositories WHERE name = ?",
+        (repository,),
+    ).fetchone()
+    if row is None:
+        return {"approvers": [], "separate_duties": False}
+    return {
+        "approvers": approvers_for_repository(conn, row[0]),
+        "separate_duties": bool(row[1]),
+    }
+
+
+def required_threshold(
+    requested: int, policy: dict, excluded: set[str] | frozenset[str] = frozenset()
+) -> int:
+    """A roster sets a 2/3 + 1 floor; a request may only raise it.
+
+    The quorum is taken over the approvers eligible to vote on this approval,
+    so separation of duties never makes approval arithmetically impossible
+    for a roster that still has other members.
+    """
+    if policy["approvers"]:
+        eligible = set(policy["approvers"]) - set(excluded)
+        return max(requested, quorum_threshold(len(eligible)))
+    return requested
+
+
+def _requester(conn: Connection, approval_id: int) -> str | None:
+    row = conn.execute(
+        """
+        SELECT a.name FROM approvals ap
+        JOIN agents a ON a.id = ap.requested_by_agent_id
+        WHERE ap.id = ?
+        """,
+        (approval_id,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _excluded(
+    conn: Connection, approval: dict, policy: dict, consumer: str | None = None
+) -> set[str]:
+    """Agents whose approval does not count under separation of duties."""
+    if not policy["separate_duties"]:
+        return set()
+    requester = _requester(conn, approval["id"])
+    return {name for name in (requester, consumer) if name}
+
+
+def _tally(
+    conn: Connection,
+    approval: dict,
+    policy: dict,
+    excluded: set[str],
+) -> tuple[list[str], list[str]]:
+    """Yes votes that count under the current policy, and all deny votes.
+
+    Recomputed on every decision and again at consumption, so removing an
+    approver withdraws their vote and separation of duties discounts the
+    consuming agent's own approval.
+    """
+    rows = conn.execute(
+        "SELECT voter, vote FROM votes WHERE approval_id = ? ORDER BY voter",
+        (approval["id"],),
+    ).fetchall()
+    roster = set(policy["approvers"])
+    yes = [
+        voter
+        for voter, choice in rows
+        if choice == 1
+        and (not roster or voter in roster)
+        and voter not in excluded
+    ]
+    no = [voter for voter, choice in rows if choice == 0]
+    return yes, no
 
 
 def request_approval(
@@ -174,14 +264,26 @@ def vote(conn: Connection, approval_id: int, voter: str, approve: bool) -> dict:
     """Record a vote against one explicit approval instance atomically.
 
     BEGIN IMMEDIATE serializes competing voters before either reads the current
-    approval state. Denial has precedence and terminal states remain final.
+    approval state. Denial has precedence and terminal states remain final. An
+    approved but unused approval still accepts votes, so a deny revokes it
+    before use and extra yes votes can restore quorum after a roster change.
     """
     begin_immediate(conn)
     voter_row = get_agent(conn, voter)
     approval = get_approval_by_id(conn, approval_id)
-    if approval["status"] != "pending":
+    if approval["status"] not in ("pending", "approved"):
         raise GateError(f"Approval {approval_id} is already {approval['status']}.")
-    threshold = approval["threshold"]
+    repository = str(approval["operation"].get("repository"))
+    policy = approval_policy(conn, repository)
+    if policy["approvers"] and voter not in policy["approvers"]:
+        raise GateError(
+            f"Agent {voter} is not an approver for repository {repository}."
+        )
+    if policy["separate_duties"] and voter == _requester(conn, approval["id"]):
+        raise GateError(
+            f"Agent {voter} requested approval {approval_id}; separation of "
+            f"duties on repository {repository} forbids voting on it."
+        )
     conn.execute(
         """
         INSERT INTO votes (approval_id, voter, vote, voter_agent_id)
@@ -201,24 +303,18 @@ def vote(conn: Connection, approval_id: int, voter: str, approve: bool) -> dict:
         detail={"vote": approve, "hash": approval["operation_hash"]},
     )
 
-    counts = conn.execute(
-        "SELECT count(*) FILTER (WHERE vote = 1), "
-        "count(*) FILTER (WHERE vote = 0) "
-        "FROM votes WHERE approval_id = ?",
-        (approval["id"],),
-    ).fetchone()
-    assert counts is not None
-    yes, no = counts
-    if no > 0:
+    excluded = _excluded(conn, approval, policy)
+    yes, no = _tally(conn, approval, policy, excluded)
+    if no:
         new_status = "denied"
-    elif yes >= threshold:
+    elif len(yes) >= required_threshold(approval["threshold"], policy, excluded):
         new_status = "approved"
     else:
         new_status = "pending"
-    if new_status != "pending":
+    if new_status != approval["status"]:
         conn.execute(
             "UPDATE approvals SET status = ?, decided_at = unixepoch() "
-            "WHERE id = ? AND status = 'pending'",
+            "WHERE id = ? AND status IN ('pending', 'approved')",
             (new_status, approval["id"]),
         )
         audit.record(
@@ -266,6 +362,19 @@ def consume_approval(
         raise GateError(
             f"Approval {op_hash} is not consumable (status "
             f"{approval['status']}); it may already be used."
+        )
+    policy = approval_policy(conn, str(operation["repository"]))
+    excluded = _excluded(conn, approval, policy, consumer=agent)
+    yes, _no = _tally(conn, approval, policy, excluded)
+    required = required_threshold(approval["threshold"], policy, excluded)
+    if len(yes) < required:
+        detail = ""
+        if policy["separate_duties"]:
+            detail = f"; {agent}'s own vote and the requester's do not count"
+        raise GateError(
+            f"Approval {approval_id} does not satisfy the current approval "
+            f"policy for {operation['repository']}: {len(yes)} eligible yes "
+            f"vote(s), {required} required{detail}."
         )
     cur = conn.execute(
         "UPDATE approvals SET status = 'consumed', consumed_at = unixepoch(), "

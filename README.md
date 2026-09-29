@@ -58,7 +58,7 @@ Then initialize the store once:
 ```bash
 $ quorumgit init
 store: /home/you/.quorumgit/quorumgit.db
-migrations applied: ['001_core.sql', '002_approval_identities.sql']
+migrations applied: ['001_core.sql', '002_approval_identities.sql', '003_approver_policy.sql']
 contract: ok
 ```
 
@@ -194,11 +194,29 @@ quorumgit approve vote 17 --agent operator
 Rules that hold no matter what:
 
 - **An approval never bypasses branch reservations.** A claimed branch still accepts pushes only from its claiming agent; a branch frozen by an open handoff accepts none at all. The hook checks reservations *before* approvals.
-- **Denial has precedence and is terminal.** One `--deny` vote denies the approval; later yes votes are refused.
+- **Denial has precedence and is terminal.** One `--deny` vote denies the approval; later yes votes are refused. An approved approval that has not been used yet still accepts votes, so a deny revokes it before use.
 - **Consumption is single-use under concurrency.** Two simultaneous pushes racing for one approval produce exactly one accepted push — the loser is rejected, not silently allowed.
 - **Votes bind to one approval instance.** A delayed vote for an older denied or consumed instance cannot decide a newer request with the same operation hash. Requesters, voters, consumers, and pushers must name registered agents.
 - **A consumed approval is spent, not blacklisted.** Consumption moves the approval to a terminal `consumed` state (with `consumed_at`) rather than reusing `denied`, and only one *live* (`pending` or `approved`) approval may exist per operation hash. The same operation can therefore be requested and approved again later as a new approval instance — which matters for takeovers, whose payload is stable and legitimately repeatable. What is never possible is one approval authorizing twice.
-- The default threshold is 1; `--threshold` sets a higher one. "Operator" is a convention, not a role: **any registered agent can vote, including the agent that requested the approval or is making the push.** Keeping approvals in human hands depends on how agent identities are used, not on anything QuorumGit enforces (see the threat model).
+- **By default the policy is open:** the threshold is 1 (`--threshold` sets a higher one) and any registered agent can vote, including the agent that requested the approval or is making the push. A repository can tighten this — see below.
+
+### Approval policy per repository
+
+Two optional settings restrict who can approve operations on a repository (operations name it in their `repository` field):
+
+```bash
+quorumgit repo approver add myproject alice      # build an approver roster
+quorumgit repo approver add myproject bob
+quorumgit repo approver add myproject carol
+quorumgit repo policy myproject --separate-duties
+quorumgit repo policy myproject                  # show the current policy
+```
+
+- **Approver roster.** Once a repository has approvers, only they can vote on its approvals, and the threshold becomes a **2/3 + 1 quorum** of the roster (1 of 1, 2 of 2, 3 of 3, 3 of 4, 4 of 5, …). `--threshold` on a request can raise that bar but not lower it.
+- **Separation of duties.** With `--separate-duties`, the agent that requested an approval cannot vote on it, and the agent that *uses* it — the pusher, or the agent taking over a lease — cannot count its own yes vote. With a roster, the quorum is counted over the approvers eligible for that particular approval, so these exclusions never make approval impossible while other approvers exist; a sole approver, however, can never approve their own operation.
+- **Quorum is re-checked when an approval is used,** against the roster and policy at that moment. Removing an approver withdraws their vote from every approval not yet used; if that drops an approval below quorum, the push or takeover is refused until more eligible approvers vote.
+
+Every roster and policy change is audited. Without a roster or separation of duties, the open policy above applies — "operator" is then a convention, not a role, and keeping approvals in human hands depends on how agent identities are used (see the threat model).
 
 Takeovers follow the same pattern: claiming a task someone else holds (`claim <task> --takeover`) prints the takeover operation to approve. Its payload includes the incumbent claim ID, so an unused approval cannot displace a later claim by the same agent. The takeover is atomic — the incumbent is released, the replacement claim created, and the approval consumed in one transaction, or none of it happens. A refused takeover leaves the incumbent untouched and the approval unconsumed.
 
@@ -211,6 +229,8 @@ Takeovers follow the same pattern: claiming a task someone else holds (`claim <t
 | `quorumgit doctor [--repair]` | Detect and conservatively reconcile recorded managed-worktree drift |
 | `quorumgit destroy --yes` | Delete the database file (managed worktrees under `QUORUMGIT_DATA_DIR/worktrees` are left in place) |
 | `quorumgit repo add <name> <path> [--protected-ref <ref>]…` | Register a repository |
+| `quorumgit repo approver add\|remove <repo> <agent>` / `repo approver list <repo>` | Manage a repository's approver roster |
+| `quorumgit repo policy <repo> [--separate-duties \| --no-separate-duties]` | Show or change a repository's approval policy |
 | `quorumgit agent add <name>` | Register an agent identity |
 | `quorumgit task add --repo <name> --title <t> [--objective <o>]` | Create a task |
 | `quorumgit claim <task> --branch <b> --scope <glob>… [--no-worktree] [--takeover] [--override-overlap] [--lease-hours <h>]` | Claim a task |
@@ -263,7 +283,7 @@ QuorumGit v1 coordinates **cooperating agents**; the adversary is *accident, not
 - Agent identity is asserted (`QUORUMGIT_AGENT`), not cryptographically authenticated. Any local process can claim to be any agent.
 - The trust root is write access to the database and the filesystem. An actor with either can bypass governance.
 - The pre-receive hook governs `git push` only. Direct ref manipulation inside a repository bypasses it.
-- Approval hashes provide exact-payload binding and tamper-evidence, not approver authentication. Any registered agent may vote, including the requester or pusher, so an agent can approve its own protected operation.
+- Approval hashes provide exact-payload binding and tamper-evidence, not approver authentication. Approver rosters and separation of duties restrict *which asserted identities* may approve, but because identity is asserted, a process that can claim to be an approver can vote as one.
 
 These are the correct trade-offs for preventing well-intentioned agents from colliding on one machine. They are not Byzantine fault tolerance, and this document will not pretend otherwise.
 

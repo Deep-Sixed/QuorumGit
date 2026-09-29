@@ -23,6 +23,9 @@ def _agents(conn, *names):
         conn.execute("INSERT INTO agents (name) VALUES (?) ON CONFLICT DO NOTHING", (name,))
 
 
+UPGRADES_AFTER_001 = ["002_approval_identities.sql", "003_approver_policy.sql"]
+
+
 def _apply_001(cfg: Config):
     conn = store.open_connection(cfg)
     conn.execute(
@@ -186,13 +189,13 @@ def test_contract_rejects_001_only_store_until_all_migrations_apply(tmp_path):
     conn.commit()
     conn.close()
 
-    message = "Missing required migrations: ['002_approval_identities.sql']"
+    message = f"Missing required migrations: {UPGRADES_AFTER_001}"
     with pytest.raises(store.ContractViolation, match=re.escape(message)):
         store.verify_contract(cfg)
     with pytest.raises(store.ContractViolation, match=re.escape(message)):
         store.connect(cfg)
 
-    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    assert store.migrate(cfg) == UPGRADES_AFTER_001
     store.verify_contract(cfg)
     upgraded = store.connect(cfg)
     upgraded.close()
@@ -209,7 +212,7 @@ def test_identity_migration_preserves_and_backfills_history(tmp_path):
     conn.commit()
     conn.close()
 
-    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    assert store.migrate(cfg) == UPGRADES_AFTER_001
     migrated = store.connect(cfg)
     try:
         requester = migrated.execute(
@@ -249,7 +252,7 @@ def test_migration_does_not_backfill_requester_registered_after_request(tmp_path
     conn.commit()
     conn.close()
 
-    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    assert store.migrate(cfg) == UPGRADES_AFTER_001
     migrated = store.connect(cfg)
     try:
         row = migrated.execute(
@@ -281,7 +284,7 @@ def test_migration_does_not_backfill_voter_registered_after_vote(tmp_path):
     conn.commit()
     conn.close()
 
-    assert store.migrate(cfg) == ["002_approval_identities.sql"]
+    assert store.migrate(cfg) == UPGRADES_AFTER_001
     migrated = store.connect(cfg)
     try:
         approval = migrated.execute(

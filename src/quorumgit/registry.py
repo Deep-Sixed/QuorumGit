@@ -13,6 +13,21 @@ class RegistryError(RuntimeError):
     pass
 
 
+def approvers_for_repository(conn: Connection, repository_id: int) -> list[str]:
+    return [
+        row[0]
+        for row in conn.execute(
+            """
+            SELECT a.name
+            FROM repository_approvers ra JOIN agents a ON a.id = ra.agent_id
+            WHERE ra.repository_id = ?
+            ORDER BY a.name
+            """,
+            (repository_id,),
+        ).fetchall()
+    ]
+
+
 def _protected_refs(conn: Connection, repository_id: int) -> list[str]:
     return [
         row[0]
@@ -153,7 +168,7 @@ def add_repository(
 
 def get_repository(conn: Connection, name: str) -> dict:
     row = conn.execute(
-        "SELECT id, name, path FROM repositories WHERE name = ?",
+        "SELECT id, name, path, separate_duties FROM repositories WHERE name = ?",
         (name,),
     ).fetchone()
     if row is None:
@@ -163,6 +178,8 @@ def get_repository(conn: Connection, name: str) -> dict:
         "name": row[1],
         "path": row[2],
         "protected_refs": _protected_refs(conn, row[0]),
+        "approvers": approvers_for_repository(conn, row[0]),
+        "separate_duties": bool(row[3]),
     }
 
 
@@ -203,3 +220,73 @@ def get_agent(conn: Connection, name: str) -> dict:
 def list_agents(conn: Connection) -> list[dict]:
     rows = conn.execute("SELECT id, name FROM agents ORDER BY name").fetchall()
     return [{"id": r[0], "name": r[1]} for r in rows]
+
+
+# ------------------------------------------------------------ approval policy
+
+
+def add_approver(conn: Connection, repository: str, agent: str) -> None:
+    """Add a registered agent to a repository's approver roster."""
+    begin_immediate(conn)
+    repo = get_repository(conn, repository)
+    member = get_agent(conn, agent)
+    if agent in repo["approvers"]:
+        raise RegistryError(
+            f"Agent {agent} is already an approver for repository {repository}."
+        )
+    conn.execute(
+        "INSERT INTO repository_approvers (repository_id, agent_id) VALUES (?, ?)",
+        (repo["id"], member["id"]),
+    )
+    audit.record(
+        conn,
+        "repository.approver_added",
+        "repository",
+        repo["id"],
+        agent=agent,
+        detail={"repository": repository, "approver": agent},
+    )
+
+
+def remove_approver(conn: Connection, repository: str, agent: str) -> None:
+    """Remove an agent from a repository's approver roster.
+
+    Votes the agent already cast stay on record but stop counting: quorum is
+    re-evaluated against the current roster whenever an approval is used.
+    """
+    begin_immediate(conn)
+    repo = get_repository(conn, repository)
+    member = get_agent(conn, agent)
+    cur = conn.execute(
+        "DELETE FROM repository_approvers WHERE repository_id = ? AND agent_id = ?",
+        (repo["id"], member["id"]),
+    )
+    if cur.rowcount != 1:
+        raise RegistryError(
+            f"Agent {agent} is not an approver for repository {repository}."
+        )
+    audit.record(
+        conn,
+        "repository.approver_removed",
+        "repository",
+        repo["id"],
+        agent=agent,
+        detail={"repository": repository, "approver": agent},
+    )
+
+
+def set_separate_duties(conn: Connection, repository: str, enabled: bool) -> None:
+    """Toggle the rule that an agent may not approve its own operations."""
+    begin_immediate(conn)
+    repo = get_repository(conn, repository)
+    conn.execute(
+        "UPDATE repositories SET separate_duties = ? WHERE id = ?",
+        (1 if enabled else 0, repo["id"]),
+    )
+    audit.record(
+        conn,
+        "repository.policy_changed",
+        "repository",
+        repo["id"],
+        detail={"repository": repository, "separate_duties": enabled},
+    )
