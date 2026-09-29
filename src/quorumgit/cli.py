@@ -444,8 +444,16 @@ def cmd_hook_pre_receive(args, cfg) -> int:
 
 def cmd_hook_reference_transaction(args, cfg) -> int:
     if not store.database_path(cfg).exists():
-        # A governed push cannot reach here without a store: its pre-receive
-        # needed one. Without one this is local ref maintenance.
+        # Without a store, only unidentified local ref maintenance may pass.
+        # Every push is identified (pre-receive requires it), so a store that
+        # vanished after pre-receive must not wave its update through.
+        if args.state == "prepared" and cfg.agent:
+            print(
+                "[quorumgit] REJECTED: the store is missing; cannot re-validate "
+                f"this update by {cfg.agent}.",
+                file=sys.stderr,
+            )
+            return 1
         return 0
     try:
         conn = store.connect(cfg)

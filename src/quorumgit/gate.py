@@ -688,26 +688,50 @@ def _prepare_updates(
     pusher: str | None,
     updates: list[tuple[str, str, str]],
 ) -> None:
-    """Re-validate and authorize validated updates while Git holds the locks."""
-    begin_immediate(conn)
+    """Re-validate and authorize validated updates while Git holds the locks.
+
+    Only an unidentified transaction with no matching validation is local ref
+    maintenance. An identified one (every push carries QUORUMGIT_AGENT, which
+    pre-receive requires) must match a fresh validation, or it is rejected:
+    an expired or missing record never downgrades a push to pass-through.
+    """
     repo = get_repository(conn, repository)
+    governed = []
+    # Classify without the write reservation, so pass-through maintenance
+    # never waits on (or deadlocks with) a command holding the store.
     for oldrev, newrev, refname in updates:
+        if not refname.startswith("refs/"):
+            # A symbolic ref such as HEAD is listed alongside the ref it
+            # points to; that ref appears as its own line and is governed
+            # there. Pushes only ever name refs under refs/.
+            continue
+        found = _find_update(conn, repo["id"], "validated", oldrev, newrev, refname)
+        if found is not None:
+            governed.append((oldrev, newrev, refname))
+            continue
+        if pusher is not None:
+            raise PushRejected(
+                f"Update of {refname} to {newrev} by {pusher} has no current "
+                "pre-receive validation; push it again."
+            )
+        stray = conn.execute(
+            "SELECT id FROM ref_updates WHERE repository_id = ? "
+            "AND refname = ? AND status = 'validated' "
+            "AND created_at >= unixepoch() - ? LIMIT 1",
+            (repo["id"], refname, VALIDATION_TTL_SECONDS),
+        ).fetchone()
+        if stray is not None:
+            raise PushRejected(
+                f"Update of {refname} to {newrev} does not match the update "
+                "pre-receive validated."
+            )
+    if not governed:
+        return
+    begin_immediate(conn)
+    for oldrev, newrev, refname in governed:
         found = _find_update(conn, repo["id"], "validated", oldrev, newrev, refname)
         if found is None:
-            stray = conn.execute(
-                "SELECT id FROM ref_updates WHERE repository_id = ? "
-                "AND refname = ? AND status = 'validated' "
-                "AND created_at >= unixepoch() - ? LIMIT 1",
-                (repo["id"], refname, VALIDATION_TTL_SECONDS),
-            ).fetchone()
-            if stray is not None:
-                raise PushRejected(
-                    f"Update of {refname} to {newrev} does not match the update "
-                    "pre-receive validated."
-                )
-            # Not a governed push (pre-receive records every update it
-            # accepts): local ref maintenance in the hub passes through.
-            continue
+            raise PushRejected(f"Update of {refname} changed while being prepared.")
         update_id, validated_old, validated_pusher, _ = found
         if pusher != validated_pusher:
             raise PushRejected(
@@ -1056,6 +1080,13 @@ def _require_reference_transaction_hook(conn: Connection, repository: str) -> No
         raise PushRejected(
             f"The QuorumGit reference-transaction hook is missing or modified at "
             f"{hook_path}; run `quorumgit hook install --repo {repository}`."
+        )
+    # Git silently ignores a hook that is not an executable regular file.
+    if not hook_path.is_file() or not os.access(hook_path, os.X_OK):
+        raise PushRejected(
+            f"The QuorumGit reference-transaction hook at {hook_path} is not "
+            f"executable, so Git would skip it; run `quorumgit hook install "
+            f"--repo {repository}`."
         )
 
 

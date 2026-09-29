@@ -512,3 +512,94 @@ def test_doctor_cli_reports_stuck_updates(committed_conn, tmp_path, cfg, monkeyp
     assert result.returncode == 1
     assert f"ref update {update_id} " in result.stdout
     assert "stuck_prepared (git aborted) — detected" in result.stdout
+
+
+# ------------------------------------------- review: fail-closed transactions
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows has no executable bit")
+def test_push_requires_an_executable_transaction_hook(committed_conn, tmp_path, cfg):
+    conn = committed_conn
+    _repo_name, hub, clone, a, _b = _setup(conn, tmp_path)
+    (hub / "hooks" / "reference-transaction").chmod(0o644)
+    _commit(clone, "docs/noexec.md", branch="feat/noexec")
+    rejected = _push(clone, a, "feat/noexec", cfg=cfg)
+    assert rejected.returncode != 0
+    assert "not executable" in rejected.stderr
+
+
+def test_identified_transaction_needs_a_fresh_validation(
+    committed_conn, tmp_path, monkeypatch
+):
+    conn = committed_conn
+    repo_name, hub, clone, a, _b = _setup(conn, tmp_path)
+    _commit(clone, "docs/slow.md", branch="feat/slow")
+    newrev = _rev(["-C", str(clone)], "HEAD")
+    zero = "0" * 40
+    conn.execute(
+        "INSERT INTO ref_updates (repository_id, refname, oldrev, newrev, "
+        "pusher_agent_id, created_at) VALUES (?, 'refs/heads/feat/slow', ?, ?, ?, "
+        "unixepoch() - ?)",
+        (
+            registry.get_repository(conn, repo_name)["id"],
+            zero,
+            newrev,
+            registry.get_agent(conn, a)["id"],
+            gate.VALIDATION_TTL_SECONDS + 60,
+        ),
+    )
+    conn.commit()
+    monkeypatch.chdir(hub)
+    monkeypatch.setenv("GIT_DIR", ".")
+    line = [f"{zero} {newrev} refs/heads/feat/slow\n"]
+
+    # A push delayed past the validation window is rejected, not waved through.
+    monkeypatch.setenv("QUORUMGIT_AGENT", a)
+    assert gate.run_reference_transaction(conn, repo_name, "prepared", line) == 1
+    other = [f"{zero} {newrev} refs/heads/feat/never-validated\n"]
+    assert gate.run_reference_transaction(conn, repo_name, "prepared", other) == 1
+
+    # Only unidentified transactions are local maintenance.
+    monkeypatch.delenv("QUORUMGIT_AGENT")
+    assert gate.run_reference_transaction(conn, repo_name, "prepared", other) == 0
+
+
+def test_identified_local_ref_change_in_the_hub_is_rejected(
+    committed_conn, tmp_path, cfg
+):
+    _repo_name, hub, _clone, a, _b = _setup(committed_conn, tmp_path)
+    head = _rev(["--git-dir", str(hub)], "refs/heads/main")
+    env = {**os.environ, "QUORUMGIT_DATA_DIR": str(cfg.data_dir), "QUORUMGIT_AGENT": a}
+    env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env["PATH"]
+    result = subprocess.run(
+        ["git", "--git-dir", str(hub), "update-ref", "refs/heads/sneaky", head],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "no current pre-receive validation" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("agent", "state", "code"),
+    [("someone", "prepared", 1), (None, "prepared", 0), ("someone", "committed", 0)],
+)
+def test_missing_store_fails_closed_only_for_identified_prepare(
+    tmp_path, agent, state, code
+):
+    env = {**os.environ, "QUORUMGIT_DATA_DIR": str(tmp_path / "vanished")}
+    env.pop("QUORUMGIT_AGENT", None)
+    if agent:
+        env["QUORUMGIT_AGENT"] = agent
+    result = subprocess.run(
+        [sys.executable, "-m", "quorumgit", "hook", "reference-transaction",
+         "--repo", "any", state],
+        input=f"{'0' * 40} {'1' * 40} refs/heads/x\n",
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == code, result.stderr
