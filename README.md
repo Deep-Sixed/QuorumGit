@@ -8,7 +8,7 @@ QuorumGit prevents coding agents (or humans) working the same codebase from step
 agent-one ──┐
 agent-two ──┼──► quorumgit CLI ──► local libSQL file (claims, leases, approvals, audit)
 reviewer  ──┘                          │
-                                       └──► git pre-receive hook (push enforcement)
+                                       └──► git pre-receive + reference-transaction hooks (push enforcement)
 ```
 
 ## The problem it solves
@@ -41,7 +41,7 @@ Everything an agent does — claim, renew, checkpoint, hand off, release — wri
 
 ## Installation
 
-Requirements: **Python 3.11–3.14**, **git**. There is no database to install, no server to run, and no extension to provision: the store is a single [libSQL](https://github.com/tursodatabase/libsql-python) database file under `QUORUMGIT_DATA_DIR`.
+Requirements: **Python 3.11–3.14**, **git 2.28+** (for the reference-transaction hook). There is no database to install, no server to run, and no extension to provision: the store is a single [libSQL](https://github.com/tursodatabase/libsql-python) database file under `QUORUMGIT_DATA_DIR`.
 
 > **Platform note.** Linux, macOS, and Windows are supported. `libsql` 0.1.11 publishes a prebuilt wheel for CPython 3.11–3.13 on all three, and for CPython 3.14 on Linux only — on macOS 3.14 pip builds the extension from source (needs a Rust toolchain), and on Windows 3.14 that build does not currently succeed. Use 3.11–3.13 on Windows until upstream ships a 3.14 wheel.
 
@@ -58,11 +58,11 @@ Then initialize the store once:
 ```bash
 $ quorumgit init
 store: /home/you/.quorumgit/quorumgit.db
-migrations applied: ['001_core.sql', '002_approval_identities.sql']
+migrations applied: ['001_core.sql', '002_approval_identities.sql', '003_ref_updates.sql']
 contract: ok
 ```
 
-`init` creates the state directory, applies migrations, and verifies the runtime contract (required tables, foreign keys on, WAL journal mode). It is idempotent — re-run it any time.
+`init` creates the state directory, applies migrations, and verifies the runtime contract: required tables and migrations, foreign keys on, WAL journal mode, and **every schema object the governance rules depend on**. The expected schema is derived by replaying the bundled migrations in memory, so a store whose append-only audit triggers, single-owner/single-live-approval unique indexes, or identity triggers are missing or altered — or that carries extra indexes or triggers — fails the contract instead of silently losing an invariant. Every command runs this check. It is idempotent — re-run it any time.
 
 `quorumgit status` shows the store URI, contract state, and row counts. If the store is down or incomplete, every command exits non-zero: there is **one storage backend and no fallback**, by design.
 
@@ -132,7 +132,7 @@ Where the registered repository sits determines how enforcement works. Pick one 
 
 **Local model** — the registered repo is a working checkout on the same machine. Claims create isolated worktrees; agents commit directly in them. Coordination is entirely claim-based; no pushes, no hook needed. This is the default and the simplest setup — the quick start above is the local model.
 
-**Hub model** — the registered repo is a **bare** hub that agents push to from their own clones. Enforcement moves to a pre-receive hook:
+**Hub model** — the registered repo is a **bare** hub that agents push to from their own clones. Enforcement moves to a pair of Git hooks:
 
 ```bash
 git clone --bare /path/to/source myproject.git
@@ -150,6 +150,8 @@ QUORUMGIT_AGENT=agent-one git push origin feat/x    # accepted — owner
 QUORUMGIT_AGENT=agent-two git push origin feat/x    # rejected — branch is claimed
 git push origin feat/x                              # rejected — unidentified
 ```
+
+**Authorization is bound to the ref update itself.** `pre-receive` checks the push and records each exact ref update it accepted, but spends nothing. Git's `reference-transaction` hook then runs at the `prepared` stage — after Git has locked the refs and while it can still abort — re-checks every rule against the store's current state, and only then consumes any approval. If ownership changed after `pre-receive` (a release, takeover, or handoff), the update is aborted. If Git refuses the update after `pre-receive` (another hook, a lost ref lock), no approval is spent; if Git aborts after `prepared`, the consumed approval is restored. The `committed`/`aborted` outcome of every governed update is recorded. `pre-receive` refuses pushes when the transaction hook is missing or modified, and ref transactions that no push validated (local maintenance in the hub) pass through.
 
 **Scopes are enforced at push time.** When a branch has a live claim, every commit the push introduces must only touch paths inside that claim's scopes (`**` spans directories, `*` stays within one; a scope without wildcards covers that file or directory). Merge commits count only the paths the merge itself changed, so merging the base branch in is not attributed to the claim holder. In the local model agents commit directly in their worktree, so no hook runs and scopes remain coordination metadata.
 
@@ -173,7 +175,7 @@ quorumgit approve request '{"type":"protected_ref_update","repository":"myprojec
 quorumgit approve vote 17 --agent operator
 
 # 3. The same push now lands. Pushing it again — or replaying the approval — is rejected:
-#    the approval was consumed atomically when the operation was accepted.
+#    the approval was consumed while Git held the ref lock, as the update committed.
 ```
 
 Rules that hold no matter what:
@@ -211,7 +213,7 @@ Takeovers follow the same pattern: claiming a task someone else holds (`claim <t
 | `quorumgit approve request <json> [--threshold <n>]` | Open an approval for an exact operation |
 | `quorumgit approve vote <approval-id> [--deny]` | Vote on one approval instance |
 | `quorumgit approve hash <json>` | Compute an operation's hash |
-| `quorumgit hook install --repo <name>` | Install the pre-receive hook (hub model) |
+| `quorumgit hook install --repo <name>` | Install the pre-receive and reference-transaction hooks (hub model) |
 | `quorumgit audit [--entity <e>] [--entity-id <id>] [--limit <n>]` | Read the audit trail |
 
 `repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
@@ -241,7 +243,7 @@ QuorumGit v1 coordinates **cooperating agents**; the adversary is *accident, not
 
 - Agent identity is asserted (`QUORUMGIT_AGENT`), not cryptographically authenticated. Any local process can claim to be any agent.
 - The trust root is write access to the database and the filesystem. An actor with either can bypass governance.
-- The pre-receive hook governs `git push` only. Direct ref manipulation inside a repository bypasses it.
+- The hooks govern `git push` only. Direct ref manipulation inside a repository bypasses them.
 - Approval hashes provide exact-payload binding and tamper-evidence, not approver authentication.
 
 These are the correct trade-offs for preventing well-intentioned agents from colliding on one machine. They are not Byzantine fault tolerance, and this document will not pretend otherwise.

@@ -414,14 +414,32 @@ def cmd_approve_hash(args, cfg) -> int:
 def cmd_hook_install(args, cfg) -> int:
     with store.connect(cfg) as conn:
         path = gate.install_hook(conn, args.repo)
+        repo_path = registry.get_repository(conn, args.repo)["path"]
         conn.commit()
     print(f"pre-receive hook installed: {path}")
+    print("reference-transaction hook installed: "
+          f"{gate._effective_hook(repo_path, 'reference-transaction')}")
     return 0
 
 
 def cmd_hook_pre_receive(args, cfg) -> int:
     with store.connect(cfg) as conn:
         return gate.run_pre_receive(conn, args.repo, sys.stdin)
+
+
+def cmd_hook_reference_transaction(args, cfg) -> int:
+    if not store.database_path(cfg).exists():
+        # A governed push cannot reach here without a store: its pre-receive
+        # needed one. Without one this is local ref maintenance.
+        return 0
+    try:
+        conn = store.connect(cfg)
+    except store.StoreError as exc:
+        label = "REJECTED" if args.state == "prepared" else f"WARNING ({args.state})"
+        print(f"[quorumgit] {label}: {exc}", file=sys.stderr)
+        return 1
+    with conn:
+        return gate.run_reference_transaction(conn, args.repo, args.state, sys.stdin)
 
 
 # -------------------------------------------------------------------- audit
@@ -563,6 +581,10 @@ def build_parser() -> argparse.ArgumentParser:
         lambda sp: sp.add_argument("--repo", required=True), parent=hook)
     add("pre-receive", cmd_hook_pre_receive,
         lambda sp: sp.add_argument("--repo", required=True), parent=hook)
+    add("reference-transaction", cmd_hook_reference_transaction, lambda sp: (
+        sp.add_argument("--repo", required=True),
+        sp.add_argument("state"),
+    ), parent=hook)
 
     add("audit", cmd_audit, lambda sp: (
         sp.add_argument("--entity"),

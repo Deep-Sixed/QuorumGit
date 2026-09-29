@@ -7,6 +7,7 @@ operation payload. Enforcement is fail-closed: any hook error rejects the push.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -447,7 +448,29 @@ def _verify_repository_binding(
     return repo
 
 
-def check_ref_update(
+def _required_approval(
+    conn: Connection, operation: dict[str, Any], pusher: str
+) -> dict:
+    """The approval that authorizes `operation` for `pusher`, or PushRejected."""
+    approval = approved_instance(conn, operation)
+    if approval is None:
+        raise PushRejected(
+            f"{operation['type']} on {operation['refname']} requires an approval "
+            f"bound to this exact update (hash {operation_hash(operation)})."
+        )
+    independent = _independent_yes_votes(
+        conn, approval["id"], get_agent(conn, pusher)["id"]
+    )
+    if independent < approval["threshold"]:
+        raise PushRejected(
+            f"Approval {approval['id']} needs {approval['threshold']} approving "
+            f"vote(s) from agents other than {pusher}, who is pushing; it has "
+            f"{independent}. An agent cannot authorize its own operation."
+        )
+    return approval
+
+
+def evaluate_ref_update(
     conn: Connection,
     repository: str,
     git_dir: str,
@@ -455,8 +478,14 @@ def check_ref_update(
     oldrev: str,
     newrev: str,
     refname: str,
-) -> None:
-    """Enforce governance for one ref update. Raises PushRejected."""
+) -> tuple[dict, dict[str, Any] | None, dict | None]:
+    """Apply every push rule to one ref update without changing any state.
+
+    Returns (repository, protected operation or None, its approval or None).
+    Raises PushRejected. Runs twice per governed update: in pre-receive, and
+    again at the reference transaction's `prepared` stage against the state
+    current while Git holds the ref locks.
+    """
     repo = _verify_repository_binding(conn, repository, git_dir)
     branch = refname.removeprefix("refs/heads/")
 
@@ -484,42 +513,72 @@ def check_ref_update(
         and not _is_zero(oldrev)
         and not _is_fast_forward(git_dir, oldrev, newrev)
     )
+    if not (protected or deletion or forced):
+        return repo, None, None
 
-    if protected or deletion or forced:
-        operation = {
-            "type": "protected_ref_update"
-            if protected
-            else ("ref_delete" if deletion else "force_update"),
-            "repository": repository,
+    operation = {
+        "type": "protected_ref_update"
+        if protected
+        else ("ref_delete" if deletion else "force_update"),
+        "repository": repository,
+        "refname": refname,
+        "oldrev": oldrev,
+        "newrev": newrev,
+    }
+    if pusher is None:
+        raise PushRejected("Pusher identity required for a protected update.")
+    return repo, operation, _required_approval(conn, operation, pusher)
+
+
+def check_ref_update(
+    conn: Connection,
+    repository: str,
+    git_dir: str,
+    pusher: str,
+    oldrev: str,
+    newrev: str,
+    refname: str,
+) -> None:
+    """pre-receive: validate one ref update and record it for its transaction.
+
+    Nothing is consumed here. Git may still refuse the update after
+    pre-receive (another hook, a lost ref lock), so the approval is only spent
+    once Git has locked the ref, in the reference-transaction hook.
+    """
+    repo, operation, approval = evaluate_ref_update(
+        conn, repository, git_dir, pusher, oldrev, newrev, refname
+    )
+    row = conn.execute(
+        """
+        INSERT INTO ref_updates (
+            repository_id, refname, oldrev, newrev, pusher_agent_id, operation
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        RETURNING id
+        """,
+        (
+            repo["id"],
+            refname,
+            oldrev,
+            newrev,
+            get_agent(conn, pusher)["id"],
+            json_dumps(operation) if operation else None,
+        ),
+    ).fetchone()
+    assert row is not None
+    audit.record(
+        conn,
+        "gate.update_validated",
+        "ref_update",
+        row[0],
+        agent=pusher,
+        detail={
             "refname": refname,
             "oldrev": oldrev,
             "newrev": newrev,
-        }
-        approval = approved_instance(conn, operation)
-        if approval is None:
-            raise PushRejected(
-                f"{operation['type']} on {refname} requires an approval "
-                f"bound to this exact update (hash {operation_hash(operation)})."
-            )
-        assert pusher is not None
-        consume_approval(conn, approval["id"], operation, agent=pusher)
-        audit.record(
-            conn,
-            "gate.protected_update_allowed",
-            "repository",
-            repo["id"],
-            agent=pusher,
-            detail=operation,
-        )
-        return
-
-    audit.record(
-        conn,
-        "gate.update_allowed",
-        "repository",
-        repo["id"],
-        agent=pusher,
-        detail={"refname": refname, "oldrev": oldrev, "newrev": newrev},
+            "operation": operation,
+            "approval_id": approval["id"] if approval else None,
+        },
     )
 
 
@@ -553,6 +612,9 @@ def run_pre_receive(
             check_ref_update(conn, repository, git_dir, pusher, *parts)
         if not saw_update:
             raise PushRejected("No ref updates supplied on stdin.")
+        # Without the transaction hook nothing would re-validate at update
+        # time or consume approvals, so a missing one must reject the push.
+        _require_reference_transaction_hook(conn, repository)
     except Exception as exc:  # fail closed on anything
         conn.rollback()
         print(f"[quorumgit] REJECTED: {exc}", file=sys.stderr)
@@ -562,10 +624,248 @@ def run_pre_receive(
     return 0
 
 
-def _effective_pre_receive_hook(repository_path: str | Path) -> Path:
+# ------------------------------------------------------ reference transaction
+
+TRANSACTION_STATES = ("prepared", "committed", "aborted")
+# pre-receive and the reference transaction run seconds apart. A validation
+# older than this is stale (Git refused the update after pre-receive) and is
+# never matched against a later transaction.
+VALIDATION_TTL_SECONDS = 300
+
+
+def _parse_updates(stdin_lines: Iterable[str]) -> list[tuple[str, str, str]]:
+    updates = []
+    for line in stdin_lines:
+        parts = line.split()
+        if not parts:
+            continue
+        if len(parts) != 3:
+            raise PushRejected(f"Malformed reference-transaction input: {line!r}")
+        updates.append((parts[0], parts[1], parts[2]))
+    return updates
+
+
+def _find_update(
+    conn: Connection,
+    repository_id: int,
+    status: str,
+    oldrev: str,
+    newrev: str,
+    refname: str,
+) -> tuple | None:
+    """The newest recorded update matching one transaction line.
+
+    Git reports the zero OID as the old value when a transaction does not
+    check it, so a zero old value matches any recorded one.
+    """
+    return conn.execute(
+        """
+        SELECT u.id, u.oldrev, a.name, u.approval_id
+        FROM ref_updates u JOIN agents a ON a.id = u.pusher_agent_id
+        WHERE u.repository_id = ? AND u.status = ? AND u.refname = ?
+          AND u.newrev = ? AND (u.oldrev = ? OR ?)
+          AND u.created_at >= unixepoch() - ?
+        ORDER BY u.id DESC
+        LIMIT 1
+        """,
+        (
+            repository_id,
+            status,
+            refname,
+            newrev,
+            oldrev,
+            1 if _is_zero(oldrev) else 0,
+            VALIDATION_TTL_SECONDS,
+        ),
+    ).fetchone()
+
+
+def _prepare_updates(
+    conn: Connection,
+    repository: str,
+    git_dir: str,
+    pusher: str | None,
+    updates: list[tuple[str, str, str]],
+) -> None:
+    """Re-validate and authorize validated updates while Git holds the locks."""
+    begin_immediate(conn)
+    repo = get_repository(conn, repository)
+    for oldrev, newrev, refname in updates:
+        found = _find_update(conn, repo["id"], "validated", oldrev, newrev, refname)
+        if found is None:
+            stray = conn.execute(
+                "SELECT id FROM ref_updates WHERE repository_id = ? "
+                "AND refname = ? AND status = 'validated' "
+                "AND created_at >= unixepoch() - ? LIMIT 1",
+                (repo["id"], refname, VALIDATION_TTL_SECONDS),
+            ).fetchone()
+            if stray is not None:
+                raise PushRejected(
+                    f"Update of {refname} to {newrev} does not match the update "
+                    "pre-receive validated."
+                )
+            # Not a governed push (pre-receive records every update it
+            # accepts): local ref maintenance in the hub passes through.
+            continue
+        update_id, validated_old, validated_pusher, _ = found
+        if pusher != validated_pusher:
+            raise PushRejected(
+                f"Update of {refname} was validated for {validated_pusher}, "
+                f"not {pusher or 'an unidentified pusher'}."
+            )
+        _, operation, approval = evaluate_ref_update(
+            conn, repository, git_dir, pusher, validated_old, newrev, refname
+        )
+        if operation is not None:
+            assert approval is not None and pusher is not None
+            consume_approval(conn, approval["id"], operation, agent=pusher)
+        cur = conn.execute(
+            "UPDATE ref_updates SET status = 'prepared', operation = ?, "
+            "approval_id = ? WHERE id = ? AND status = 'validated'",
+            (
+                json_dumps(operation) if operation else None,
+                approval["id"] if approval else None,
+                update_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise PushRejected(f"Update of {refname} changed while being prepared.")
+        audit.record(
+            conn,
+            "gate.update_prepared",
+            "ref_update",
+            update_id,
+            agent=pusher,
+            detail={
+                "refname": refname,
+                "oldrev": validated_old,
+                "newrev": newrev,
+                "approval_id": approval["id"] if approval else None,
+            },
+        )
+
+
+def _restore_approval(conn: Connection, update_id: int, approval_id: int) -> None:
+    """Return an approval consumed for an update Git then aborted."""
+    try:
+        cur = conn.execute(
+            "UPDATE approvals SET status = 'approved', consumed_at = NULL, "
+            "consumed_by_agent_id = NULL WHERE id = ? AND status = 'consumed'",
+            (approval_id,),
+        )
+    except ValueError as exc:  # libSQL constraint failure
+        # A newer live instance for the same operation now exists; the old
+        # one stays consumed rather than creating two live approvals.
+        audit.record(
+            conn,
+            "approval.restore_skipped",
+            "approval",
+            approval_id,
+            detail={"ref_update_id": update_id, "reason": str(exc)},
+        )
+        return
+    if cur.rowcount == 1:
+        audit.record(
+            conn,
+            "approval.restored",
+            "approval",
+            approval_id,
+            detail={"ref_update_id": update_id},
+        )
+
+
+def _resolve_updates(
+    conn: Connection,
+    repository: str,
+    state: str,
+    updates: list[tuple[str, str, str]],
+) -> None:
+    begin_immediate(conn)
+    repo = get_repository(conn, repository)
+    for oldrev, newrev, refname in updates:
+        statuses = ("prepared",) if state == "committed" else ("prepared", "validated")
+        for status in statuses:
+            found = _find_update(conn, repo["id"], status, oldrev, newrev, refname)
+            if found is None:
+                continue
+            update_id, _, pusher, approval_id = found
+            conn.execute(
+                "UPDATE ref_updates SET status = ?, resolved_at = unixepoch() "
+                "WHERE id = ? AND status = ?",
+                (state, update_id, status),
+            )
+            if state == "aborted" and approval_id is not None:
+                _restore_approval(conn, update_id, approval_id)
+            audit.record(
+                conn,
+                f"gate.update_{state}",
+                "ref_update",
+                update_id,
+                agent=pusher,
+                detail={"refname": refname, "newrev": newrev},
+            )
+            break
+
+
+def run_reference_transaction(
+    conn: Connection, repository: str, state: str, stdin_lines: Iterable[str]
+) -> int:
+    """Hook entry point for Git's reference-transaction hook.
+
+    `prepared` is the authoritative gate: its failure makes Git abort the
+    transaction, so it fails closed. Git ignores the exit status of
+    `committed` and `aborted`; they only record the outcome.
+    """
+    if state not in TRANSACTION_STATES:
+        return 0
+    git_dir = os.environ.get("GIT_DIR") or "."
+    pusher = os.environ.get("QUORUMGIT_AGENT") or None
+    try:
+        updates = _parse_updates(stdin_lines)
+        if state == "prepared":
+            _prepare_updates(conn, repository, git_dir, pusher, updates)
+        else:
+            _resolve_updates(conn, repository, state, updates)
+    except Exception as exc:  # noqa: BLE001 — fail closed on anything
+        conn.rollback()
+        label = "REJECTED" if state == "prepared" else f"WARNING ({state})"
+        print(f"[quorumgit] {label}: {exc}", file=sys.stderr)
+        return 1
+    conn.commit()
+    return 0
+
+
+# ------------------------------------------------------------ hook install
+
+HOOK_NAMES = ("pre-receive", "reference-transaction")
+REFERENCE_TRANSACTION_MARKER = "# quorumgit-managed-reference-transaction v1"
+# The reference-transaction hook (with its prepared/committed/aborted states).
+MIN_GIT_VERSION = (2, 28)
+
+
+def _git_version() -> tuple[int, ...]:
+    result = subprocess.run(
+        ["git", "version"], capture_output=True, text=True, check=False
+    )
+    match = re.search(r"(\d+)\.(\d+)", result.stdout)
+    if result.returncode != 0 or match is None:
+        raise GateError("Unable to determine the Git version.")
+    return (int(match.group(1)), int(match.group(2)))
+
+
+def _require_git_version() -> None:
+    version = _git_version()
+    if version < MIN_GIT_VERSION:
+        raise GateError(
+            f"Git {'.'.join(map(str, version))} lacks the reference-transaction "
+            f"hook; QuorumGit needs Git {'.'.join(map(str, MIN_GIT_VERSION))} or newer."
+        )
+
+
+def _effective_hook(repository_path: str | Path, name: str) -> Path:
     repo_path = Path(repository_path).resolve()
     result = subprocess.run(
-        ["git", "-C", str(repo_path), "rev-parse", "--git-path", "hooks/pre-receive"],
+        ["git", "-C", str(repo_path), "rev-parse", "--git-path", f"hooks/{name}"],
         capture_output=True,
         text=True,
     )
@@ -575,11 +875,15 @@ def _effective_pre_receive_hook(repository_path: str | Path) -> Path:
         raise GateError(f"Unable to resolve Git hook path for {repo_path}{suffix}")
     raw = result.stdout.strip()
     if not raw:
-        raise GateError(f"Git returned no pre-receive hook path for {repo_path}")
+        raise GateError(f"Git returned no {name} hook path for {repo_path}")
     hook_path = Path(raw)
     if not hook_path.is_absolute():
         hook_path = repo_path / hook_path
     return hook_path.resolve()
+
+
+def _effective_pre_receive_hook(repository_path: str | Path) -> Path:
+    return _effective_hook(repository_path, "pre-receive")
 
 
 def _hook_script(repository: str, executable: str | None = None) -> str:
@@ -592,6 +896,22 @@ def _hook_script(repository: str, executable: str | None = None) -> str:
     )
 
 
+def _reference_transaction_script(
+    repository: str, executable: str | None = None
+) -> str:
+    python = executable or sys.executable
+    return (
+        "#!/bin/sh\n"
+        f"{REFERENCE_TRANSACTION_MARKER}\n"
+        'case "$1" in\n'
+        "prepared|committed|aborted) ;;\n"
+        "*) cat >/dev/null; exit 0 ;;\n"
+        "esac\n"
+        f"exec {shlex.quote(python)} -m quorumgit hook reference-transaction "
+        f'--repo {shlex.quote(repository)} "$1"\n'
+    )
+
+
 def _legacy_hook_script(repository: str) -> str:
     """Exact pre-PR6 hook shape, recognized only for safe in-place upgrade."""
     return (
@@ -599,6 +919,29 @@ def _legacy_hook_script(repository: str) -> str:
         f'exec "{sys.executable}" -m quorumgit hook pre-receive '
         f'--repo "{repository}"\n'
     )
+
+
+def _hook_plan(repository: str, name: str) -> tuple[str, str, tuple[str, ...]]:
+    """(expected content, ownership marker, upgradeable legacy contents)."""
+    if name == "pre-receive":
+        return _hook_script(repository), HOOK_MARKER, (_legacy_hook_script(repository),)
+    return _reference_transaction_script(repository), REFERENCE_TRANSACTION_MARKER, ()
+
+
+def _require_reference_transaction_hook(conn: Connection, repository: str) -> None:
+    _require_git_version()
+    repo = get_repository(conn, repository)
+    hook_path = _effective_hook(repo["path"], "reference-transaction")
+    expected, _, _ = _hook_plan(repository, "reference-transaction")
+    try:
+        installed = hook_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        installed = None
+    if installed != expected:
+        raise PushRejected(
+            f"The QuorumGit reference-transaction hook is missing or modified at "
+            f"{hook_path}; run `quorumgit hook install --repo {repository}`."
+        )
 
 
 def _write_hook_atomically(hook_path: Path, content: str) -> None:
@@ -623,63 +966,70 @@ def _write_hook_atomically(hook_path: Path, content: str) -> None:
             pass
 
 
-def install_hook(conn: Connection, repository: str) -> Path:
-    """Safely install QuorumGit at Git's effective pre-receive hook path.
+def _inspect_hook(hook_path: Path, expected: str, marker: str, legacy: tuple[str, ...]) -> str:
+    """Decide what installing over `hook_path` means; refuse foreign content."""
+    if not hook_path.exists():
+        return "installed"
+    try:
+        existing = hook_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise GateError(f"Cannot inspect existing hook {hook_path}: {exc}") from exc
+    if existing == expected:
+        return "verified"
+    if existing in legacy:
+        return "upgraded"
+    if marker in existing.splitlines()[:3]:
+        raise GateError(
+            f"Existing QuorumGit-managed hook differs at {hook_path}; "
+            "refusing to overwrite it."
+        )
+    raise GateError(
+        f"Existing hook at {hook_path} is not owned by QuorumGit; refusing to "
+        "overwrite or silently chain it."
+    )
 
-    Existing unrelated hooks are never overwritten or silently chained. An
+
+def install_hook(conn: Connection, repository: str) -> Path:
+    """Safely install QuorumGit's pre-receive and reference-transaction hooks.
+
+    Both go at Git's effective hook paths. Existing unrelated hooks are never
+    overwritten or silently chained, and every existing hook is inspected
+    before anything is written, so a refusal leaves both paths untouched. An
     exact current QuorumGit hook is idempotent; an exact legacy QuorumGit hook
-    for the same repository is upgraded in place. Any other existing content
-    is refused so operators must make coexistence explicit.
+    for the same repository is upgraded in place. Returns the pre-receive path.
     """
     begin_immediate(conn)
+    _require_git_version()
     repo = get_repository(conn, repository)
     common_dir = assert_repository_identity_unique(conn, repo)
-    hook_path = _effective_pre_receive_hook(repo["path"])
-    expected = _hook_script(repository)
-    action = "installed"
 
-    if hook_path.exists():
-        try:
-            existing = hook_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as exc:
-            raise GateError(
-                f"Cannot inspect existing pre-receive hook {hook_path}: {exc}"
-            ) from exc
-        if existing == expected:
-            hook_path.chmod(0o755)
-            action = "verified"
-        elif existing == _legacy_hook_script(repository):
-            _write_hook_atomically(hook_path, expected)
-            action = "upgraded"
-        elif HOOK_MARKER in existing.splitlines()[:3]:
-            raise GateError(
-                f"Existing QuorumGit-managed pre-receive hook differs at "
-                f"{hook_path}; refusing to overwrite it."
-            )
-        else:
-            raise GateError(
-                f"Existing pre-receive hook at {hook_path} is not owned by "
-                "QuorumGit; refusing to overwrite or silently chain it."
-            )
-    else:
-        _write_hook_atomically(hook_path, expected)
-
-    effective = _effective_pre_receive_hook(repo["path"])
-    if effective != hook_path or not hook_path.exists():
-        raise GateError(
-            f"Installed hook is not Git's effective pre-receive hook: {hook_path}"
+    plans = []
+    for name in HOOK_NAMES:
+        expected, marker, legacy = _hook_plan(repository, name)
+        hook_path = _effective_hook(repo["path"], name)
+        plans.append(
+            (name, hook_path, expected, _inspect_hook(hook_path, expected, marker, legacy))
         )
-    if hook_path.read_text(encoding="utf-8") != expected:
-        raise GateError(f"Installed pre-receive hook failed verification: {hook_path}")
 
-    audit.record(
-        conn,
-        f"hook.{action}",
-        "repository",
-        repo["id"],
-        detail={
-            "path": str(hook_path),
-            "git_common_dir": str(common_dir),
-        },
-    )
-    return hook_path
+    for name, hook_path, expected, action in plans:
+        if action == "verified":
+            hook_path.chmod(0o755)
+        else:
+            _write_hook_atomically(hook_path, expected)
+        effective = _effective_hook(repo["path"], name)
+        if effective != hook_path or not hook_path.exists():
+            raise GateError(f"Installed hook is not Git's effective {name} hook: {hook_path}")
+        if hook_path.read_text(encoding="utf-8") != expected:
+            raise GateError(f"Installed {name} hook failed verification: {hook_path}")
+        audit.record(
+            conn,
+            f"hook.{action}",
+            "repository",
+            repo["id"],
+            detail={
+                "hook": name,
+                "path": str(hook_path),
+                "git_common_dir": str(common_dir),
+            },
+        )
+    return plans[0][1]

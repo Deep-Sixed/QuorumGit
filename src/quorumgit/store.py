@@ -7,7 +7,9 @@ external connection string, fallback store, or degraded mode.
 
 from __future__ import annotations
 
+import functools
 import json
+import re
 import time
 from importlib import import_module, resources
 from pathlib import Path
@@ -51,6 +53,14 @@ REQUIRED_TABLES = (
     "conflict_events",
     "audit_events",
 )
+
+# Kept byte-identical to the statement existing stores were created with.
+SCHEMA_MIGRATIONS_DDL = """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+            )
+            """
 
 
 class StoreError(RuntimeError):
@@ -248,14 +258,7 @@ def migrate(target: Config | str | Path) -> list[str]:
     applied: list[str] = []
     try:
         begin_immediate(conn)
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version TEXT PRIMARY KEY,
-                applied_at INTEGER NOT NULL DEFAULT (unixepoch())
-            )
-            """
-        )
+        conn.execute(SCHEMA_MIGRATIONS_DDL)
         conn.commit()
 
         done = {
@@ -292,6 +295,74 @@ def migrate(target: Config | str | Path) -> list[str]:
 
 
 # ------------------------------------------------------------ contract check
+
+
+def _normalized_sql(sql: str | None) -> str | None:
+    """Schema SQL with formatting-only whitespace removed."""
+    if sql is None:
+        return None
+    return re.sub(r" ?([(),;]) ?", r"\1", " ".join(sql.split()))
+
+
+def _schema_objects(conn: Connection) -> dict[tuple[str, str], tuple[str, str | None]]:
+    """Every user schema object as {(type, name): (table, normalized SQL)}."""
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%'"
+    ).fetchall()
+    return {(row[0], row[1]): (row[2], _normalized_sql(row[3])) for row in rows}
+
+
+@functools.lru_cache(maxsize=1)
+def _reference_schema() -> dict[tuple[str, str], tuple[str, str | None]]:
+    """The schema this QuorumGit build expects: every migration replayed in memory.
+
+    Deriving the fingerprint from the migrations themselves keeps it exact
+    without a hand-maintained list: each table, index (including the partial
+    unique indexes that enforce single ownership and single live approvals)
+    and trigger (including the append-only audit guards) must be present with
+    the same definition.
+    """
+    conn = libsql.connect(":memory:")
+    try:
+        conn.execute(SCHEMA_MIGRATIONS_DDL)
+        for mig in _migration_files():
+            for statement in _migration_statements(mig.read_text(encoding="utf-8")):
+                conn.execute(statement)
+        return _schema_objects(conn)
+    finally:
+        conn.close()
+
+
+def _describe(keys: set[tuple[str, str]]) -> str:
+    return ", ".join(f"{kind} {name}" for kind, name in sorted(keys))
+
+
+def _verify_schema_objects(conn: Connection) -> None:
+    expected = _reference_schema()
+    actual = _schema_objects(conn)
+    missing = set(expected) - set(actual)
+    changed = {
+        key for key in set(expected) & set(actual) if expected[key] != actual[key]
+    }
+    # Extra tables are inert data; an extra index or trigger can change what
+    # governance writes succeed or what they do, so it is a violation.
+    unexpected = {
+        key for key in set(actual) - set(expected) if key[0] != "table"
+    }
+    problems = []
+    if missing:
+        problems.append(f"missing {_describe(missing)}")
+    if changed:
+        problems.append(f"altered {_describe(changed)}")
+    if unexpected:
+        problems.append(f"unexpected {_describe(unexpected)}")
+    if problems:
+        raise ContractViolation(
+            "Store schema does not match this QuorumGit version: "
+            + "; ".join(problems)
+            + ". Governance invariants cannot be guaranteed."
+        )
 
 
 def verify_contract(target: Config | Connection | str | Path) -> None:
@@ -332,6 +403,13 @@ def verify_contract(target: Config | Connection | str | Path) -> None:
                 f"Missing required migrations: {sorted(missing_migrations)}. "
                 "Run `quorumgit init` to apply migrations."
             )
+        unknown_migrations = applied_migrations - required_migrations
+        if unknown_migrations:
+            raise ContractViolation(
+                f"Store has migrations this QuorumGit does not know: "
+                f"{sorted(unknown_migrations)}. It was written by a newer version."
+            )
+        _verify_schema_objects(conn)
 
         foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
         journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
