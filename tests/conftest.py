@@ -1,6 +1,6 @@
-"""Test fixtures: one throwaway local libSQL store and real temporary git repos.
+"""Test fixtures: one throwaway local SQLite store and real temporary git repos.
 
-Nothing is mocked — tests run against the actual libSQL engine and real git.
+Nothing is mocked — tests run against the actual SQLite engine and real git.
 """
 
 from __future__ import annotations

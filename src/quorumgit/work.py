@@ -115,9 +115,9 @@ def set_task_status(conn: Connection, task_id: int, status: str) -> None:
 def lock_task(conn: Connection, task_id: int) -> None:
     """Serialize ownership transitions before reading task state.
 
-    libSQL inherits SQLite's single-writer model. BEGIN IMMEDIATE acquires the
-    writer reservation for the whole governance transaction, replacing the
-    PostgreSQL row lock while also serializing cross-task branch/scope checks.
+    SQLite has a single-writer model. BEGIN IMMEDIATE acquires the writer
+    reservation for the whole governance transaction, which also serializes
+    cross-task branch/scope checks.
     """
     begin_immediate(conn)
     row = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()

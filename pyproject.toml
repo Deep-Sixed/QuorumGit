@@ -14,9 +14,8 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
 ]
-dependencies = [
-    "libsql==0.1.11",
-]
+# Storage is SQLite 3 via the standard-library sqlite3 module (SQLite >= 3.38).
+dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6", "pyright>=1.1.380"]
