@@ -37,6 +37,42 @@ LOCK_RETRY_INITIAL_SECONDS = 0.002
 LOCK_RETRY_MAX_SECONDS = 0.05
 MIGRATION_SEPARATOR = "-- quorumgit-statement"
 
+# libsql 0.1.11 closes the underlying SQLite handle twice whenever a
+# connection is torn down: dropping its inner LibsqlConnection calls
+# sqlite3Close and frees the handle, then the outer Connection's drop calls
+# sqlite3Close again on the freed memory (Valgrind: "Invalid read ... in
+# sqlite3Close ... inside a block free'd by sqlite3Close"). It happens on
+# explicit close() and on implicit garbage collection alike. Linux usually
+# tolerates the stray read; Windows intermittently fails it with 0xC0000005.
+# No newer libsql release exists, so short-lived CLI processes never tear a
+# connection down: with retention enabled, release() keeps the connection
+# alive and the process ends through os._exit (see cli.run). Every caller has
+# committed or rolled back by then, so nothing is lost by skipping close.
+_retain_connections = False
+_retained: list[Any] = []
+
+
+def retain_connections_for_process() -> None:
+    """Keep released connections alive until the process exits (CLI only)."""
+    global _retain_connections
+    _retain_connections = True
+
+
+def release(conn: Connection) -> None:
+    """Close a connection, or retain it for the rest of a CLI process.
+
+    A retained connection never keeps a transaction (or the write lock) open:
+    anything still uncommitted is rolled back, as close() would have done.
+    """
+    if not _retain_connections:
+        conn.close()
+        return
+    try:
+        if conn.in_transaction:
+            conn.rollback()
+    finally:
+        _retained.append(conn)
+
 REQUIRED_TABLES = (
     "schema_migrations",
     "repositories",
@@ -130,7 +166,7 @@ def open_connection(
         return conn
     except Exception as exc:
         if conn is not None:
-            conn.close()
+            release(conn)
         if isinstance(exc, StoreError):
             raise
         raise StoreError(f"Cannot open local libSQL store: {exc}") from exc
@@ -144,27 +180,25 @@ def connect(cfg: Config) -> Connection:
     try:
         verify_contract(conn)
     except Exception:
-        conn.close()
+        release(conn)
         raise
     return conn
 
 
 @contextmanager
 def session(cfg: Config) -> Iterator[Connection]:
-    """One command's connection: commit on success, roll back on error, close.
+    """One command's connection: commit on success, roll back on error, release.
 
-    libSQL's own context manager ends the transaction but leaves the
-    connection open, so without this the native connection would be torn down
-    implicitly whenever its last Python reference disappeared. Closing it
-    explicitly, on the thread that opened it, keeps that teardown
-    deterministic.
+    libSQL's own context manager ends the transaction but never closes the
+    connection; release() then closes it or, in a CLI process, retains it (see
+    _retain_connections for why).
     """
     conn = connect(cfg)
     try:
         with conn:
             yield conn
     finally:
-        conn.close()
+        release(conn)
 
 
 def _is_locked_error(exc: Exception) -> bool:
@@ -325,7 +359,7 @@ def migrate(target: Config | str | Path) -> list[str]:
             raise
         raise StoreError(f"Migration failed: {exc}") from exc
     finally:
-        conn.close()
+        release(conn)
 
 
 # ------------------------------------------------------------ contract check
@@ -404,4 +438,4 @@ def verify_contract(target: Config | Connection | str | Path) -> None:
         raise StoreError(f"Store contract check failed: {exc}") from exc
     finally:
         if owned:
-            conn.close()
+            release(conn)

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import traceback
 
 from . import __version__, audit, config, gate, handoff, registry, store, trees, work
 
@@ -644,5 +646,41 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+def _exit_status(code: object) -> int:
+    """Map a SystemExit code to a process status the way the interpreter does."""
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    print(code, file=sys.stderr)
+    return 1
+
+
+def run() -> None:
+    """Process entry point: run one command, then exit without libSQL teardown.
+
+    libsql 0.1.11 double-closes the SQLite handle whenever a connection is
+    torn down, which intermittently crashes the process on Windows (see
+    store._retain_connections). Connections are therefore retained and the
+    process ends through os._exit once output is flushed. Every command has
+    committed or rolled back its transaction before it returns.
+    """
+    store.retain_connections_for_process()
+    status = 1
+    try:
+        status = main()
+    except SystemExit as exc:
+        status = _exit_status(exc.code)
+    except BaseException:
+        traceback.print_exc()
+        status = 1
+    finally:
+        try:
+            sys.stdout.flush()
+        finally:
+            sys.stderr.flush()
+            os._exit(status)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    run()
