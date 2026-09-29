@@ -23,7 +23,12 @@ from .registry import (
     get_repository,
 )
 from .store import Connection, begin_immediate, json_dumps, json_loads
-from .work import live_claim_for_branch, open_handoff_for_branch
+from .work import (
+    claim_scopes,
+    live_claim_for_branch,
+    open_handoff_for_branch,
+    path_in_scopes,
+)
 
 DEFAULT_THRESHOLD = 1
 HOOK_MARKER = "# quorumgit-managed-pre-receive v1"
@@ -169,17 +174,45 @@ def get_approval_by_id(conn: Connection, approval_id: int) -> dict:
     return _approval_dict(row)
 
 
+def _beneficiary(operation: dict[str, Any]) -> str | None:
+    """The agent an operation authorizes, when it is known before consumption."""
+    if operation.get("type") == "lease_takeover":
+        return str(operation.get("to_agent") or "") or None
+    return None
+
+
+def _independent_yes_votes(
+    conn: Connection, approval_id: int, excluding_agent_id: int
+) -> int:
+    row = conn.execute(
+        "SELECT count(*) FROM votes "
+        "WHERE approval_id = ? AND vote = 1 AND voter_agent_id <> ?",
+        (approval_id, excluding_agent_id),
+    ).fetchone()
+    assert row is not None
+    return row[0]
+
+
 def vote(conn: Connection, approval_id: int, voter: str, approve: bool) -> dict:
     """Record a vote against one explicit approval instance atomically.
 
     BEGIN IMMEDIATE serializes competing voters before either reads the current
-    approval state. Denial has precedence and terminal states remain final.
+    approval state. Denial has precedence and denied/consumed are terminal.
+    An approved instance still accepts votes until it is consumed: further yes
+    votes let independent approvers replace a self-vote that consumption will
+    not count, and a no vote revokes it before use. An agent may never approve
+    an operation whose known beneficiary is itself.
     """
     begin_immediate(conn)
     voter_row = get_agent(conn, voter)
     approval = get_approval_by_id(conn, approval_id)
-    if approval["status"] != "pending":
+    if approval["status"] not in ("pending", "approved"):
         raise GateError(f"Approval {approval_id} is already {approval['status']}.")
+    if approve and _beneficiary(approval["operation"]) == voter:
+        raise GateError(
+            f"Agent {voter} cannot approve operation {approval_id} that "
+            "authorizes itself; another registered agent must approve it."
+        )
     threshold = approval["threshold"]
     conn.execute(
         """
@@ -214,11 +247,11 @@ def vote(conn: Connection, approval_id: int, voter: str, approve: bool) -> dict:
         new_status = "approved"
     else:
         new_status = "pending"
-    if new_status != "pending":
+    if new_status != approval["status"]:
         conn.execute(
             "UPDATE approvals SET status = ?, decided_at = unixepoch() "
-            "WHERE id = ? AND status = 'pending'",
-            (new_status, approval["id"]),
+            "WHERE id = ? AND status = ?",
+            (new_status, approval["id"], approval["status"]),
         )
         audit.record(
             conn,
@@ -265,6 +298,13 @@ def consume_approval(
         raise GateError(
             f"Approval {op_hash} is not consumable (status "
             f"{approval['status']}); it may already be used."
+        )
+    independent = _independent_yes_votes(conn, approval["id"], consumer["id"])
+    if independent < approval["threshold"]:
+        raise GateError(
+            f"Approval {approval_id} needs {approval['threshold']} approving "
+            f"vote(s) from agents other than {agent}, who is using it; it has "
+            f"{independent}. An agent cannot authorize its own operation."
         )
     cur = conn.execute(
         "UPDATE approvals SET status = 'consumed', consumed_at = unixepoch(), "
@@ -313,6 +353,63 @@ def _is_fast_forward(git_dir: str, oldrev: str, newrev: str) -> bool:
     if result.returncode not in (0, 1):
         raise PushRejected("Unable to determine fast-forward status.")
     return result.returncode == 0
+
+
+MAX_REPORTED_PATHS = 10
+
+
+def _pushed_paths(git_dir: str, newrev: str) -> list[str]:
+    """Paths changed by the commits this push introduces to the repository.
+
+    `newrev --not --all` is exactly the set of new commits: in pre-receive no
+    ref points at them yet. `--cc` lists only the paths a merge commit itself
+    authored (differing from every parent), so merging the base branch in does
+    not attribute the base's files to the pusher. Renames count as both paths.
+    """
+    result = subprocess.run(
+        [
+            "git",
+            "--git-dir",
+            git_dir,
+            "log",
+            "--format=",
+            "--name-only",
+            "--no-renames",
+            "--cc",
+            "-z",
+            newrev,
+            "--not",
+            "--all",
+        ],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise PushRejected("Unable to determine the paths changed by this push.")
+    paths = (
+        entry.lstrip("\n")
+        for entry in result.stdout.decode("utf-8", "surrogateescape").split("\0")
+    )
+    return list(dict.fromkeys(path for path in paths if path))
+
+
+def enforce_claim_scopes(
+    conn: Connection, git_dir: str, claim: dict, branch: str, newrev: str
+) -> None:
+    """Reject new commits that touch paths outside the claim's declared scopes."""
+    scopes = claim_scopes(conn, claim["id"])
+    outside = [
+        path for path in _pushed_paths(git_dir, newrev)
+        if not path_in_scopes(path, scopes)
+    ]
+    if outside:
+        shown = ", ".join(outside[:MAX_REPORTED_PATHS])
+        more = len(outside) - MAX_REPORTED_PATHS
+        if more > 0:
+            shown += f", and {more} more"
+        raise PushRejected(
+            f"Push to {branch!r} changes paths outside claim {claim['id']}'s "
+            f"scopes {scopes}: {shown}. Claim a scope that covers them first."
+        )
 
 
 def _invoking_git_common_dir(git_dir: str) -> Path:
@@ -377,6 +474,8 @@ def check_ref_update(
                 f"(claim {claim['id']}); pusher is "
                 f"{pusher or 'unidentified — set QUORUMGIT_AGENT'}."
             )
+        if claim and not _is_zero(newrev):
+            enforce_claim_scopes(conn, git_dir, claim, branch, newrev)
 
     protected = refname in repo["protected_refs"]
     deletion = _is_zero(newrev)

@@ -158,34 +158,35 @@ def cmd_claim(args, cfg) -> int:
     with store.connect(cfg) as conn:
         takeover_operation = None
         takeover_approval = None
-        if args.takeover:
-            # Bind the approval to a stable incumbent. claim_task() and every
-            # release take this same task lock, closing the stale-holder window.
-            work.lock_task(conn, args.task_id)
-            holder = work.active_claim_for_task(conn, args.task_id)
-            if holder and not holder["expired"]:
-                task = work.get_task(conn, args.task_id)
-                takeover_operation = {
-                    "type": "lease_takeover",
-                    "repository": task["repository"],
-                    "task_id": args.task_id,
-                    "from_claim_id": holder["id"],
-                    "from_agent": holder["agent"],
-                    "to_agent": agent,
-                }
-                takeover_approval = gate.approved_instance(conn, takeover_operation)
-                if takeover_approval is None:
-                    print(
-                        "[quorumgit] REFUSED: lease takeover requires approval.\n"
-                        f"operation hash: "
-                        f"{gate.operation_hash(takeover_operation)}\n"
-                        "Request/approve it via `quorumgit approve request/vote` "
-                        "with operation:\n"
-                        f"{json.dumps(takeover_operation, sort_keys=True)}",
-                        file=sys.stderr,
-                    )
-                    conn.commit()  # keep the conflict/audit trail
-                    return 1
+        # Pin the incumbent (live or expired) under the task lock: a takeover
+        # approval binds to it, and a successor on the same branch inherits
+        # its worktree. claim_task() and every release take this same lock.
+        work.lock_task(conn, args.task_id)
+        holder = work.active_claim_for_task(conn, args.task_id)
+        if args.takeover and holder and not holder["expired"]:
+            task = work.get_task(conn, args.task_id)
+            takeover_operation = {
+                "type": "lease_takeover",
+                "repository": task["repository"],
+                "task_id": args.task_id,
+                "from_claim_id": holder["id"],
+                "from_agent": holder["agent"],
+                "to_agent": agent,
+            }
+            takeover_approval = gate.approved_instance(conn, takeover_operation)
+            if takeover_approval is None:
+                print(
+                    "[quorumgit] REFUSED: lease takeover requires approval.\n"
+                    f"operation hash: "
+                    f"{gate.operation_hash(takeover_operation)}\n"
+                    "Request it via `quorumgit approve request`; another "
+                    "registered agent must approve it with `quorumgit approve "
+                    "vote`. Operation:\n"
+                    f"{json.dumps(takeover_operation, sort_keys=True)}",
+                    file=sys.stderr,
+                )
+                conn.commit()  # keep the conflict/audit trail
+                return 1
         try:
             claim_id, classification, _ = work.claim_task(
                 conn,
@@ -218,12 +219,18 @@ def cmd_claim(args, cfg) -> int:
                 print(f"[quorumgit] REFUSED: {exc}", file=sys.stderr)
                 return 1
         wt = None
+        inherited = False
         if not args.no_worktree:
-            wt = trees.create_worktree(conn, claim_id, cfg.worktrees_dir)
+            if holder is not None:
+                wt = trees.inherit_worktree(conn, holder["id"], claim_id, agent)
+                inherited = wt is not None
+            if wt is None:
+                wt = trees.create_worktree(conn, claim_id, cfg.worktrees_dir)
         conn.commit()
     print(f"claim {claim_id} acquired ({classification}).")
     if wt:
-        print(f"worktree: {wt['path']}")
+        suffix = f" (inherited from claim {holder['id']})" if inherited and holder else ""
+        print(f"worktree: {wt['path']}{suffix}")
         print(f"branch: {wt['branch']}")
     else:
         print(f"branch: {args.branch} (no worktree — work from your own clone "
@@ -252,19 +259,25 @@ def cmd_release(args, cfg) -> int:
     return 0
 
 
+def _active_worktree(conn, claim_id: int) -> dict | None:
+    wt = trees.worktree_for_claim(conn, claim_id)
+    return wt if wt and wt["removed_at"] is None else None
+
+
 def cmd_checkpoint(args, cfg) -> int:
     agent = _agent(args, cfg)
     with store.connect(cfg) as conn:
         commit = args.commit
         if not commit:
-            wt = trees.worktree_for_claim(conn, args.claim_id)
+            wt = _active_worktree(conn, args.claim_id)
             if wt is None:
-                print("No worktree for this claim; pass --commit <oid>.",
+                print("No active worktree for this claim; pass --commit <oid>.",
                       file=sys.stderr)
                 return 1
             commit = trees.head_commit(wt["path"])
         cp_id = work.add_checkpoint(conn, args.claim_id, agent, commit,
                                     note=args.note)
+        commit = work.checkpoint_commit(conn, cp_id)
         conn.commit()
     print(f"checkpoint {cp_id} at {commit}.")
     return 0
@@ -276,11 +289,16 @@ def cmd_checkpoint(args, cfg) -> int:
 def cmd_handoff_create(args, cfg) -> int:
     agent = _agent(args, cfg)
     with store.connect(cfg) as conn:
-        wt = trees.worktree_for_claim(conn, args.claim_id)
-        last_commit = trees.head_commit(wt["path"]) if wt else args.last_commit
+        # An explicit --last-commit always wins; otherwise continue from the
+        # managed worktree's HEAD.
+        last_commit = args.last_commit
         if not last_commit:
-            print("Provide --last-commit (no worktree found).", file=sys.stderr)
-            return 1
+            wt = _active_worktree(conn, args.claim_id)
+            if wt is None:
+                print("Provide --last-commit (no active worktree for this claim).",
+                      file=sys.stderr)
+                return 1
+            last_commit = trees.head_commit(wt["path"])
         record = {
             "completed": args.completed,
             "remaining": args.remaining,
@@ -295,6 +313,7 @@ def cmd_handoff_create(args, cfg) -> int:
         handoff_id = handoff.create_handoff(
             conn, args.claim_id, agent, record, to_agent=args.to
         )
+        last_commit = handoff.get_handoff(conn, handoff_id)["record"]["last_commit"]
         conn.commit()
     print(f"handoff {handoff_id} created (last commit {last_commit}).")
     return 0
@@ -349,9 +368,12 @@ def cmd_handoff_cancel(args, cfg) -> int:
 
 
 def _operation_from_args(args) -> dict:
-    operation = json.loads(args.operation)
+    try:
+        operation = json.loads(args.operation)
+    except json.JSONDecodeError as exc:
+        raise gate.GateError(f"Operation is not valid JSON: {exc}") from exc
     if not isinstance(operation, dict):
-        raise SystemExit("Operation must be a JSON object.")
+        raise gate.GateError("Operation must be a JSON object.")
     return operation
 
 

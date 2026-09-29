@@ -131,7 +131,7 @@ def add_repository(
     ).fetchone()
     assert row is not None
     repo_id = row[0]
-    for refname in protected_refs or []:
+    for refname in dict.fromkeys(protected_refs or []):
         conn.execute(
             "INSERT INTO protected_refs (repository_id, refname) VALUES (?, ?)",
             (repo_id, refname),
@@ -181,6 +181,9 @@ def list_repositories(conn: Connection) -> list[dict]:
 
 
 def add_agent(conn: Connection, name: str) -> int:
+    begin_immediate(conn)
+    if conn.execute("SELECT 1 FROM agents WHERE name = ?", (name,)).fetchone():
+        raise RegistryError(f"Agent is already registered: {name}")
     row = conn.execute(
         "INSERT INTO agents (name) VALUES (?) RETURNING id", (name,)
     ).fetchone()

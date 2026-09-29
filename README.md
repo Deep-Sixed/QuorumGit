@@ -58,7 +58,7 @@ Then initialize the store once:
 ```bash
 $ quorumgit init
 store: /home/you/.quorumgit/quorumgit.db
-migrations applied: ['001_core.sql']
+migrations applied: ['001_core.sql', '002_approval_identities.sql']
 contract: ok
 ```
 
@@ -124,7 +124,7 @@ Every claim attempt is classified against all live claims before it is granted, 
 | `CONFLICTING` | branch already claimed by another task | refused |
 | `BLOCKED` | task already held by an unexpired claim | refused; takeover requires approval |
 
-Scope overlap uses a conservative literal-prefix test (the prefix of one glob up to its first wildcard against the other's) — it errs toward flagging.
+Scopes are normalized when declared (`./src/**`, `/src/**`, `src//**` and `src\**` all become `src/**`; scopes that escape the repository root are refused). Scope overlap then uses a conservative literal-prefix test (the prefix of one glob up to its first wildcard against the other's), compared case-insensitively — it errs toward flagging.
 
 ## Two deployment models
 
@@ -151,7 +151,9 @@ QUORUMGIT_AGENT=agent-two git push origin feat/x    # rejected — branch is cla
 git push origin feat/x                              # rejected — unidentified
 ```
 
-Checkpoints in the hub model take an explicit `--commit <oid>`. Continuation points are **verified, not trusted**: the commit must exist in the registered repository, and when the claimed branch exists, be reachable from it. A typo'd or fabricated OID is rejected.
+**Scopes are enforced at push time.** When a branch has a live claim, every commit the push introduces must only touch paths inside that claim's scopes (`**` spans directories, `*` stays within one; a scope without wildcards covers that file or directory). Merge commits count only the paths the merge itself changed, so merging the base branch in is not attributed to the claim holder. In the local model agents commit directly in their worktree, so no hook runs and scopes remain coordination metadata.
+
+Checkpoints in the hub model take an explicit `--commit <oid>` (any commit spec Git resolves — a full or abbreviated OID or a ref — recorded as the full OID). Continuation points are **verified, not trusted**: the commit must exist in the registered repository, and when the claimed branch exists, be reachable from it. A typo'd or fabricated OID is rejected.
 
 ## Protected operations and approvals
 
@@ -177,13 +179,14 @@ quorumgit approve vote 17 --agent operator
 Rules that hold no matter what:
 
 - **An approval never bypasses branch reservations.** A claimed branch still accepts pushes only from its claiming agent; a branch frozen by an open handoff accepts none at all. The hook checks reservations *before* approvals.
-- **Denial has precedence and is terminal.** One `--deny` vote denies the approval; later yes votes are refused.
+- **No agent authorizes itself.** The agent that uses an approval (the pusher, or the claimant of a takeover) never counts toward its threshold: its own yes vote is ignored at consumption, and a takeover's beneficiary cannot vote yes at all. If a self-vote was the only approval, another registered agent can still add theirs to the approved instance.
+- **Denial has precedence and is terminal.** One `--deny` vote denies the approval — including an approved one that has not yet been used; later yes votes are refused.
 - **Consumption is single-use under concurrency.** Two simultaneous pushes racing for one approval produce exactly one accepted push — the loser is rejected, not silently allowed.
 - **Votes bind to one approval instance.** A delayed vote for an older denied or consumed instance cannot decide a newer request with the same operation hash. Requesters, voters, consumers, and pushers must name registered agents.
 - **A consumed approval is spent, not blacklisted.** Consumption moves the approval to a terminal `consumed` state (with `consumed_at`) rather than reusing `denied`, and only one *live* (`pending` or `approved`) approval may exist per operation hash. The same operation can therefore be requested and approved again later as a new approval instance — which matters for takeovers, whose payload is stable and legitimately repeatable. What is never possible is one approval authorizing twice.
 - The default threshold is 1 (a human operator); the vote schema supports higher thresholds.
 
-Takeovers follow the same pattern: claiming a task someone else holds (`claim <task> --takeover`) prints the takeover operation to approve. Its payload includes the incumbent claim ID, so an unused approval cannot displace a later claim by the same agent. The takeover is atomic — the incumbent is released, the replacement claim created, and the approval consumed in one transaction, or none of it happens. A refused takeover leaves the incumbent untouched and the approval unconsumed.
+Takeovers follow the same pattern: claiming a task someone else holds (`claim <task> --takeover`) prints the takeover operation to approve. Its payload includes the incumbent claim ID, so an unused approval cannot displace a later claim by the same agent. The takeover is atomic — the incumbent is released, the replacement claim created, and the approval consumed in one transaction, or none of it happens. A refused takeover leaves the incumbent untouched and the approval unconsumed. When the replacement claim uses the incumbent's branch, it inherits the incumbent's managed worktree (including uncommitted work), because Git will not check one branch out twice; reclaiming an expired lease on the same branch works the same way.
 
 ## Command reference
 
@@ -198,9 +201,9 @@ Takeovers follow the same pattern: claiming a task someone else holds (`claim <t
 | `quorumgit task add --repo <name> --title <t> [--objective <o>]` | Create a task |
 | `quorumgit claim <task> --branch <b> --scope <glob>… [--no-worktree] [--takeover] [--override-overlap] [--lease-hours <h>]` | Claim a task |
 | `quorumgit renew <claim>` | Extend a live, unexpired lease; expired claims must be acquired again |
-| `quorumgit checkpoint <claim> [--commit <oid>] [--note <n>]` | Record verified progress |
+| `quorumgit checkpoint <claim> [--commit <commit>] [--note <n>]` | Record verified progress |
 | `quorumgit release <claim> [--remove-worktree] [--reason <r>]` | Release a claim |
-| `quorumgit handoff create <claim> --completed <c> --remaining <r> [--to <agent>] [--last-commit <oid>]` | Hand work off |
+| `quorumgit handoff create <claim> --completed <c> --remaining <r> [--to <agent>] [--last-commit <commit>]` | Hand work off (from `--last-commit` when given, else the worktree's HEAD) |
 | `quorumgit handoff accept <id>` | Continue handed-off work (addressee, or anyone if unaddressed) |
 | `quorumgit handoff decline <id>` | Decline — addressee only; clean retained worktree is removed |
 | `quorumgit handoff cancel <id>` | Cancel — creator only; clean retained worktree is removed |

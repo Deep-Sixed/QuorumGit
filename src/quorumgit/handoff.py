@@ -37,9 +37,12 @@ def create_handoff(
         if not record.get(field):
             raise HandoffError(f"Handoff record requires {field!r}.")
     task = work.get_task(conn, claim["task_id"])
-    work.verify_commit(
-        task["repository_path"], record["last_commit"], branch=claim["branch"]
-    )
+    record = {
+        **record,
+        "last_commit": work.verify_commit(
+            task["repository_path"], record["last_commit"], branch=claim["branch"]
+        ),
+    }
 
     to_agent_id = get_agent(conn, to_agent)["id"] if to_agent else None
     row = conn.execute(

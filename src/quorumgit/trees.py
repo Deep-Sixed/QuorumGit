@@ -129,6 +129,50 @@ def transfer_worktree(conn: Connection, worktree_id: int, new_claim_id: int) -> 
     )
 
 
+def inherit_worktree(
+    conn: Connection, from_claim_id: int, to_claim_id: int, agent: str
+) -> dict | None:
+    """Move a superseded claim's managed worktree to its successor claim.
+
+    An expired or taken-over claim's checkout still has its branch checked
+    out, so Git refuses a second worktree for that branch. When the successor
+    claims the same branch, it inherits the checkout (and any uncommitted
+    work in it), exactly as a handoff does. Returns None when there is nothing
+    safe to inherit, so the caller creates a fresh worktree instead.
+    """
+    wt = worktree_for_claim(conn, from_claim_id)
+    if wt is None or wt["removed_at"] is not None:
+        return None
+    previous = get_claim(conn, from_claim_id)
+    successor = get_claim(conn, to_claim_id)
+    if previous["released_at"] is None or successor["task_id"] != previous["task_id"]:
+        raise WorktreeError(
+            f"Claim {from_claim_id} does not hand its worktree to claim {to_claim_id}."
+        )
+    if wt["branch"] != successor["branch"] or not Path(wt["path"]).exists():
+        return None
+    try:
+        checked_out = _git(wt["path"], "rev-parse", "--symbolic-full-name", "HEAD")
+    except WorktreeError:
+        return None
+    if checked_out != f"refs/heads/{wt['branch']}":
+        return None
+    transfer_worktree(conn, wt["id"], to_claim_id)
+    audit.record(
+        conn,
+        "worktree.transferred",
+        "worktree",
+        wt["id"],
+        agent=agent,
+        detail={
+            "path": wt["path"],
+            "from_claim_id": from_claim_id,
+            "to_claim_id": to_claim_id,
+        },
+    )
+    return {"id": wt["id"], "path": wt["path"], "branch": wt["branch"]}
+
+
 def _mark_removed(
     conn: Connection,
     wt: dict,
