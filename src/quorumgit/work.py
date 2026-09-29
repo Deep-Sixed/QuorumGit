@@ -399,6 +399,16 @@ def path_in_scopes(path: str, scopes: list[str]) -> bool:
     return any(_glob_regex(normalize_scope(s)).match(path) for s in scopes)
 
 
+def paths_outside(paths: list[str], scopes: list[str]) -> list[str]:
+    """The paths no scope covers, in their original order."""
+    return [p for p in paths if not path_in_scopes(p, scopes)]
+
+
+def paths_within(paths: list[str], scopes: list[str]) -> list[str]:
+    """The paths some scope covers, in their original order."""
+    return [p for p in paths if path_in_scopes(p, scopes)]
+
+
 def verify_commit(
     repo_path: str, commit_oid: str, branch: str | None = None
 ) -> None:

@@ -39,7 +39,8 @@ def _apply_001(cfg: Config):
 UPGRADE_MIGRATIONS = [
     "002_approval_identities.sql",
     "004_approval_authority.sql",
-    "005_approval_quorum.sql",
+    "005_content_governance.sql",
+    "006_approval_quorum.sql",
 ]
 
 

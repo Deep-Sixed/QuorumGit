@@ -361,7 +361,8 @@ def test_upgrade_leaves_no_agent_with_authority(tmp_path):
 
     assert store.migrate(local) == [
         "004_approval_authority.sql",
-        "005_approval_quorum.sql",
+        "005_content_governance.sql",
+        "006_approval_quorum.sql",
     ]
     upgraded = store.connect(local)
     try:
