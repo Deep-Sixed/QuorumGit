@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from importlib import import_module, resources
 from pathlib import Path
 from typing import Any
@@ -145,6 +147,24 @@ def connect(cfg: Config) -> Connection:
         conn.close()
         raise
     return conn
+
+
+@contextmanager
+def session(cfg: Config) -> Iterator[Connection]:
+    """One command's connection: commit on success, roll back on error, close.
+
+    libSQL's own context manager ends the transaction but leaves the
+    connection open, so without this the native connection would be torn down
+    implicitly whenever its last Python reference disappeared. Closing it
+    explicitly, on the thread that opened it, keeps that teardown
+    deterministic.
+    """
+    conn = connect(cfg)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def _is_locked_error(exc: Exception) -> bool:

@@ -52,7 +52,7 @@ def cmd_status(args, cfg) -> int:
     except store.StoreError as exc:
         print(f"contract: VIOLATED — {exc}")
         return 1
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         for table in ("repositories", "agents", "tasks", "claims", "handoffs"):
             row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()  # noqa: S608 — fixed identifier set
             assert row is not None
@@ -71,7 +71,7 @@ def cmd_destroy(args, cfg) -> int:
 
 def cmd_doctor(args, cfg) -> int:
     """Inspect and optionally reconcile recorded managed-worktree drift."""
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         findings = trees.doctor_worktrees(conn, repair=args.repair)
         if args.repair:
             conn.commit()
@@ -102,7 +102,7 @@ def cmd_doctor(args, cfg) -> int:
 
 
 def cmd_repo_add(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         repo_id = registry.add_repository(
             conn, args.name, args.path, protected_refs=args.protected_ref
         )
@@ -112,7 +112,7 @@ def cmd_repo_add(args, cfg) -> int:
 
 
 def cmd_repo_list(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         for repo in registry.list_repositories(conn):
             refs = ",".join(repo["protected_refs"]) or "-"
             print(f"{repo['id']}\t{repo['name']}\t{repo['path']}\tprotected:{refs}")
@@ -120,7 +120,7 @@ def cmd_repo_list(args, cfg) -> int:
 
 
 def cmd_repo_policy(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         changing = (
             args.threshold is not None
             or args.role
@@ -147,7 +147,7 @@ def cmd_repo_policy(args, cfg) -> int:
 
 
 def cmd_agent_add(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         agent_id = registry.add_agent(
             conn,
             args.name,
@@ -160,7 +160,7 @@ def cmd_agent_add(args, cfg) -> int:
 
 
 def cmd_agent_role(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         registry.set_agent_role(
             conn,
             args.name,
@@ -173,7 +173,7 @@ def cmd_agent_role(args, cfg) -> int:
 
 
 def cmd_agent_list(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         for agent in registry.list_agents(conn):
             print(f"{agent['id']}\t{agent['name']}\t{agent['role']}")
     return 0
@@ -183,7 +183,7 @@ def cmd_agent_list(args, cfg) -> int:
 
 
 def cmd_task_add(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         task_id = work.create_task(conn, args.repo, args.title, args.objective)
         conn.commit()
     print(f"task {task_id} created.")
@@ -191,7 +191,7 @@ def cmd_task_add(args, cfg) -> int:
 
 
 def cmd_task_list(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         for task in work.list_tasks(conn, repository=args.repo):
             print(f"{task['id']}\t{task['repository']}\t{task['status']}\t"
                   f"{task['title']}")
@@ -200,7 +200,7 @@ def cmd_task_list(args, cfg) -> int:
 
 def cmd_claim(args, cfg) -> int:
     agent = _agent(args, cfg)
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         takeover_operation = None
         takeover_approval = None
         if args.takeover:
@@ -288,7 +288,7 @@ def cmd_claim(args, cfg) -> int:
 
 
 def cmd_renew(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         work.renew_claim(conn, args.claim_id, _agent(args, cfg),
                          lease_hours=args.lease_hours)
         conn.commit()
@@ -298,7 +298,7 @@ def cmd_renew(args, cfg) -> int:
 
 def cmd_release(args, cfg) -> int:
     agent = _agent(args, cfg)
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         wt = trees.worktree_for_claim(conn, args.claim_id)
         if wt and wt["removed_at"] is None and args.remove_worktree:
             trees.remove_worktree(conn, args.claim_id, agent)
@@ -310,7 +310,7 @@ def cmd_release(args, cfg) -> int:
 
 def cmd_checkpoint(args, cfg) -> int:
     agent = _agent(args, cfg)
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         commit = args.commit
         if not commit:
             wt = trees.worktree_for_claim(conn, args.claim_id)
@@ -331,7 +331,7 @@ def cmd_checkpoint(args, cfg) -> int:
 
 def cmd_handoff_create(args, cfg) -> int:
     agent = _agent(args, cfg)
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         wt = trees.worktree_for_claim(conn, args.claim_id)
         last_commit = trees.head_commit(wt["path"]) if wt else args.last_commit
         if not last_commit:
@@ -357,7 +357,7 @@ def cmd_handoff_create(args, cfg) -> int:
 
 
 def cmd_handoff_list(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         for h in handoff.list_handoffs(conn, status=args.status):
             print(f"{h['id']}\ttask {h['task_id']}\t{h['from_agent']} -> "
                   f"{h['to_agent'] or 'anyone'}\t{h['status']}")
@@ -365,7 +365,7 @@ def cmd_handoff_list(args, cfg) -> int:
 
 
 def cmd_handoff_show(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         h = handoff.get_handoff(conn, args.handoff_id)
     print(json.dumps(h, indent=2, default=str))
     return 0
@@ -373,7 +373,7 @@ def cmd_handoff_show(args, cfg) -> int:
 
 def cmd_handoff_accept(args, cfg) -> int:
     agent = _agent(args, cfg)
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         result = handoff.accept_handoff(conn, args.handoff_id, agent,
                                         lease_hours=args.lease_hours)
         conn.commit()
@@ -386,7 +386,7 @@ def cmd_handoff_accept(args, cfg) -> int:
 
 
 def cmd_handoff_decline(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         handoff.decline_handoff(conn, args.handoff_id, _agent(args, cfg))
         conn.commit()
     print(f"handoff {args.handoff_id} declined.")
@@ -394,7 +394,7 @@ def cmd_handoff_decline(args, cfg) -> int:
 
 
 def cmd_handoff_cancel(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         handoff.cancel_handoff(conn, args.handoff_id, _agent(args, cfg))
         conn.commit()
     print(f"handoff {args.handoff_id} cancelled.")
@@ -412,7 +412,7 @@ def _operation_from_args(args) -> dict:
 
 
 def cmd_approve_request(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         approval = gate.request_approval(
             conn, _operation_from_args(args), requested_by=_agent(args, cfg)
         )
@@ -425,7 +425,7 @@ def cmd_approve_request(args, cfg) -> int:
 
 
 def cmd_approve_vote(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         approval = gate.vote(conn, args.approval_id, _agent(args, cfg),
                              approve=not args.deny)
         conn.commit()
@@ -445,7 +445,7 @@ def cmd_approve_hash(args, cfg) -> int:
 
 
 def cmd_hook_install(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         path = gate.install_hook(conn, args.repo)
         conn.commit()
     print(f"pre-receive hook installed: {path}")
@@ -453,7 +453,7 @@ def cmd_hook_install(args, cfg) -> int:
 
 
 def cmd_hook_pre_receive(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         return gate.run_pre_receive(conn, args.repo, sys.stdin)
 
 
@@ -461,7 +461,7 @@ def cmd_hook_pre_receive(args, cfg) -> int:
 
 
 def cmd_audit(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         for event in audit.events(conn, entity=args.entity,
                                   entity_id=args.entity_id, limit=args.limit):
             print(f"{event['id']}\t{event['created_at']}\t{event['event_type']}"
