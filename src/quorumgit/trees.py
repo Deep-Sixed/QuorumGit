@@ -305,10 +305,11 @@ def cleanup_released_worktree(
     *,
     agent: str,
     reason: str,
+    event_type: str = "worktree.handoff_cleanup",
 ) -> bool:
     """Remove a retained released-claim worktree without forcing dirty state.
 
-    Handoff decline/cancel uses this after it has reserved the handoff/task.
+    Handoff decline/cancel and `task done` use this after reserving the task.
     Git's ordinary `worktree remove` is deliberately used without --force; a
     dirty checkout therefore aborts the resolution rather than losing work.
     """
@@ -318,7 +319,7 @@ def cleanup_released_worktree(
     claim = get_claim(conn, claim_id)
     if claim["released_at"] is None:
         raise WorktreeError(
-            f"Claim {claim_id} is still active; refusing handoff cleanup."
+            f"Claim {claim_id} is still active; refusing released-claim cleanup."
         )
     task = get_task(conn, claim["task_id"])
     _git(task["repository_path"], "worktree", "remove", wt["path"])
@@ -326,7 +327,7 @@ def cleanup_released_worktree(
         conn,
         wt,
         agent=agent,
-        event_type="worktree.handoff_cleanup",
+        event_type=event_type,
         detail={"reason": reason},
     )
     return True

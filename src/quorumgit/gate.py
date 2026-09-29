@@ -29,7 +29,12 @@ from .registry import (
     get_repository,
 )
 from .store import Connection, begin_immediate, json_dumps, json_loads
-from .work import live_claim_for_branch, open_handoff_for_branch
+from .work import (
+    claim_scopes,
+    live_claim_for_branch,
+    open_handoff_for_branch,
+    path_in_scopes,
+)
 
 HOOK_MARKER = "# quorumgit-managed-pre-receive v1"
 
@@ -510,6 +515,64 @@ def _is_fast_forward(git_dir: str, oldrev: str, newrev: str) -> bool:
     return result.returncode == 0
 
 
+MAX_REPORTED_PATHS = 10
+
+
+def _pushed_paths(git_dir: str, newrev: str) -> list[str]:
+    """Paths changed by the commits this push introduces to the repository.
+
+    `newrev --not --all` is exactly the set of new commits: in pre-receive no
+    ref points at them yet. `--cc` lists only the paths a merge commit itself
+    authored (differing from every parent), so merging the base branch in does
+    not attribute the base's files to the pusher. Renames count as both paths.
+    """
+    result = subprocess.run(
+        [
+            "git",
+            "--git-dir",
+            git_dir,
+            "log",
+            "--format=",
+            "--name-only",
+            "--no-renames",
+            "--cc",
+            "-z",
+            newrev,
+            "--not",
+            "--all",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise PushRejected("Unable to determine the paths changed by this push.")
+    paths = (
+        entry.lstrip("\n")
+        for entry in result.stdout.decode("utf-8", "surrogateescape").split("\0")
+    )
+    return list(dict.fromkeys(path for path in paths if path))
+
+
+def enforce_claim_scopes(
+    conn: Connection, git_dir: str, claim: dict, branch: str, newrev: str
+) -> None:
+    """Reject new commits that touch paths outside the claim's declared scopes."""
+    scopes = claim_scopes(conn, claim["id"])
+    outside = [
+        path for path in _pushed_paths(git_dir, newrev)
+        if not path_in_scopes(path, scopes)
+    ]
+    if outside:
+        shown = ", ".join(outside[:MAX_REPORTED_PATHS])
+        more = len(outside) - MAX_REPORTED_PATHS
+        if more > 0:
+            shown += f", and {more} more"
+        raise PushRejected(
+            f"Push to {branch!r} changes paths outside claim {claim['id']}'s "
+            f"scopes {scopes}: {shown}. Claim a scope that covers them first."
+        )
+
+
 def _invoking_git_common_dir(git_dir: str) -> Path:
     result = subprocess.run(
         ["git", "--git-dir", git_dir, "rev-parse", "--git-common-dir"],
@@ -573,6 +636,8 @@ def check_ref_update(
                 f"(claim {claim['id']}); pusher is "
                 f"{pusher or 'unidentified — set QUORUMGIT_AGENT'}."
             )
+        if claim and not _is_zero(newrev):
+            enforce_claim_scopes(conn, git_dir, claim, branch, newrev)
 
     protected = refname in repo["protected_refs"]
     deletion = _is_zero(newrev)
