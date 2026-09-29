@@ -255,7 +255,7 @@ def fresh_store(tmp_path):
 def test_first_operator_is_bootstrapped_then_roles_are_operator_only(
     fresh_store, tmp_path
 ):
-    local, conn = fresh_store
+    _local, conn = fresh_store
     registry.add_agent(conn, "alice")
     registry.add_agent(conn, "mallory")
     repo = register_repo(conn, tmp_path / "bootstrap")

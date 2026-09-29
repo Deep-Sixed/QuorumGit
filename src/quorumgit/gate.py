@@ -220,7 +220,7 @@ def request_approval(
         WHERE operation_hash = ? AND status IN ('pending', 'approved')
         ORDER BY id DESC
         LIMIT 1
-        """,  # noqa: S608 -- fixed column list
+        """,
         (op_hash,),
     ).fetchone()
     if existing is not None:
@@ -259,7 +259,7 @@ def get_approval(conn: Connection, op_hash: str) -> dict:
         WHERE operation_hash = ?
         ORDER BY id DESC
         LIMIT 1
-        """,  # noqa: S608 -- fixed column list
+        """,
         (op_hash,),
     ).fetchone()
     if row is None:
@@ -269,7 +269,7 @@ def get_approval(conn: Connection, op_hash: str) -> dict:
 
 def get_approval_by_id(conn: Connection, approval_id: int) -> dict:
     row = conn.execute(
-        f"SELECT {_APPROVAL_COLUMNS} FROM approvals WHERE id = ?",  # noqa: S608 -- fixed column list
+        f"SELECT {_APPROVAL_COLUMNS} FROM approvals WHERE id = ?",
         (approval_id,),
     ).fetchone()
     if row is None:
