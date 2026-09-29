@@ -41,7 +41,7 @@ Everything an agent does — claim, renew, checkpoint, hand off, release — wri
 
 ## Installation
 
-Requirements: **Python 3.11–3.14**, **git**. There is no database to install, no server to run, and no extension to provision: the store is a single SQLite 3 database file under `QUORUMGIT_DATA_DIR`, accessed through Python's standard-library [`sqlite3`](https://docs.python.org/3/library/sqlite3.html) module. QuorumGit has no third-party runtime dependencies. The Python interpreter must be linked against SQLite 3.38 or newer (every supported CPython release from python.org, Homebrew, and current Linux distributions is); `quorumgit` refuses to open the store otherwise.
+Requirements: **Python 3.11–3.14**, **Git 2.17 or newer** (the first release with `git worktree remove`). There is no database to install, no server to run, and no extension to provision: the store is a single SQLite 3 database file under `QUORUMGIT_DATA_DIR`, accessed through Python's standard-library [`sqlite3`](https://docs.python.org/3/library/sqlite3.html) module. QuorumGit has no third-party runtime dependencies. The Python interpreter must be linked against SQLite 3.38 or newer (every supported CPython release from python.org, Homebrew, and current Linux distributions is); `quorumgit` refuses to open the store otherwise.
 
 > **Platform note.** Linux, macOS, and Windows are supported on every Python from 3.11 to 3.14.
 
