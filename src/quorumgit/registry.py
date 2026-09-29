@@ -8,7 +8,6 @@ from pathlib import Path
 from . import audit
 from .store import Connection, begin_immediate
 
-
 ROLES = ("worker", "reviewer", "operator")
 DEFAULT_ROLE = "worker"
 

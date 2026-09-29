@@ -168,10 +168,9 @@ def test_session_commits_rolls_back_and_closes(tmp_path):
         with pytest.raises(sqlite3.ProgrammingError, match="closed"):
             conn.execute("SELECT 1")
 
-        with pytest.raises(RuntimeError):
-            with store.session(local) as conn:
-                conn.execute("INSERT INTO agents (name) VALUES ('dropped')")
-                raise RuntimeError("abort")
+        with pytest.raises(RuntimeError), store.session(local) as conn:
+            conn.execute("INSERT INTO agents (name) VALUES ('dropped')")
+            raise RuntimeError("abort")
 
         check = store.connect(local)
         try:
