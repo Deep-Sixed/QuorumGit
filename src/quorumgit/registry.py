@@ -28,6 +28,17 @@ def approvers_for_repository(conn: Connection, repository_id: int) -> list[str]:
     ]
 
 
+def open_namespaces_for_repository(conn: Connection, repository_id: int) -> list[str]:
+    return [
+        row[0]
+        for row in conn.execute(
+            "SELECT prefix FROM open_ref_namespaces WHERE repository_id = ? "
+            "ORDER BY prefix",
+            (repository_id,),
+        ).fetchall()
+    ]
+
+
 def _protected_refs(conn: Connection, repository_id: int) -> list[str]:
     return [
         row[0]
@@ -180,6 +191,7 @@ def get_repository(conn: Connection, name: str) -> dict:
         "protected_refs": _protected_refs(conn, row[0]),
         "approvers": approvers_for_repository(conn, row[0]),
         "separate_duties": bool(row[3]),
+        "open_namespaces": open_namespaces_for_repository(conn, row[0]),
     }
 
 
@@ -290,3 +302,64 @@ def set_separate_duties(conn: Connection, repository: str, enabled: bool) -> Non
         repo["id"],
         detail={"repository": repository, "separate_duties": enabled},
     )
+
+
+# ------------------------------------------------------------ ref namespaces
+
+
+def _normalize_namespace(prefix: str) -> str:
+    prefix = prefix.strip()
+    if not prefix.endswith("/"):
+        prefix += "/"
+    if not prefix.startswith("refs/") or prefix.count("/") < 2 or prefix == "refs/":
+        raise RegistryError(
+            f"Ref namespace must look like 'refs/<name>/', got {prefix!r}."
+        )
+    if prefix.startswith("refs/heads/"):
+        raise RegistryError(
+            "Branches (refs/heads/) are governed by claims, protected refs, and "
+            "approvals; they cannot be opened as a namespace."
+        )
+    return prefix
+
+
+def open_namespace(conn: Connection, repository: str, prefix: str) -> str:
+    """Let ref updates under a non-branch namespace skip approval."""
+    begin_immediate(conn)
+    repo = get_repository(conn, repository)
+    prefix = _normalize_namespace(prefix)
+    if prefix in repo["open_namespaces"]:
+        raise RegistryError(f"{prefix} is already open in {repository}.")
+    conn.execute(
+        "INSERT INTO open_ref_namespaces (repository_id, prefix) VALUES (?, ?)",
+        (repo["id"], prefix),
+    )
+    audit.record(
+        conn,
+        "repository.namespace_opened",
+        "repository",
+        repo["id"],
+        detail={"repository": repository, "prefix": prefix},
+    )
+    return prefix
+
+
+def close_namespace(conn: Connection, repository: str, prefix: str) -> str:
+    """Require approval again for ref updates under a namespace."""
+    begin_immediate(conn)
+    repo = get_repository(conn, repository)
+    prefix = _normalize_namespace(prefix)
+    cur = conn.execute(
+        "DELETE FROM open_ref_namespaces WHERE repository_id = ? AND prefix = ?",
+        (repo["id"], prefix),
+    )
+    if cur.rowcount != 1:
+        raise RegistryError(f"{prefix} is not open in {repository}.")
+    audit.record(
+        conn,
+        "repository.namespace_closed",
+        "repository",
+        repo["id"],
+        detail={"repository": repository, "prefix": prefix},
+    )
+    return prefix

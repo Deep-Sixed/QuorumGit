@@ -169,6 +169,29 @@ def cmd_repo_policy(args, cfg) -> int:
     return 0
 
 
+def cmd_repo_namespace_open(args, cfg) -> int:
+    with store.connect(cfg) as conn:
+        prefix = registry.open_namespace(conn, args.repo, args.prefix)
+        conn.commit()
+    print(f"{prefix} is open in {args.repo}: updates there need no approval.")
+    return 0
+
+
+def cmd_repo_namespace_close(args, cfg) -> int:
+    with store.connect(cfg) as conn:
+        prefix = registry.close_namespace(conn, args.repo, args.prefix)
+        conn.commit()
+    print(f"{prefix} is closed in {args.repo}: updates there need an approval.")
+    return 0
+
+
+def cmd_repo_namespace_list(args, cfg) -> int:
+    with store.connect(cfg) as conn:
+        for prefix in registry.get_repository(conn, args.repo)["open_namespaces"]:
+            print(prefix)
+    return 0
+
+
 def cmd_agent_add(args, cfg) -> int:
     with store.connect(cfg) as conn:
         agent_id = registry.add_agent(conn, args.name)
@@ -533,6 +556,20 @@ def build_parser() -> argparse.ArgumentParser:
     ), parent=approver)
     add("list", cmd_repo_approver_list,
         lambda sp: sp.add_argument("repo"), parent=approver)
+    namespace = repo.add_parser(
+        "namespace",
+        help="non-branch ref namespaces (refs/tags/, …) that skip approval",
+    ).add_subparsers(dest="action", required=True)
+    add("open", cmd_repo_namespace_open, lambda sp: (
+        sp.add_argument("repo"),
+        sp.add_argument("prefix", help="e.g. refs/tags/"),
+    ), parent=namespace)
+    add("close", cmd_repo_namespace_close, lambda sp: (
+        sp.add_argument("repo"),
+        sp.add_argument("prefix"),
+    ), parent=namespace)
+    add("list", cmd_repo_namespace_list,
+        lambda sp: sp.add_argument("repo"), parent=namespace)
     add("policy", cmd_repo_policy, lambda sp: (
         sp.add_argument("repo"),
         sp.add_argument("--separate-duties", dest="separate_duties",

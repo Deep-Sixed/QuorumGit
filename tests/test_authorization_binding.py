@@ -23,7 +23,11 @@ def _agents(conn, *names):
         conn.execute("INSERT INTO agents (name) VALUES (?) ON CONFLICT DO NOTHING", (name,))
 
 
-UPGRADES_AFTER_001 = ["002_approval_identities.sql", "003_approver_policy.sql"]
+UPGRADES_AFTER_001 = [
+    "002_approval_identities.sql",
+    "003_approver_policy.sql",
+    "004_open_ref_namespaces.sql",
+]
 
 
 def _apply_001(cfg: Config):

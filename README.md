@@ -58,7 +58,7 @@ Then initialize the store once:
 ```bash
 $ quorumgit init
 store: /home/you/.quorumgit/quorumgit.db
-migrations applied: ['001_core.sql', '002_approval_identities.sql', '003_approver_policy.sql']
+migrations applied: ['001_core.sql', '002_approval_identities.sql', '003_approver_policy.sql', '004_open_ref_namespaces.sql']
 contract: ok
 ```
 
@@ -171,7 +171,7 @@ Checkpoints in the hub model take an explicit `--commit <oid>`. Continuation poi
 
 ## Protected operations and approvals
 
-Updates to protected refs, force pushes, ref deletions, pushes that change paths outside the pusher's claimed scopes, and lease takeovers all require an approval. An approval is bound by SHA-256 hash to the **exact operation payload** (canonical JSON) — approving one push authorizes that push at those exact revisions, and nothing else.
+Updates to protected refs, force pushes, ref deletions, pushes that change paths outside the pusher's claimed scopes, updates to refs outside `refs/heads/`, and lease takeovers all require an approval. An approval is bound by SHA-256 hash to the **exact operation payload** (canonical JSON) — approving one push authorizes that push at those exact revisions, and nothing else.
 
 The flow, driven by the rejection messages themselves:
 
@@ -223,6 +223,16 @@ Every roster and policy change is audited. Without a roster or separation of dut
 
 `approve request --push` runs the hook's own derivation against the hub, with your clone's object store attached read-only (the way Git exposes incoming objects to a pre-receive hook). It fetches and writes nothing, reads the old revision from the hub's current ref, resolves `--rev` (default `HEAD`) in `--from`, and produces the same operation the hook will compute — protected update, force push, deletion (`--delete`), or out-of-scope update with its path list — for the agent named by `--pusher` (default: the requester). It applies the same branch reservations as the hook, so a push the hook would refuse outright is refused here too. If the hub's ref moves before you push, the operation no longer matches: derive and request again.
 
+**Refs outside branches are governed too.** Claims only coordinate `refs/heads/*`, so a push that creates or moves anything else — a tag, a note, a custom `refs/…` ref — is a `non_branch_ref_update` and needs an approval bound to that exact update. For annotated tags the operation names the tag object, so derive it with `--rev <tag>`: `quorumgit approve request --repo myproject --push refs/tags/v1.0 --from ./my-clone --rev v1.0`. A repository that wants a namespace ungoverned (for example, release tooling that tags freely) opens it explicitly:
+
+```bash
+quorumgit repo namespace open myproject refs/tags/     # tag pushes need no approval
+quorumgit repo namespace list myproject
+quorumgit repo namespace close myproject refs/tags/    # governed again
+```
+
+Opening a namespace only lifts the non-branch rule: deleting or force-moving a ref there, or updating one listed with `--protected-ref`, still needs an approval. `refs/heads/` itself cannot be opened. Opening and closing are audited.
+
 Takeovers follow the same pattern: claiming a task someone else holds (`claim <task> --takeover`) prints the takeover operation to approve. Its payload includes the incumbent claim ID, so an unused approval cannot displace a later claim by the same agent. The takeover is atomic — the incumbent is released, the replacement claim created, and the approval consumed in one transaction, or none of it happens. A refused takeover leaves the incumbent untouched and the approval unconsumed.
 
 ## Command reference
@@ -236,6 +246,7 @@ Takeovers follow the same pattern: claiming a task someone else holds (`claim <t
 | `quorumgit repo add <name> <path> [--protected-ref <ref>]…` | Register a repository |
 | `quorumgit repo approver add\|remove <repo> <agent>` / `repo approver list <repo>` | Manage a repository's approver roster |
 | `quorumgit repo policy <repo> [--separate-duties \| --no-separate-duties]` | Show or change a repository's approval policy |
+| `quorumgit repo namespace open\|close <repo> <refs/prefix/>` / `repo namespace list <repo>` | Let updates under a non-branch ref namespace skip approval, or govern it again |
 | `quorumgit agent add <name>` | Register an agent identity |
 | `quorumgit task add --repo <name> --title <t> [--objective <o>]` | Create a task |
 | `quorumgit claim <task> --branch <b> --scope <glob>… [--no-worktree] [--takeover] [--override-overlap] [--lease-hours <h>]` | Claim a task |

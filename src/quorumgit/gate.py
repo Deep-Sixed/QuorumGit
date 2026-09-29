@@ -562,13 +562,18 @@ def governed_operation(
             )
 
     protected = refname in repo["protected_refs"]
+    # Only branches are coordinated by claims; tags, notes, and custom refs
+    # are governed by approval unless the repository opened their namespace.
+    outside_branches = not refname.startswith("refs/heads/") and not any(
+        refname.startswith(prefix) for prefix in repo["open_namespaces"]
+    )
     forced = (
         not deletion
         and not _is_zero(oldrev)
         and not _is_fast_forward(git_dir, oldrev, newrev, env)
     )
 
-    if not (protected or deletion or forced or out_of_scope):
+    if not (protected or deletion or forced or out_of_scope or outside_branches):
         return None
     if protected:
         op_type = "protected_ref_update"
@@ -576,6 +581,8 @@ def governed_operation(
         op_type = "ref_delete"
     elif forced:
         op_type = "force_update"
+    elif outside_branches:
+        op_type = "non_branch_ref_update"
     else:
         op_type = "out_of_scope_update"
     operation: dict[str, Any] = {
@@ -624,9 +631,12 @@ def derive_push_operation(
     repo = get_repository(conn, repository)
     get_agent(conn, pusher)
     hub_git_dir = str(assert_repository_identity_unique(conn, repo))
+    # Branches point at commits. Other refs (an annotated tag, say) are pushed
+    # as the object itself, which is what the hook sees, so do not peel them.
+    peel = "^{commit}" if refname.startswith("refs/heads/") else ""
     current = subprocess.run(
         ["git", "--git-dir", hub_git_dir, "rev-parse", "--verify", "--quiet",
-         f"{refname}^{{commit}}"],
+         f"{refname}{peel}"],
         capture_output=True,
         text=True,
         check=False,
@@ -644,8 +654,8 @@ def derive_push_operation(
             raise GateError("Deriving a push needs --from <your clone>.")
         source_path = Path(source).resolve()
         newrev = _git_out(
-            ["-C", str(source_path), "rev-parse", "--verify", f"{rev}^{{commit}}"],
-            f"Cannot resolve {rev!r} to a commit in {source_path}",
+            ["-C", str(source_path), "rev-parse", "--verify", f"{rev}{peel}"],
+            f"Cannot resolve {rev!r} in {source_path}",
         )
         try:
             source_common = git_common_dir(source_path)
