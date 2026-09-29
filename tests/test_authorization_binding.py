@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import uuid
 from pathlib import Path
 
@@ -229,7 +230,7 @@ def test_identity_migration_preserves_and_backfills_history(tmp_path):
         assert store.json_loads(invalidation[0], {})["reason"] == (
             "unregistered historical voter"
         )
-        with pytest.raises(ValueError, match="registered agent"):
+        with pytest.raises(sqlite3.IntegrityError, match="registered agent"):
             migrated.execute(
                 "INSERT INTO approvals (operation_hash, operation) VALUES (?, ?)",
                 ("sha256:" + "1" * 64, store.json_dumps(operation)),

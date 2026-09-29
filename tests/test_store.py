@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -60,13 +61,32 @@ def test_incomplete_store_fails_loud(tmp_path):
         store.verify_contract(cfg)
 
 
-def test_begin_immediate_waiter_acquires_after_holder_releases(initialized_store):
-    """A contended writer succeeds after release instead of timing out.
+def test_old_sqlite_fails_loud(monkeypatch, tmp_path):
+    monkeypatch.setattr(store.sqlite3, "sqlite_version_info", (3, 37, 2))
+    cfg = Config(data_dir=tmp_path / "old-sqlite", agent=None)
+    with pytest.raises(store.ContractViolation, match="3.38.0 or newer"):
+        store.open_connection(cfg)
+    assert not store.database_path(cfg).exists()
 
-    libsql 0.1.11's native busy handler can otherwise sleep for the whole
-    timeout and still raise after the holder has committed. This pins the
-    polling behavior in store.begin_immediate().
-    """
+
+def test_begin_immediate_times_out_while_writer_holds_lock(initialized_store):
+    holder = store.connect(initialized_store)
+    waiter = store.connect(initialized_store)
+    try:
+        store.begin_immediate(holder)
+        with pytest.raises(store.StoreError, match="write lock"):
+            store.begin_immediate(waiter, timeout_seconds=0.1)
+        assert not waiter.in_transaction
+        busy_timeout = waiter.execute("PRAGMA busy_timeout").fetchone()[0]
+        assert busy_timeout == round(store.DEFAULT_BUSY_TIMEOUT_SECONDS * 1000)
+    finally:
+        holder.rollback()
+        holder.close()
+        waiter.close()
+
+
+def test_begin_immediate_waiter_acquires_after_holder_releases(initialized_store):
+    """A contended writer succeeds after release instead of timing out."""
     holder = store.connect(initialized_store)
     waiter = store.connect(initialized_store)
     acquired = threading.Event()
@@ -134,5 +154,5 @@ def test_audit_append_only(conn):
     conn.execute(
         "INSERT INTO audit_events (event_type, entity) VALUES ('t', 'probe')"
     )
-    with pytest.raises(ValueError, match="append-only"):
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         conn.execute("DELETE FROM audit_events WHERE entity = 'probe'")
