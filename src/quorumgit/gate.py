@@ -11,8 +11,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from . import audit
 from .canonical import stable_hash
@@ -309,6 +310,7 @@ def _is_fast_forward(git_dir: str, oldrev: str, newrev: str) -> bool:
             newrev,
         ],
         capture_output=True,
+        check=False,
     )
     if result.returncode not in (0, 1):
         raise PushRejected("Unable to determine fast-forward status.")
@@ -320,6 +322,7 @@ def _invoking_git_common_dir(git_dir: str) -> Path:
         ["git", "--git-dir", git_dir, "rev-parse", "--git-common-dir"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
@@ -454,7 +457,7 @@ def run_pre_receive(
             check_ref_update(conn, repository, git_dir, pusher, *parts)
         if not saw_update:
             raise PushRejected("No ref updates supplied on stdin.")
-    except Exception as exc:  # fail closed on anything
+    except Exception as exc:  # noqa: BLE001 — fail closed on anything
         conn.rollback()
         print(f"[quorumgit] REJECTED: {exc}", file=sys.stderr)
         return 1
@@ -469,6 +472,7 @@ def _effective_pre_receive_hook(repository_path: str | Path) -> Path:
         ["git", "-C", str(repo_path), "rev-parse", "--git-path", "hooks/pre-receive"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()

@@ -54,7 +54,7 @@ def cmd_status(args, cfg) -> int:
         return 1
     with store.connect(cfg) as conn:
         for table in ("repositories", "agents", "tasks", "claims", "handoffs"):
-            row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()  # noqa: S608 — fixed identifier set
+            row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()
             assert row is not None
             print(f"{table}: {row[0]}")
     return 0
