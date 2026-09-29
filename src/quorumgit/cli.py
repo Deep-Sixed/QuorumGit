@@ -198,6 +198,20 @@ def cmd_task_list(args, cfg) -> int:
     return 0
 
 
+def cmd_task_done(args, cfg) -> int:
+    agent = _agent(args, cfg)
+    with store.session(cfg) as conn:
+        claim_id = work.complete_task(conn, args.task_id, agent, note=args.note)
+        removed = args.remove_worktree and trees.cleanup_released_worktree(
+            conn, claim_id, agent=agent, reason="task_done",
+            event_type="worktree.task_done_cleanup",
+        )
+    print(f"task {args.task_id} done (claim {claim_id} released).")
+    if removed:
+        print("worktree removed.")
+    return 0
+
+
 def cmd_claim(args, cfg) -> int:
     agent = _agent(args, cfg)
     with store.session(cfg) as conn:
@@ -535,6 +549,14 @@ def build_parser() -> argparse.ArgumentParser:
     ), parent=task)
     add("list", cmd_task_list,
         lambda sp: sp.add_argument("--repo"), parent=task)
+    add("done", cmd_task_done, lambda sp: (
+        sp.add_argument("task_id", type=int),
+        sp.add_argument("--agent"),
+        sp.add_argument("--note", default=""),
+        sp.add_argument("--remove-worktree", action="store_true",
+                        help="remove the claim's worktree; refused if it has "
+                             "uncommitted changes"),
+    ), parent=task)
 
     add("claim", cmd_claim, lambda sp: (
         sp.add_argument("task_id", type=int),
