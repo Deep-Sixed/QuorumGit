@@ -62,6 +62,12 @@ def _claim_id(output: str) -> int:
     return int(match.group(1))
 
 
+def _worktree(conn, claim_id: int) -> dict:
+    wt = trees.worktree_for_claim(conn, claim_id)
+    assert wt is not None, f"claim {claim_id} has no worktree"
+    return wt
+
+
 def _no_traceback(result) -> None:
     assert "Traceback" not in result.stderr, result.stderr
     assert result.returncode == 1, (result.stdout, result.stderr)
@@ -217,7 +223,7 @@ def test_approved_takeover_on_same_branch_inherits_worktree(
                  "--scope", "src/**", agent=a)
     assert first.returncode == 0, first.stderr
     old_claim = _claim_id(first.stdout)
-    old_path = trees.worktree_for_claim(conn, old_claim)["path"]
+    old_path = _worktree(conn, old_claim)["path"]
 
     operation = {
         "type": "lease_takeover",
@@ -235,7 +241,7 @@ def test_approved_takeover_on_same_branch_inherits_worktree(
                  "--scope", "src/**", "--takeover", agent=b)
     assert taken.returncode == 0, taken.stderr
     new_claim = _claim_id(taken.stdout)
-    assert trees.worktree_for_claim(conn, new_claim)["path"] == old_path
+    assert _worktree(conn, new_claim)["path"] == old_path
     assert gate.get_approval_by_id(conn, approval["id"])["status"] == "consumed"
 
 
@@ -261,7 +267,7 @@ def test_reclaim_on_a_different_branch_creates_a_fresh_worktree(
     new_claim = _claim_id(second.stdout)
     new_wt = trees.worktree_for_claim(conn, new_claim)
     assert new_wt is not None and new_wt["branch"] == "feat/new"
-    assert trees.worktree_for_claim(conn, old_claim)["removed_at"] is None
+    assert _worktree(conn, old_claim)["removed_at"] is None
 
 
 # ---------------------------------------------------------------- finding 3
@@ -440,7 +446,7 @@ def test_explicit_last_commit_wins_over_worktree_head(committed_conn, tmp_path, 
                    "--scope", "src/**", agent=a)
     assert claimed.returncode == 0, claimed.stderr
     claim_id = _claim_id(claimed.stdout)
-    wt_path = Path(trees.worktree_for_claim(conn, claim_id)["path"])
+    wt_path = Path(_worktree(conn, claim_id)["path"])
     base = _git(wt_path, "rev-parse", "HEAD")
     (wt_path / "src" / "more.py").write_text("x\n")
     _git(wt_path, "add", "-A")
@@ -451,7 +457,9 @@ def test_explicit_last_commit_wins_over_worktree_head(committed_conn, tmp_path, 
                    "--remaining", "r", "--last-commit", base[:10], agent=a)
     assert created.returncode == 0, created.stderr
     assert base in created.stdout
-    hid = int(re.search(r"handoff (\d+) created", created.stdout).group(1))
+    match = re.search(r"handoff (\d+) created", created.stdout)
+    assert match is not None, created.stdout
+    hid = int(match.group(1))
     assert handoff.get_handoff(conn, hid)["record"]["last_commit"] == base
 
 
