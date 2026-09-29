@@ -383,6 +383,7 @@ def cmd_checkpoint(args, cfg) -> int:
             commit = trees.head_commit(wt["path"])
         cp_id = work.add_checkpoint(conn, args.claim_id, agent, commit,
                                     note=args.note)
+        commit = work.checkpoint_commit(conn, cp_id)
         conn.commit()
     print(f"checkpoint {cp_id} at {commit}.")
     return 0
@@ -394,12 +395,16 @@ def cmd_checkpoint(args, cfg) -> int:
 def cmd_handoff_create(args, cfg) -> int:
     agent = _agent(args, cfg)
     with store.session(cfg) as conn:
-        wt = trees.active_worktree_for_claim(conn, args.claim_id)
-        last_commit = trees.head_commit(wt["path"]) if wt else args.last_commit
+        # An explicit --last-commit always wins; otherwise continue from the
+        # managed worktree's HEAD.
+        last_commit = args.last_commit
         if not last_commit:
-            print("Provide --last-commit (no active worktree for this claim).",
-                  file=sys.stderr)
-            return 1
+            wt = trees.active_worktree_for_claim(conn, args.claim_id)
+            if wt is None:
+                print("Provide --last-commit (no active worktree for this claim).",
+                      file=sys.stderr)
+                return 1
+            last_commit = trees.head_commit(wt["path"])
         record = {
             "completed": args.completed,
             "remaining": args.remaining,
@@ -414,6 +419,7 @@ def cmd_handoff_create(args, cfg) -> int:
         handoff_id = handoff.create_handoff(
             conn, args.claim_id, agent, record, to_agent=args.to
         )
+        last_commit = handoff.get_handoff(conn, handoff_id)["record"]["last_commit"]
         conn.commit()
     print(f"handoff {handoff_id} created (last commit {last_commit}).")
     return 0
@@ -468,9 +474,12 @@ def cmd_handoff_cancel(args, cfg) -> int:
 
 
 def _operation_from_args(args) -> dict:
-    operation = json.loads(args.operation)
+    try:
+        operation = json.loads(args.operation)
+    except json.JSONDecodeError as exc:
+        raise gate.GateError(f"Operation is not valid JSON: {exc}") from exc
     if not isinstance(operation, dict):
-        raise SystemExit("Operation must be a JSON object.")
+        raise gate.GateError("Operation must be a JSON object.")
     return operation
 
 
