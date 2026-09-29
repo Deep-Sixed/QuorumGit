@@ -224,7 +224,7 @@ approvals required (1):
 re-run with --request to open these approvals.
 ```
 
-`--request` opens an approval for each required operation (as `--agent`/`QUORUMGIT_AGENT`), `--json` prints the plan for tooling, `--delete` plans a ref deletion, and `-C <path>` names a clone other than the current directory. Nothing is pushed or changed without `--request`. It exits non-zero when the push would be refused outright (outside the allowed namespaces, a frozen branch, or a branch claimed by someone else). Fetch first if the hub has moved: the plan is bound to the hub's current ref value, and a stale plan's hash simply won't match.
+`--request` opens an approval for each required operation (as `--agent`/`QUORUMGIT_AGENT`), `--json` prints the plan for tooling, `--delete` plans a ref deletion, and `-C <path>` names a clone other than the current directory. Nothing is pushed or changed without `--request`. It exits non-zero when the push would be refused outright (outside the allowed namespaces, a frozen branch, or a branch claimed by someone else). Fetch first: the plan is bound to the hub's current ref values, so `prepare` refuses to plan from a clone missing any commit a hub ref points at (a single-branch clone, say), and a plan made before the hub moved simply won't match.
 
 ## Protected operations and approvals
 

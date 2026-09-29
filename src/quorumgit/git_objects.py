@@ -26,6 +26,30 @@ def is_zero(oid: str) -> bool:
     return set(oid) == {"0"}
 
 
+def zero_oid_like(oid: str) -> str:
+    """The null OID in the same object format (SHA-1 or SHA-256) as oid.
+
+    Git spells "no object" with as many zeros as its hash has hex digits, and
+    the hook receives it that way, so a planned operation must match.
+    """
+    return "0" * len(oid)
+
+
+def _text_path(path: str) -> str:
+    """A path as stable, encodable text.
+
+    Git paths are bytes. Valid UTF-8 is kept as is; any other byte is written
+    as a ``\\xNN`` escape, so the path can be hashed, stored, and shown, and
+    every caller derives the same text for the same bytes.
+    """
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        raw = path.encode("utf-8", "surrogateescape")
+        return raw.decode("utf-8", "backslashreplace")
+    return path
+
+
 def _git(git_dir: str | Path, *args: str, stdin: str | None = None) -> str:
     result = subprocess.run(
         ["git", "--git-dir", str(git_dir), *args],
@@ -155,7 +179,7 @@ def commit_paths(git_dir: str | Path, commit: str) -> list[str]:
         "diff-tree", "-r", "-c", "--root", "--no-renames", "--name-only",
         "--no-commit-id", "-z", commit,
     )
-    return [path for path in out.split("\0") if path]
+    return [_text_path(path) for path in out.split("\0") if path]
 
 
 def changed_paths(

@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -332,3 +334,101 @@ def test_prepare_reports_refusals_without_writing(committed_conn, tmp_path, cfg)
         "protected_ref_update"
     ]
     assert deletion["paths"] == []
+
+
+# ------------------------------------------------- review regressions (#23)
+
+
+def test_prepare_refuses_a_clone_missing_hub_tips(committed_conn, tmp_path, cfg):
+    """A tip the clone lacks would make already-governed commits look new."""
+    conn = committed_conn
+    repo_name, hub, clone, a, _b = _setup(conn, tmp_path)
+    _git(clone, "checkout", "-b", "feat/other")
+    _edit(clone, "docs/other.md", message="other")
+    assert _push(clone, a, "feat/other", cfg=cfg).returncode == 0
+
+    narrow = tmp_path / "narrow"
+    _git(
+        tmp_path, "clone", "--no-local", "--single-branch", "--branch", "main",
+        str(hub), str(narrow),
+    )
+    _git(narrow, "checkout", "-b", "feat/mine")
+    _edit(narrow, "src/mine.py", message="mine")
+    with pytest.raises(gate.GateError, match="lacks 1 commit"):
+        gate.prepare_push(conn, repo_name, "feat/mine", narrow)
+
+    _git(narrow, "fetch", "origin", "feat/other")
+    plan = gate.prepare_push(conn, repo_name, "feat/mine", narrow)
+    assert plan["paths"] == ["src/mine.py"]
+
+
+def _sha256_supported(tmp_path: Path) -> bool:
+    probe = subprocess.run(
+        ["git", "init", "-q", "--object-format=sha256", str(tmp_path / "probe")],
+        capture_output=True,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
+def test_prepare_matches_the_hook_in_sha256_repositories(
+    committed_conn, tmp_path, cfg
+):
+    if not _sha256_supported(tmp_path):
+        pytest.skip("git without SHA-256 object format support")
+    conn = committed_conn
+    seed = tmp_path / "seed256"
+    _git(tmp_path, "init", "-q", "-b", "main", "--object-format=sha256", str(seed))
+    _edit(seed, "README.md", message="seed")
+    hub = tmp_path / "hub256.git"
+    _git(tmp_path, "clone", "--bare", str(seed), str(hub))
+    repo_name = f"hub256-{uuid.uuid4().hex[:8]}"
+    registry.add_repository(
+        conn, repo_name, hub, protected_refs=["refs/heads/main"],
+        protected_paths=["secrets/**"],
+    )
+    agent = f"agent-256-{uuid.uuid4().hex[:8]}"
+    registry.add_agent(conn, agent)
+    gate.install_hook(conn, repo_name)
+    conn.commit()
+    clone = tmp_path / "clone256"
+    _git(tmp_path, "clone", str(hub), str(clone))
+
+    _git(clone, "checkout", "-b", "feat/new")
+    _edit(clone, "secrets/key.txt", message="new ref")
+    rejected = _push(clone, agent, "feat/new", cfg=cfg)
+    assert rejected.returncode != 0
+    plan = gate.prepare_push(conn, repo_name, "feat/new", clone)
+    assert plan["oldrev"] == "0" * 64
+    entry = _required(plan)["protected_path_update"]
+    assert entry["hash"] in rejected.stderr
+
+    deletion = gate.prepare_push(conn, repo_name, "main", clone, None)
+    assert deletion["newrev"] == "0" * 64
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="needs a filesystem that accepts non-UTF-8 names"
+)
+def test_non_utf8_paths_can_be_approved(committed_conn, tmp_path, cfg):
+    conn = committed_conn
+    repo_name, _hub, clone, a, _b = _setup(conn, tmp_path)
+    _claimed_branch(conn, repo_name, a, "feat/bytes", ["src/**"])
+    _git(clone, "checkout", "-b", "feat/bytes")
+    with open(os.fsencode(clone) + b"/caf\xe9.txt", "wb") as handle:
+        handle.write(b"bytes\n")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "non-utf8 name")
+
+    rejected = _push(clone, a, "feat/bytes", cfg=cfg)
+    assert rejected.returncode != 0
+    assert "out_of_scope_push" in rejected.stderr
+    plan = gate.prepare_push(conn, repo_name, "feat/bytes", clone)
+    entry = _required(plan)["out_of_scope_push"]
+    assert entry["operation"]["paths"] == ["caf\\xe9.txt"]
+    assert entry["hash"] in rejected.stderr
+
+    approve(conn, entry["operation"], requested_by=a)
+    conn.commit()
+    accepted = _push(clone, a, "feat/bytes", cfg=cfg)
+    assert accepted.returncode == 0, accepted.stderr

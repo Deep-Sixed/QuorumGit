@@ -24,7 +24,7 @@ from typing import Any
 
 from . import audit, git_objects
 from .canonical import stable_hash
-from .git_objects import ZERO_OID, is_zero
+from .git_objects import is_zero, zero_oid_like
 from .registry import (
     RegistryError,
     approval_policy,
@@ -685,16 +685,32 @@ def prepare_push(
     hub_dir = git_common_dir(repo["path"])
     local_dir = git_objects.absolute_git_dir(local_path)
     oldrev = git_objects.ref_value(hub_dir, refname)
-    newrev = ZERO_OID if new is None else git_objects.resolve_object(local_dir, new)
+    if new is None:
+        if is_zero(oldrev):
+            raise GateError(f"{refname} does not exist in {repository!r}.")
+        newrev = zero_oid_like(oldrev)
+    else:
+        newrev = git_objects.resolve_object(local_dir, new)
+        if is_zero(oldrev):
+            oldrev = zero_oid_like(newrev)
     if not is_zero(oldrev) and not git_objects.object_exists(local_dir, oldrev):
         raise GateError(
             f"{refname} is at {oldrev} in {repository!r}, which your clone does "
             "not have; fetch before preparing this push."
         )
-    known = [
-        tip for tip in git_objects.ref_tips(hub_dir)
-        if git_objects.object_exists(local_dir, tip)
+    known = git_objects.ref_tips(hub_dir)
+    missing = [
+        tip for tip in known if not git_objects.object_exists(local_dir, tip)
     ]
+    if missing and not is_zero(newrev):
+        # Commits reachable from a tip the clone lacks would look new here but
+        # not to the hook, so the derived paths (and hashes) would differ.
+        raise GateError(
+            f"Your clone lacks {len(missing)} commit(s) that refs in "
+            f"{repository!r} point at (for example {missing[0]}); fetch every "
+            "ref you can push to before preparing this push, so the plan "
+            "matches what the hook will see."
+        )
     paths = git_objects.changed_paths(local_dir, oldrev, newrev, known)
 
     refusals: list[str] = []
