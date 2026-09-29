@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -161,43 +159,5 @@ def test_session_commits_rolls_back_and_closes(tmp_path):
         finally:
             check.close()
         assert "kept" in names and "dropped" not in names
-    finally:
-        store.destroy(local)
-
-
-def test_cli_process_retains_connections_instead_of_closing(tmp_path):
-    """libsql 0.1.11 double-closes SQLite on teardown; the CLI never tears down.
-
-    Runs in a subprocess because retention is process-wide by design.
-    """
-    local = Config(data_dir=tmp_path / "retain", agent=None)
-    store.migrate(local)
-    script = f"""
-from pathlib import Path
-from quorumgit import store
-from quorumgit.config import Config
-cfg = Config(data_dir=Path({str(local.data_dir)!r}), agent=None)
-store.retain_connections_for_process()
-with store.session(cfg) as conn:
-    conn.execute("INSERT INTO agents (name) VALUES ('retained')")
-assert conn.execute("SELECT 1").fetchone()[0] == 1, "connection was closed"
-store.begin_immediate(conn)
-conn.execute("INSERT INTO agents (name) VALUES ('never-committed')")
-store.release(conn)
-assert not conn.in_transaction, "retained connection kept its transaction"
-import os
-os._exit(0)  # as cli.run does: never let interpreter shutdown tear conn down
-"""
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", script], capture_output=True, text=True
-        )
-        assert result.returncode == 0, result.stderr
-        check = store.connect(local)
-        try:
-            names = {r[0] for r in check.execute("SELECT name FROM agents").fetchall()}
-        finally:
-            check.close()
-        assert "retained" in names and "never-committed" not in names
     finally:
         store.destroy(local)

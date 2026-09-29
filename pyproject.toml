@@ -22,7 +22,7 @@ dependencies = [
 dev = ["pytest>=8", "ruff>=0.6", "pyright>=1.1.380"]
 
 [project.scripts]
-quorumgit = "quorumgit.cli:run"
+quorumgit = "quorumgit.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

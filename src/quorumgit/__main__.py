@@ -1,3 +1,3 @@
-from .cli import run
+from .cli import main
 
-run()
+raise SystemExit(main())
