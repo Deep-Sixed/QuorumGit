@@ -1,8 +1,9 @@
-"""QuorumGit's single persistent store: one local libSQL database file.
+"""QuorumGit's single persistent store: one local SQLite 3 database file.
 
 There is exactly one storage backend and one operational mode. The database is
-owned by QuorumGit under QUORUMGIT_DATA_DIR; there is no PostgreSQL service,
-external connection string, fallback store, or degraded mode.
+owned by QuorumGit under QUORUMGIT_DATA_DIR and accessed through Python's
+standard-library ``sqlite3`` module; there is no database server, external
+connection string, fallback store, or degraded mode.
 """
 
 from __future__ import annotations
@@ -10,31 +11,19 @@ from __future__ import annotations
 import functools
 import json
 import re
-import time
-from importlib import import_module, resources
+import sqlite3
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
 from .config import Config
 
-# libsql is a PyO3 extension whose runtime exports are not fully represented in
-# its published typing metadata. Keep the third-party typing gap at this one
-# boundary rather than weakening Pyright for the project.
-libsql: Any = import_module("libsql")
-Connection = Any
+Connection = sqlite3.Connection
 
 DATABASE_FILENAME = "quorumgit.db"
 DEFAULT_BUSY_TIMEOUT_SECONDS = 5.0
-
-# libSQL 0.1.11's busy handler does not wake when a write lock is released: a
-# contended BEGIN IMMEDIATE sleeps for the whole PRAGMA busy_timeout and then
-# raises "database is locked", even if the holder committed immediately after
-# the attempt began. A long busy_timeout therefore only delays a guaranteed
-# failure. Instead each attempt fails fast and begin_immediate() polls until
-# DEFAULT_BUSY_TIMEOUT_SECONDS, which does observe the release.
-LOCK_POLL_TIMEOUT_MS = 50
-LOCK_RETRY_INITIAL_SECONDS = 0.002
-LOCK_RETRY_MAX_SECONDS = 0.05
+# unixepoch() (used by the schema defaults) arrived in SQLite 3.38.0.
+MINIMUM_SQLITE_VERSION = (3, 38, 0)
 MIGRATION_SEPARATOR = "-- quorumgit-statement"
 
 REQUIRED_TABLES = (
@@ -85,22 +74,36 @@ def _cfg_for_target(target: Config | str | Path) -> Config:
     return Config(data_dir=path.parent, agent=None)
 
 
-def _configure_connection(conn: Connection, _timeout_seconds: float) -> None:
+def _busy_timeout_ms(timeout_seconds: float) -> int:
+    return max(1, round(timeout_seconds * 1000))
+
+
+def _require_sqlite_version() -> None:
+    if sqlite3.sqlite_version_info < MINIMUM_SQLITE_VERSION:
+        required = ".".join(str(part) for part in MINIMUM_SQLITE_VERSION)
+        raise ContractViolation(
+            f"SQLite {required} or newer is required; this Python is linked "
+            f"against SQLite {sqlite3.sqlite_version}"
+        )
+
+
+def _configure_connection(conn: Connection, timeout_seconds: float) -> None:
+    expected_busy_timeout = _busy_timeout_ms(timeout_seconds)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute(f"PRAGMA busy_timeout = {LOCK_POLL_TIMEOUT_MS}")
+    conn.execute(f"PRAGMA busy_timeout = {expected_busy_timeout}")
 
     foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
     journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
     busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
     if foreign_keys != 1:
-        raise ContractViolation("libSQL connection did not enable foreign keys")
+        raise ContractViolation("SQLite connection did not enable foreign keys")
     if journal_mode != "wal":
         raise ContractViolation(
-            f"libSQL connection did not enter WAL mode: {journal_mode!r}"
+            f"SQLite connection did not enter WAL mode: {journal_mode!r}"
         )
-    if busy_timeout != LOCK_POLL_TIMEOUT_MS:
-        raise ContractViolation("libSQL connection did not apply busy_timeout")
+    if busy_timeout != expected_busy_timeout:
+        raise ContractViolation("SQLite connection did not apply busy_timeout")
 
 
 def open_connection(
@@ -109,13 +112,17 @@ def open_connection(
     """Open the local database without requiring an already-applied schema."""
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be greater than zero")
+    _require_sqlite_version()
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
     conn: Connection | None = None
     try:
-        conn = libsql.connect(
+        conn = sqlite3.connect(
             str(database_path(cfg)),
             timeout=timeout_seconds,
             isolation_level="IMMEDIATE",
+            # A connection may be handed to another thread (never shared
+            # concurrently); SQLite's serialized threading mode permits this.
+            check_same_thread=False,
         )
         _configure_connection(conn, timeout_seconds)
         return conn
@@ -124,7 +131,7 @@ def open_connection(
             conn.close()
         if isinstance(exc, StoreError):
             raise
-        raise StoreError(f"Cannot open local libSQL store: {exc}") from exc
+        raise StoreError(f"Cannot open local SQLite store: {exc}") from exc
 
 
 def connect(cfg: Config) -> Connection:
@@ -140,7 +147,7 @@ def connect(cfg: Config) -> Connection:
     return conn
 
 
-def _is_locked_error(exc: Exception) -> bool:
+def _is_locked_error(exc: sqlite3.OperationalError) -> bool:
     return "locked" in str(exc).lower() or "busy" in str(exc).lower()
 
 
@@ -149,30 +156,30 @@ def begin_immediate(
 ) -> None:
     """Acquire the single-writer reservation before governance reads.
 
-    Polls rather than issuing one blocking BEGIN: see LOCK_POLL_TIMEOUT_MS for
-    why libSQL's own busy handler cannot be relied on to wait here. Raises
-    StoreError once timeout_seconds elapses so a contended governance command
-    fails loudly instead of proceeding without the reservation.
+    SQLite's busy handler waits up to timeout_seconds for a concurrent writer
+    to release the lock. Raises StoreError once that elapses so a contended
+    governance command fails loudly instead of proceeding without the
+    reservation.
     """
     if conn.in_transaction:
         return
-    deadline = time.monotonic() + timeout_seconds
-    delay = LOCK_RETRY_INITIAL_SECONDS
-    while True:
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            return
-        except Exception as exc:
-            if not _is_locked_error(exc):
-                raise
-            if time.monotonic() >= deadline:
-                raise StoreError(
-                    "Could not acquire the store write lock within "
-                    f"{timeout_seconds:g}s; another quorumgit command is "
-                    "holding it. Retry once it finishes."
-                ) from exc
-            time.sleep(delay)
-            delay = min(delay * 2, LOCK_RETRY_MAX_SECONDS)
+    previous_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    requested_ms = _busy_timeout_ms(timeout_seconds)
+    if requested_ms != previous_ms:
+        conn.execute(f"PRAGMA busy_timeout = {requested_ms}")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        if not _is_locked_error(exc):
+            raise
+        raise StoreError(
+            "Could not acquire the store write lock within "
+            f"{timeout_seconds:g}s; another quorumgit command is "
+            "holding it. Retry once it finishes."
+        ) from exc
+    finally:
+        if requested_ms != previous_ms:
+            conn.execute(f"PRAGMA busy_timeout = {previous_ms}")
 
 
 # ---------------------------------------------------------------- lifecycle
@@ -181,7 +188,7 @@ def begin_immediate(
 def ensure_running(cfg: Config) -> str:
     """Compatibility name: ensure the local state directory exists.
 
-    libSQL is embedded and has no server process to start. The returned string
+    SQLite is embedded and has no server process to start. The returned string
     is the local database path retained for the pre-cutover CLI call shape.
     """
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
@@ -189,11 +196,11 @@ def ensure_running(cfg: Config) -> str:
 
 
 def provision_extensions(_target: object) -> None:
-    """No-op compatibility hook: libSQL requires no external extensions."""
+    """No-op compatibility hook: SQLite requires no external extensions."""
 
 
 def stop(_cfg: Config) -> None:
-    """No-op compatibility hook: an embedded libSQL store has no daemon."""
+    """No-op compatibility hook: an embedded SQLite store has no daemon."""
 
 
 def instance_status(cfg: Config) -> dict[str, Any]:
@@ -252,7 +259,7 @@ def _migration_statements(text: str) -> list[str]:
 
 
 def migrate(target: Config | str | Path) -> list[str]:
-    """Apply pending libSQL migrations in filename order."""
+    """Apply pending SQLite migrations in filename order."""
     cfg = _cfg_for_target(target)
     conn = open_connection(cfg)
     applied: list[str] = []
@@ -323,7 +330,7 @@ def _reference_schema() -> dict[tuple[str, str], tuple[str, str | None]]:
     and trigger (including the append-only audit guards) must be present with
     the same definition.
     """
-    conn = libsql.connect(":memory:")
+    conn = sqlite3.connect(":memory:")
     try:
         conn.execute(SCHEMA_MIGRATIONS_DDL)
         for mig in _migration_files():

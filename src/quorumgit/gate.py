@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -778,7 +779,7 @@ def _restore_approval(conn: Connection, update_id: int, approval_id: int) -> Non
             "consumed_by_agent_id = NULL WHERE id = ? AND status = 'consumed'",
             (approval_id,),
         )
-    except ValueError as exc:  # libSQL constraint failure
+    except sqlite3.IntegrityError as exc:
         # A newer live instance for the same operation now exists; the old
         # one stays consumed rather than creating two live approvals.
         audit.record(

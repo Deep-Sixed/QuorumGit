@@ -157,7 +157,7 @@ def test_consumed_operation_can_be_approved_again(conn):
 
 
 def test_consume_approval_concurrent_single_winner(initialized_store):
-    """Two real libSQL connections race to consume one approval; one wins.
+    """Two real SQLite connections race to consume one approval; one wins.
 
     The second consumer is already in flight and blocked on SQLite's writer
     reservation before the first commits. This preserves the original genuine
