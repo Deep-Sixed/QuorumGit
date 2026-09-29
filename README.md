@@ -136,7 +136,7 @@ Every claim attempt is classified against all live claims before it is granted, 
 | `CONFLICTING` | branch already claimed by another task | refused |
 | `BLOCKED` | task already held by an unexpired claim | refused; takeover requires approval |
 
-Scope overlap uses a conservative literal-prefix test (the prefix of one glob up to its first wildcard against the other's) — it errs toward flagging.
+Scopes are normalized when declared (`./src/**`, `/src/**`, `src//**` and `src\**` all become `src/**`; scopes that escape the repository root are refused). Scope overlap then uses a conservative literal-prefix test (the prefix of one glob up to its first wildcard against the other's), compared case-insensitively — it errs toward flagging.
 
 ## Two deployment models
 
@@ -162,6 +162,8 @@ QUORUMGIT_AGENT=agent-one git push origin feat/x    # accepted — owner
 QUORUMGIT_AGENT=agent-two git push origin feat/x    # rejected — branch is claimed
 git push origin feat/x                              # rejected — unidentified
 ```
+
+**Scopes are enforced at push time.** When a branch has a live claim, every commit the push introduces must only touch paths inside that claim's scopes (`**` spans directories, `*` stays within one; a scope without wildcards covers that file or directory). Merge commits count only the paths the merge itself changed, so merging the base branch in is not attributed to the claim holder. In the local model agents commit directly in their worktree, so no hook runs and scopes remain coordination metadata.
 
 The hook learns who is pushing from `QUORUMGIT_AGENT` in its own environment, which Git passes through only when the remote is a **local path** (as `origin` is above). Over SSH or HTTP the variable does not reach the hook, so every push is rejected as unidentified. The hook also opens the store under its own `QUORUMGIT_DATA_DIR`, so pushers must use the same data directory as the rest of the deployment.
 
