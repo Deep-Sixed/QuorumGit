@@ -31,7 +31,7 @@ Eight concepts, in the order you meet them:
 |---|---|
 | **Repository** | A registered Git repo that QuorumGit governs. |
 | **Agent** | A registered identity with one role — `worker` (the default), `reviewer`, or `operator`. Set via `QUORUMGIT_AGENT` or `--agent`. |
-| **Task** | A unit of work against one repository. |
+| **Task** | A unit of work against one repository. Its holder closes it with `task done`; a done task can never be claimed again. |
 | **Claim** | An agent's exclusive lease on a task: names a branch, declares at least one write **scope** (path glob), and expires at a timestamp (default lease: 8 hours, set with `--lease-hours`). Expired leases make the task reclaimable and cannot be renewed — evaluated at read time, no timers. |
 | **Worktree** | An isolated `git worktree` created per claim. Agents never share a mutable checkout; Git itself refuses to check one branch out twice. A claim that supersedes an earlier claim on the same task and branch continues its retained checkout instead of creating a second one. |
 | **Handoff** | A structured continuation record (done / remaining / exact commit / blockers) that transfers work to a successor instead of abandoning it. |
@@ -102,7 +102,13 @@ When the agent stops working, either release:
 quorumgit release 1 --remove-worktree
 ```
 
-Releasing returns the task to `open`, so any agent can claim it again. There is currently no command that marks a task finished — release means "I am no longer working on this", not "this is done".
+Releasing returns the task to `open`, so any agent can claim it again — release means "I am no longer working on this". When the work is finished, the claim holder closes the task instead:
+
+```bash
+quorumgit task done 1 --note "merged in #42" --remove-worktree
+```
+
+`task done` releases the claim and moves the task to the terminal `done` status in one transaction; no one can claim it afterwards. Only the agent holding the task's live, unexpired claim can run it (accept an open handoff first). `--remove-worktree` uses the same non-forced removal as `release`, so a worktree with uncommitted changes refuses the whole command and nothing changes.
 
 …or hand the work to someone else with everything they need to continue:
 
@@ -224,6 +230,7 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit agent role <name> <role>` | Change an agent's role (operator only, after bootstrap) |
 | `quorumgit repo policy <name> [--threshold <n>] [--role <role>]… [--[no-]requester-may-vote]` | Show or change a repository's approval policy (changes are operator only) |
 | `quorumgit task add --repo <name> --title <t> [--objective <o>]` | Create a task |
+| `quorumgit task done <task> [--note <n>] [--remove-worktree]` | Close a task for good — live claim holder only; releases the claim |
 | `quorumgit claim <task> --branch <b> --scope <glob>… [--no-worktree] [--takeover] [--override-overlap] [--lease-hours <h>]` | Claim a task |
 | `quorumgit renew <claim> [--lease-hours <h>]` | Extend a live, unexpired lease; expired claims must be acquired again |
 | `quorumgit checkpoint <claim> [--commit <oid>] [--note <n>]` | Record verified progress |
@@ -239,7 +246,7 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit hook install --repo <name>` | Install the pre-receive hook (hub model) |
 | `quorumgit audit [--entity <e>] [--entity-id <id>] [--limit <n>]` | Read the audit trail |
 
-`repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Commands that act as an agent (`claim`, `renew`, `release`, `checkpoint`, `handoff create/accept/decline/cancel`, `approve request/vote`, and the operator actions `agent add`, `agent role`, `repo policy`) also take `--agent <name>`, which overrides `QUORUMGIT_AGENT`. At least one `--scope` is required to claim. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
+`repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Commands that act as an agent (`claim`, `renew`, `release`, `task done`, `checkpoint`, `handoff create/accept/decline/cancel`, `approve request/vote`, and the operator actions `agent add`, `agent role`, `repo policy`) also take `--agent <name>`, which overrides `QUORUMGIT_AGENT`. At least one `--scope` is required to claim. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
 
 `quorumgit doctor` only checks worktree paths already recorded by QuorumGit. It reports:
 
