@@ -68,6 +68,7 @@ def _push(clone: Path, agent: str | None, *refspec: str, cfg=None):
         capture_output=True,
         text=True,
         env=env,
+        check=False,
     )
 
 

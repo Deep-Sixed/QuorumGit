@@ -59,6 +59,7 @@ def git_common_dir(path: str | Path) -> Path:
         capture_output=True,
         text=True,
         env=path_scoped_git_env(),
+        check=False,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()

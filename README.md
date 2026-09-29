@@ -64,7 +64,7 @@ contract: ok
 
 `init` creates the state directory, applies migrations, and verifies the runtime contract: required tables and migrations, foreign keys on, WAL journal mode, and **every schema object the governance rules depend on**. The expected schema is derived by replaying the bundled migrations in memory, so a store whose append-only audit triggers, single-owner/single-live-approval unique indexes, or identity triggers are missing or altered — or that carries extra indexes or triggers — fails the contract instead of silently losing an invariant. Every command runs this check. It is idempotent — re-run it any time.
 
-`quorumgit status` shows the store path, contract state, and row counts. If the store is down or incomplete, every command exits non-zero: there is **one storage backend and no fallback**, by design.
+`quorumgit status` shows the store path, contract state, and row counts. If the store is missing or incomplete, every command exits non-zero: there is **one storage backend and no fallback**, by design.
 
 ## Quick start (five minutes)
 

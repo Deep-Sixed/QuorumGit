@@ -25,6 +25,7 @@ def _git(repo_path: str | Path, *args: str) -> str:
         ["git", "-C", str(repo_path), *args],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         raise WorktreeError(
@@ -74,7 +75,8 @@ def create_worktree(
                 "--verify",
                 "--quiet",
                 f"refs/heads/{branch}",
-            ]
+            ],
+            check=False,
         ).returncode
         == 0
     )
@@ -121,6 +123,14 @@ def worktree_for_claim(conn: Connection, claim_id: int) -> dict | None:
     return {"id": row[0], "path": row[1], "branch": row[2], "removed_at": row[3]}
 
 
+def active_worktree_for_claim(conn: Connection, claim_id: int) -> dict | None:
+    """The claim's worktree, or None if it has none or it was removed."""
+    wt = worktree_for_claim(conn, claim_id)
+    if wt is None or wt["removed_at"] is not None:
+        return None
+    return wt
+
+
 def transfer_worktree(conn: Connection, worktree_id: int, new_claim_id: int) -> None:
     """Reassign a worktree to a new claim (handoff continuation)."""
     conn.execute(
@@ -140,8 +150,8 @@ def inherit_worktree(
     work in it), exactly as a handoff does. Returns None when there is nothing
     safe to inherit, so the caller creates a fresh worktree instead.
     """
-    wt = worktree_for_claim(conn, from_claim_id)
-    if wt is None or wt["removed_at"] is not None:
+    wt = active_worktree_for_claim(conn, from_claim_id)
+    if wt is None:
         return None
     previous = get_claim(conn, from_claim_id)
     successor = get_claim(conn, to_claim_id)

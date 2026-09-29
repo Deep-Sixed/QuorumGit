@@ -424,6 +424,7 @@ def verify_commit(
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
     oid = resolved.stdout.strip().lower()
     if resolved.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
@@ -443,6 +444,7 @@ def verify_commit(
                     f"refs/heads/{branch}",
                 ],
                 capture_output=True,
+                check=False,
             ).returncode
             == 0
         )
@@ -459,6 +461,7 @@ def verify_commit(
                         f"refs/heads/{branch}",
                     ],
                     capture_output=True,
+                    check=False,
                 ).returncode
                 == 0
             )

@@ -13,8 +13,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from . import audit
 from .canonical import stable_hash
@@ -352,6 +353,7 @@ def _is_fast_forward(git_dir: str, oldrev: str, newrev: str) -> bool:
             newrev,
         ],
         capture_output=True,
+        check=False,
     )
     if result.returncode not in (0, 1):
         raise PushRejected("Unable to determine fast-forward status.")
@@ -385,6 +387,7 @@ def _pushed_paths(git_dir: str, newrev: str) -> list[str]:
             "--all",
         ],
         capture_output=True,
+        check=False,
     )
     if result.returncode != 0:
         raise PushRejected("Unable to determine the paths changed by this push.")
@@ -420,6 +423,7 @@ def _invoking_git_common_dir(git_dir: str) -> Path:
         ["git", "--git-dir", git_dir, "rev-parse", "--git-common-dir"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
@@ -617,7 +621,7 @@ def run_pre_receive(
         # Without the transaction hook nothing would re-validate at update
         # time or consume approvals, so a missing one must reject the push.
         _require_reference_transaction_hook(conn, repository)
-    except Exception as exc:  # fail closed on anything
+    except Exception as exc:  # noqa: BLE001 — fail closed on anything
         conn.rollback()
         print(f"[quorumgit] REJECTED: {exc}", file=sys.stderr)
         return 1
@@ -1008,6 +1012,7 @@ def _effective_hook(repository_path: str | Path, name: str) -> Path:
         ["git", "-C", str(repo_path), "rev-parse", "--git-path", f"hooks/{name}"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()

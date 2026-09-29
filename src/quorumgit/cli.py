@@ -54,7 +54,7 @@ def cmd_status(args, cfg) -> int:
         return 1
     with store.connect(cfg) as conn:
         for table in ("repositories", "agents", "tasks", "claims", "handoffs"):
-            row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()  # noqa: S608 — fixed identifier set
+            row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()
             assert row is not None
             print(f"{table}: {row[0]}")
     return 0
@@ -274,17 +274,12 @@ def cmd_release(args, cfg) -> int:
     return 0
 
 
-def _active_worktree(conn, claim_id: int) -> dict | None:
-    wt = trees.worktree_for_claim(conn, claim_id)
-    return wt if wt and wt["removed_at"] is None else None
-
-
 def cmd_checkpoint(args, cfg) -> int:
     agent = _agent(args, cfg)
     with store.connect(cfg) as conn:
         commit = args.commit
         if not commit:
-            wt = _active_worktree(conn, args.claim_id)
+            wt = trees.active_worktree_for_claim(conn, args.claim_id)
             if wt is None:
                 print("No active worktree for this claim; pass --commit <oid>.",
                       file=sys.stderr)
@@ -308,7 +303,7 @@ def cmd_handoff_create(args, cfg) -> int:
         # managed worktree's HEAD.
         last_commit = args.last_commit
         if not last_commit:
-            wt = _active_worktree(conn, args.claim_id)
+            wt = trees.active_worktree_for_claim(conn, args.claim_id)
             if wt is None:
                 print("Provide --last-commit (no active worktree for this claim).",
                       file=sys.stderr)
