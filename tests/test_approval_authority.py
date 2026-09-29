@@ -9,6 +9,7 @@ tightened policy or a demoted approver invalidates an earlier approval.
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 import uuid
 from pathlib import Path
@@ -94,7 +95,7 @@ def test_engine_refuses_ineligible_vote_rows(conn, approval_repo):
     ensure_agent(conn, "raw-worker")
     approval = gate.request_approval(conn, _op(approval_repo), "raw-worker")
     worker_id = registry.get_agent(conn, "raw-worker")["id"]
-    with pytest.raises(ValueError, match="not eligible"):
+    with pytest.raises(sqlite3.IntegrityError, match="not eligible"):
         conn.execute(
             "INSERT INTO votes (approval_id, voter, vote, voter_agent_id) "
             "VALUES (?, 'raw-worker', 1, ?)",
@@ -175,7 +176,7 @@ def test_engine_refuses_consumption_by_approver(conn, approval_repo):
     op = _op(approval_repo)
     approval = approve(conn, op, requested_by="req")
     operator_id = registry.get_agent(conn, OPERATOR)["id"]
-    with pytest.raises(ValueError, match="cannot consume its own approval"):
+    with pytest.raises(sqlite3.IntegrityError, match="cannot consume its own approval"):
         conn.execute(
             "UPDATE approvals SET status = 'consumed', consumed_at = unixepoch(), "
             "consumed_by_agent_id = ? WHERE id = ?",

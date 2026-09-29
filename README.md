@@ -6,7 +6,7 @@ QuorumGit prevents coding agents (or humans) working the same codebase from step
 
 ```
 agent-one ──┐
-agent-two ──┼──► quorumgit CLI ──► local libSQL file (claims, leases, approvals, audit)
+agent-two ──┼──► quorumgit CLI ──► local SQLite file (claims, leases, approvals, audit)
 reviewer  ──┘                          │
                                        └──► git pre-receive hook (push enforcement)
 ```
@@ -42,9 +42,9 @@ Everything an agent does — claim, renew, checkpoint, hand off, release — wri
 
 ## Installation
 
-Requirements: **Python 3.11–3.14**, **git**. There is no database to install, no server to run, and no extension to provision: the store is a single [libSQL](https://github.com/tursodatabase/libsql-python) database file under `QUORUMGIT_DATA_DIR`.
+Requirements: **Python 3.11–3.14**, **git**. There is no database to install, no server to run, and no extension to provision: the store is a single SQLite 3 database file under `QUORUMGIT_DATA_DIR`, accessed through Python's standard-library [`sqlite3`](https://docs.python.org/3/library/sqlite3.html) module. QuorumGit has no third-party runtime dependencies. The Python interpreter must be linked against SQLite 3.38 or newer (every supported CPython release from python.org, Homebrew, and current Linux distributions is); `quorumgit` refuses to open the store otherwise.
 
-> **Platform note.** Linux, macOS, and Windows are supported. `libsql` 0.1.11 publishes a prebuilt wheel for CPython 3.11–3.13 on all three, and for CPython 3.14 on Linux only — on macOS 3.14 pip builds the extension from source (needs a Rust toolchain), and on Windows 3.14 that build does not currently succeed. Use 3.11–3.13 on Windows until upstream ships a 3.14 wheel.
+> **Platform note.** Linux, macOS, and Windows are supported on every Python from 3.11 to 3.14.
 
 ```bash
 # recommended: uv (editable, so a git pull updates the live tool)
@@ -262,7 +262,7 @@ There is deliberately no external-database option and no connection-string confi
 ## Design properties
 
 - **CLI-only, no daemon.** Every operation is a short-lived transaction. Lease expiry is computed from timestamps at read time. There is no scheduler, no cron, and nothing to keep alive: the store is a file.
-- **One store, fail-loud.** One libSQL file, no second backend, no degraded operation. If the store is missing or fails its contract check, commands exit non-zero and say why.
+- **One store, fail-loud.** One SQLite file, no second backend, no degraded operation. If the store is missing or fails its contract check, commands exit non-zero and say why.
 - **Concurrency-safe where it counts.** Every governance write takes the database's single-writer reservation (`BEGIN IMMEDIATE`) before it reads, and pairs it with guarded conditional updates. Approval voting and consumption, takeover ownership transitions, and handoff resolution all serialize; races produce exactly one winner and an explicit error for the loser — verified by concurrent two-connection tests, not by inspection. Because the reservation covers the whole database rather than one row, it also closes the cross-task branch collision that per-task row locks did not.
 - **Verified continuation.** Checkpoint and handoff commits must exist in the registered repository (and be reachable from the claimed branch when it exists). The continuation contract survives restarts: every state change is committed to the database file, so claims, handoffs, and audit history are intact for the next process that opens it.
 - **Structured artifacts are schema-checked in the database.** Handoff and approval fields the governance rules depend on are relational columns with `CHECK` constraints; JSON is retained only for open-ended arrays and detail blobs.
@@ -294,7 +294,7 @@ ruff check src tests
 pyright
 ```
 
-Supported interpreters: Python 3.11 through 3.14; `ruff` and `pyright` are pinned to the 3.11 floor so post-3.11 syntax and APIs fail the checks. CI runs `pyright` and the test suite on Linux, macOS, and Windows with Python 3.11 and 3.14 (except Windows + 3.14, per the platform note); it does not run `ruff`, so run it locally. Tests run against a real libSQL database and real Git repositories — nothing is mocked. The suite covers the full acceptance workflow (register → claim → isolate → block overlap → parallel work → checkpoint → handoff → accept → approval-gated takeover → audit → restart survival), real-push hook enforcement, concurrent voting/consumption/resolution races, and a branding gate that keeps application code free of any identity other than QuorumGit.
+Supported interpreters: Python 3.11 through 3.14; `ruff` and `pyright` are pinned to the 3.11 floor so post-3.11 syntax and APIs fail the checks. CI runs `pyright` and the test suite on Linux, macOS, and Windows with Python 3.11 and 3.14; it does not run `ruff`, so run it locally. Tests run against a real SQLite database and real Git repositories — nothing is mocked. The suite covers the full acceptance workflow (register → claim → isolate → block overlap → parallel work → checkpoint → handoff → accept → approval-gated takeover → audit → restart survival), real-push hook enforcement, concurrent voting/consumption/resolution races, and a branding gate that keeps application code free of any identity other than QuorumGit.
 
 Design notes: [`docs/parallel-code-review.md`](docs/parallel-code-review.md) records which ideas from the Parallel Code project were adopted (the checkout-identity checks in `doctor`) and which were rejected.
 

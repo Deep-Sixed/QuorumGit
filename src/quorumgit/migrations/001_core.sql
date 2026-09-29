@@ -1,4 +1,4 @@
--- QuorumGit relational schema for local libSQL.
+-- QuorumGit relational schema for local SQLite 3.
 -- Each chunk between quorumgit-statement markers is executed as one statement.
 -- Governance-critical fields are relational; JSON is reserved for extensible
 -- detail payloads and is validated with SQLite's native JSON functions.
