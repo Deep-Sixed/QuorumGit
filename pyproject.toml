@@ -18,7 +18,8 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6", "pyright>=1.1.380"]
+# ruff is pinned exactly: new releases enable new rules, and CI gates on it.
+dev = ["pytest>=8", "ruff==0.16.9", "pyright>=1.1.380"]
 
 [project.scripts]
 quorumgit = "quorumgit.cli:main"
