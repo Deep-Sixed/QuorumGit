@@ -8,6 +8,7 @@ the moment another operation supersedes it. No background process exists.
 from __future__ import annotations
 
 import math
+import re
 import subprocess
 from typing import Any
 
@@ -316,6 +317,81 @@ def scopes_overlap(a: str, b: str) -> bool:
     """Conservative overlap test that errs toward flagging."""
     pa, pb = _glob_prefix(a), _glob_prefix(b)
     return pa.startswith(pb) or pb.startswith(pa)
+
+
+def _segment_regex(segment: str) -> str:
+    """Regex for one path segment: `*` and `?` never cross a `/`."""
+    out: list[str] = []
+    i = 0
+    while i < len(segment):
+        ch = segment[i]
+        if ch == "*":
+            out.append("[^/]*")
+        elif ch == "?":
+            out.append("[^/]")
+        elif ch == "[":
+            end = segment.find("]", i + 2 if segment[i + 1 : i + 2] in ("!", "]") else i + 1)
+            if end == -1:
+                out.append(re.escape(ch))
+            else:
+                body = segment[i + 1 : end]
+                if body.startswith("!"):
+                    body = "^" + body[1:]
+                out.append("[" + body.replace("\\", "\\\\") + "]")
+                i = end
+        else:
+            out.append(re.escape(ch))
+        i += 1
+    return "".join(out)
+
+
+def _scope_regex(glob: str) -> re.Pattern[str]:
+    parts = glob.split("/")
+    pieces: list[str] = []
+    for index, part in enumerate(parts):
+        last = index == len(parts) - 1
+        if part == "**":
+            pieces.append(".*" if last else "(?:[^/]+/)*")
+        else:
+            pieces.append(_segment_regex(part) + ("" if last else "/"))
+    return re.compile("".join(pieces))
+
+
+def scope_matches(glob: str, path: str) -> bool:
+    """True if a repository-relative path falls inside a declared scope.
+
+    `**` spans any number of directories, `*` and `?` stay within one path
+    segment, and a glob without wildcards names a file or a whole directory.
+    """
+    glob = glob.strip().removeprefix("./").lstrip("/")
+    path = path.removeprefix("./").lstrip("/")
+    if not glob:
+        return False
+    if _glob_prefix(glob) == glob:
+        literal = glob.rstrip("/")
+        return path == literal or path.startswith(literal + "/")
+    return _scope_regex(glob).fullmatch(path) is not None
+
+
+def paths_outside_scopes(paths: list[str], scope_globs: list[str]) -> list[str]:
+    """The sorted subset of paths that no declared scope covers."""
+    return sorted(
+        {
+            path
+            for path in paths
+            if not any(scope_matches(glob, path) for glob in scope_globs)
+        }
+    )
+
+
+def claim_scopes(conn: Connection, claim_id: int) -> list[str]:
+    return [
+        row[0]
+        for row in conn.execute(
+            "SELECT path_glob FROM scopes WHERE claim_id = ? ORDER BY id",
+            (claim_id,),
+        ).fetchall()
+    ]
 
 
 def verify_commit(

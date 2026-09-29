@@ -161,13 +161,17 @@ git push origin feat/x                              # rejected — unidentified
 
 The hook learns who is pushing from `QUORUMGIT_AGENT` in its own environment, which Git passes through only when the remote is a **local path** (as `origin` is above). Over SSH or HTTP the variable does not reach the hook, so every push is rejected as unidentified. The hook also opens the store under its own `QUORUMGIT_DATA_DIR`, so pushers must use the same data directory as the rest of the deployment.
 
+**Scopes are enforced on the push, not just the claim.** When the owner pushes a claimed branch, the hook lists the paths changed by the commits the push introduces (commits not yet reachable from any ref on the hub) and checks each against the claim's declared scopes. A push that touches anything outside them is rejected as an `out_of_scope_update` naming the stray paths, and lands only with an approval bound to that exact update — the operation includes the sorted `out_of_scope_paths`, so the approver sees what they are signing off on. Renames count as a deletion plus an addition, so moving a file *into* scope still charges its old location. Merging already-published history (for example, `main`) into the branch is not charged; edits made inside a merge commit — conflict resolutions or extra changes — are. Unclaimed branches are not scope-checked, and neither is the local model, which has no hook.
+
+Scope globs match repository-relative paths: `**` spans any number of directories, `*` and `?` stay within one path segment, and a glob without wildcards names a single file or a whole directory (`docs` covers `docs/guide.md`).
+
 Accepting a handoff in the hub model prints `worktree: (none — create manually)`: there is no managed worktree to transfer, so the successor fetches the branch into its own clone and continues from the reported commit.
 
 Checkpoints in the hub model take an explicit `--commit <oid>`. Continuation points are **verified, not trusted**: the commit must exist in the registered repository, and when the claimed branch exists, be reachable from it. A typo'd or fabricated OID is rejected.
 
 ## Protected operations and approvals
 
-Updates to protected refs, force pushes, ref deletions, and lease takeovers all require an approval. An approval is bound by SHA-256 hash to the **exact operation payload** (canonical JSON) — approving one push authorizes that push at those exact revisions, and nothing else.
+Updates to protected refs, force pushes, ref deletions, pushes that change paths outside the pusher's claimed scopes, and lease takeovers all require an approval. An approval is bound by SHA-256 hash to the **exact operation payload** (canonical JSON) — approving one push authorizes that push at those exact revisions, and nothing else.
 
 The flow, driven by the rejection messages themselves:
 

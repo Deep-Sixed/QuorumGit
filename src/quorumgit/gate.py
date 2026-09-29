@@ -15,7 +15,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from . import audit
+from . import audit, work
 from .canonical import stable_hash
 from .registry import (
     RegistryError,
@@ -317,6 +317,51 @@ def _is_fast_forward(git_dir: str, oldrev: str, newrev: str) -> bool:
     return result.returncode == 0
 
 
+def _new_commit_paths(git_dir: str, newrev: str) -> list[str]:
+    """Paths changed by the commits this push introduces.
+
+    Only commits not yet reachable from any existing ref are inspected, so a
+    branch created from (or merged with) already-published history is not
+    charged for that history. Merge commits use Git's combined diff, which
+    reports only paths the merge result changes relative to every parent:
+    conflict resolutions and edits made inside the merge itself. Renames are
+    split into a deletion and an addition so both paths are checked.
+    """
+    commits = subprocess.run(
+        ["git", "--git-dir", git_dir, "rev-list", newrev, "--not", "--all"],
+        capture_output=True,
+        check=False,
+    )
+    if commits.returncode != 0:
+        raise PushRejected("Unable to list the commits introduced by this push.")
+    if not commits.stdout.strip():
+        return []
+    result = subprocess.run(
+        [
+            "git",
+            "--git-dir",
+            git_dir,
+            "diff-tree",
+            "--stdin",
+            "-r",
+            "-c",
+            "-z",
+            "--root",
+            "--no-renames",
+            "--no-commit-id",
+            "--name-only",
+        ],
+        input=commits.stdout,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise PushRejected("Unable to determine the paths changed by this push.")
+    return sorted(
+        {item.decode("utf-8") for item in result.stdout.split(b"\0") if item}
+    )
+
+
 def _invoking_git_common_dir(git_dir: str) -> Path:
     result = subprocess.run(
         ["git", "--git-dir", git_dir, "rev-parse", "--git-common-dir"],
@@ -365,6 +410,8 @@ def check_ref_update(
     """Enforce governance for one ref update. Raises PushRejected."""
     repo = _verify_repository_binding(conn, repository, git_dir)
     branch = refname.removeprefix("refs/heads/")
+    deletion = _is_zero(newrev)
+    out_of_scope: list[str] = []
 
     if refname.startswith("refs/heads/"):
         pending = open_handoff_for_branch(conn, repo["id"], branch)
@@ -380,30 +427,55 @@ def check_ref_update(
                 f"(claim {claim['id']}); pusher is "
                 f"{pusher or 'unidentified — set QUORUMGIT_AGENT'}."
             )
+        if claim and not deletion:
+            # Declared scopes are enforced on what the push actually changes,
+            # not only on what the claim said it would change.
+            out_of_scope = work.paths_outside_scopes(
+                _new_commit_paths(git_dir, newrev),
+                work.claim_scopes(conn, claim["id"]),
+            )
 
     protected = refname in repo["protected_refs"]
-    deletion = _is_zero(newrev)
     forced = (
         not deletion
         and not _is_zero(oldrev)
         and not _is_fast_forward(git_dir, oldrev, newrev)
     )
 
-    if protected or deletion or forced:
-        operation = {
-            "type": "protected_ref_update"
-            if protected
-            else ("ref_delete" if deletion else "force_update"),
+    if protected or deletion or forced or out_of_scope:
+        if protected:
+            op_type = "protected_ref_update"
+        elif deletion:
+            op_type = "ref_delete"
+        elif forced:
+            op_type = "force_update"
+        else:
+            op_type = "out_of_scope_update"
+        operation: dict[str, Any] = {
+            "type": op_type,
             "repository": repository,
             "refname": refname,
             "oldrev": oldrev,
             "newrev": newrev,
         }
+        if out_of_scope:
+            operation["out_of_scope_paths"] = out_of_scope
         approval = approved_instance(conn, operation)
         if approval is None:
+            scope_note = ""
+            if out_of_scope:
+                shown = ", ".join(out_of_scope[:10])
+                more = len(out_of_scope) - 10
+                if more > 0:
+                    shown += f", … (+{more} more)"
+                scope_note = (
+                    f" It changes paths outside the pusher's claimed scopes: "
+                    f"{shown}."
+                )
             raise PushRejected(
                 f"{operation['type']} on {refname} requires an approval "
                 f"bound to this exact update (hash {operation_hash(operation)})."
+                f"{scope_note}"
             )
         assert pusher is not None
         consume_approval(conn, approval["id"], operation, agent=pusher)
