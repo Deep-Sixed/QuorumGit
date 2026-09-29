@@ -37,6 +37,7 @@ Eight concepts, in the order you meet them:
 | **Handoff** | A structured continuation record (done / remaining / exact commit / blockers) that transfers work to a successor instead of abandoning it. |
 | **Approval** | A sign-off by eligible agents, hash-bound to one exact operation (a specific push, takeover, or deletion), consumed on use. |
 | **Approval policy** | Owned by each repository: how many votes an approval needs, which roles may cast them, and whether the requester may vote. The agent asking for permission never chooses its own quorum. |
+| **Content governance** | In the hub model, what a push *actually changes* is derived from the Git objects it carries and checked against the pushing claim's scopes and the repository's protected paths. |
 
 Everything an agent does — claim, renew, checkpoint, hand off, release — writes an audit event in the same database transaction. The audit table is append-only, enforced by a trigger.
 
@@ -59,7 +60,7 @@ Then initialize the store once:
 ```bash
 $ quorumgit init
 store: /home/you/.quorumgit/quorumgit.db
-migrations applied: ['001_core.sql', '002_approval_identities.sql', '004_approval_authority.sql']
+migrations applied: ['001_core.sql', '002_approval_identities.sql', '004_approval_authority.sql', '005_content_governance.sql']
 contract: ok
 ```
 
@@ -169,7 +170,7 @@ QUORUMGIT_AGENT=agent-two git push origin feat/x    # rejected — branch is cla
 git push origin feat/x                              # rejected — unidentified
 ```
 
-**Scopes are enforced at push time.** When a branch has a live claim, every commit the push introduces must only touch paths inside that claim's scopes (`**` spans directories, `*` stays within one; a scope without wildcards covers that file or directory). Merge commits count only the paths the merge itself changed, so merging the base branch in is not attributed to the claim holder. In the local model agents commit directly in their worktree, so no hook runs and scopes remain coordination metadata.
+Owning the branch is necessary but not sufficient: when the branch has a live claim, every commit the push introduces must only touch paths inside that claim's scopes, or carry an `out_of_scope_push` approval for exactly the paths outside them (see [Content governance](#content-governance)). In the local model agents commit directly in their worktree, so no hook runs and scopes remain coordination metadata.
 
 The hook learns who is pushing from `QUORUMGIT_AGENT` in its own environment, which Git passes through only when the remote is a **local path** (as `origin` is above). Over SSH or HTTP the variable does not reach the hook, so every push is rejected as unidentified. The hook also opens the store under its own `QUORUMGIT_DATA_DIR`, so pushers must use the same data directory as the rest of the deployment.
 
@@ -177,9 +178,57 @@ Accepting a handoff in the hub model prints `worktree: (none — create manually
 
 Checkpoints in the hub model take an explicit `--commit <oid>`. Continuation points are **verified, not trusted**: the commit must exist in the registered repository, and when the claimed branch exists, be reachable from it. A typo'd or fabricated OID is rejected.
 
+## Content governance
+
+A claim's scopes say what an agent *intends* to modify. In the hub model the pre-receive hook also checks what the push *actually* modifies, derived only from the Git objects being received:
+
+```
+push → identify pusher → branch reservations → allowed ref namespace
+     → derive changed paths from pushed objects
+     → compare with the claim's scopes and the repository's protected paths
+     → ALLOW, or REQUIRE the matching approval(s)
+```
+
+- **Changed paths** are the paths introduced by commits that are new to the repository — reachable from the pushed revision and from no existing ref. Content already in the hub was governed when it first arrived, so merging `main` into a feature branch does not attribute `main`'s changes to the pusher; a merge contributes only the paths it changes relative to *every* parent (conflict resolutions and hand edits). Root commits are compared with the empty tree. Deletions carry no content.
+- **Out-of-scope changes need an approval, not a new claim.** When a claimed branch receives changes to paths none of its scopes cover, the push requires an `out_of_scope_push` approval naming the claim and exactly those paths. Scope globs use `**` (any number of directories), `*` and `?` (within one path segment), and `[...]`; a glob with no wildcard, or ending in `/`, covers a file or everything beneath a directory. Branches with no live claim carry no scopes, so only the other checks apply to them.
+- **Protected paths** need a `protected_path_update` approval whenever a push changes them, on any ref and whoever owns the branch:
+
+  ```bash
+  quorumgit repo protect-path myproject '.github/workflows/**' --agent lead
+  quorumgit repo protect-path myproject 'migrations/**' --agent lead
+  quorumgit repo add other /path/to/other.git --protected-path 'infrastructure/**'
+  ```
+- **Allowed ref namespaces.** Every repository accepts pushes to `refs/heads/` only. Tags, notes, and custom refs are refused until an operator opts in: `quorumgit repo allow-ref myproject refs/tags/ --agent lead` (`--remove` withdraws it). Branch claims, reservations, and scopes apply to `refs/heads/`; protected refs and protected paths apply to every allowed namespace.
+
+One push can need several approvals — a direct push to protected `main` that edits a protected path needs both `protected_ref_update` and `protected_path_update`. They are all-or-nothing: the hook lists every missing approval at once, and consumes none unless all are usable.
+
+### Planning a push: `approve prepare`
+
+Rather than pushing to learn what governance requires, ask first. `approve prepare` reads objects from your clone and ref state from the registered repository and runs the **same derivation the hook uses**, so the operations and hashes it prints are exactly the ones the hook will demand:
+
+```bash
+$ quorumgit approve prepare --repo myproject --ref feat/api          # --new defaults to HEAD
+repository: myproject
+refname: refs/heads/feat/api
+oldrev: 8e72…
+newrev: a31f…
+claim: 3 by agent-one (scopes: src/api/**)
+changed paths (3):
+  infrastructure/prod.tf
+  src/api/routes.py
+  src/database/schema.py
+approvals required (1):
+  out_of_scope_push sha256:5c1d…
+    infrastructure/prod.tf
+    src/database/schema.py
+re-run with --request to open these approvals.
+```
+
+`--request` opens an approval for each required operation (as `--agent`/`QUORUMGIT_AGENT`), `--json` prints the plan for tooling, `--delete` plans a ref deletion, and `-C <path>` names a clone other than the current directory. Nothing is pushed or changed without `--request`. It exits non-zero when the push would be refused outright (outside the allowed namespaces, a frozen branch, or a branch claimed by someone else). Fetch first: the plan is bound to the hub's current ref values, so `prepare` refuses to plan from a clone missing any commit a hub ref points at (a single-branch clone, say), and a plan made before the hub moved simply won't match.
+
 ## Protected operations and approvals
 
-Updates to protected refs, force pushes, ref deletions, and lease takeovers all require an approval. An approval is bound by SHA-256 hash to the **exact operation payload** (canonical JSON) — approving one push authorizes that push at those exact revisions, and nothing else.
+Updates to protected refs, force pushes, ref deletions, out-of-scope pushes, protected-path changes, and lease takeovers all require an approval. An approval is bound by SHA-256 hash to the **exact operation payload** (canonical JSON) — approving one push authorizes that push at those exact revisions, and nothing else.
 
 The flow, driven by the rejection messages themselves:
 
@@ -188,8 +237,9 @@ The flow, driven by the rejection messages themselves:
 #    protected_ref_update on refs/heads/main requires an approval
 #    bound to this exact update (hash sha256:ab12…).
 
-# 2. The agent requests that exact operation; an operator votes on the returned
-#    approval instance ID. The threshold comes from the repository's policy:
+# 2. The agent requests that exact operation (`quorumgit approve prepare --repo myproject
+#    --ref main --request` does this for every operation the push needs); an operator
+#    votes on the returned approval instance ID. The threshold comes from the policy:
 QUORUMGIT_AGENT=agent-one quorumgit approve request '{"type":"protected_ref_update","repository":"myproject","refname":"refs/heads/main","oldrev":"<old>","newrev":"<new>"}'
 # approval 17 hash=sha256:ab12… status=pending threshold=1
 quorumgit approve vote 17 --agent lead
@@ -213,6 +263,8 @@ Rules that hold no matter what:
 
 Registering a `reviewer` or `operator`, changing a role (`quorumgit agent role <name> <role>`), and changing repository policy are themselves authority decisions, so each requires an operator acting through `--agent` or `QUORUMGIT_AGENT`, and each is audited. The single exception is bootstrap: while no operator exists, the first one can be designated by anyone. The last remaining operator cannot be demoted, so a store never falls back into bootstrap mode by accident.
 
+> **Upgrading to content governance.** Migration `005_content_governance.sql` restricts every existing repository to `refs/heads/`. If your agents push tags or other refs, allow those namespaces with `quorumgit repo allow-ref` after running `quorumgit init`. Claimed branches now also enforce their scopes at push time, so a claim declared too narrowly will ask for `out_of_scope_push` approvals.
+
 > **Upgrading.** Migration `004_approval_authority.sql` makes every existing agent a `worker` and gives every existing repository the default policy. Approvals granted under the old rules (including self-approvals) stop authorizing anything until an eligible operator votes on a fresh request. After running `quorumgit init`, designate an operator with `quorumgit agent role <name> operator`.
 
 Takeovers follow the same pattern: claiming a task someone else holds (`claim <task> --takeover`) prints the takeover operation to approve. Its payload includes the incumbent claim ID, so an unused approval cannot displace a later claim by the same agent. The takeover is atomic — the incumbent is released, the replacement claim created, and the approval consumed in one transaction, or none of it happens. A refused takeover leaves the incumbent untouched and the approval unconsumed.
@@ -227,10 +279,12 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit status` | Store health, contract check, row counts |
 | `quorumgit doctor [--repair]` | Detect and conservatively reconcile recorded managed-worktree drift |
 | `quorumgit destroy --yes` | Delete the database file (managed worktrees under `QUORUMGIT_DATA_DIR/worktrees` are left in place) |
-| `quorumgit repo add <name> <path> [--protected-ref <ref>]…` | Register a repository |
+| `quorumgit repo add <name> <path> [--protected-ref <ref>]… [--protected-path <glob>]…` | Register a repository |
 | `quorumgit agent add <name> [--role worker\|reviewer\|operator]` | Register an agent identity (non-workers need an operator once one exists) |
 | `quorumgit agent role <name> <role>` | Change an agent's role (operator only, after bootstrap) |
-| `quorumgit repo policy <name> [--threshold <n>] [--role <role>]… [--[no-]requester-may-vote]` | Show or change a repository's approval policy (changes are operator only) |
+| `quorumgit repo policy <name> [--threshold <n>] [--role <role>]… [--[no-]requester-may-vote]` | Show or change a repository's approval policy (changes are operator only); also shows protected refs, protected paths, and allowed ref namespaces |
+| `quorumgit repo protect-path <name> <glob> [--remove]` | Require an approval for any push changing matching paths (operator only) |
+| `quorumgit repo allow-ref <name> <prefix> [--remove]` | Allow pushes to a ref namespace such as `refs/tags/` (operator only) |
 | `quorumgit task add --repo <name> --title <t> [--objective <o>]` | Create a task |
 | `quorumgit task done <task> [--note <n>] [--remove-worktree]` | Close a task for good — live claim holder only; releases the claim |
 | `quorumgit claim <task> --branch <b> --scope <glob>… [--no-worktree] [--takeover] [--override-overlap] [--lease-hours <h>]` | Claim a task |
@@ -244,11 +298,12 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit handoff list [--status <s>] / show <id>` | Inspect handoffs |
 | `quorumgit approve request <json>` | Open an approval for an exact operation, at the repository's threshold |
 | `quorumgit approve vote <approval-id> [--deny]` | Vote on one approval instance |
+| `quorumgit approve prepare --repo <name> --ref <ref> [--new <rev> \| --delete] [-C <clone>] [--request] [--json]` | Show every approval a push would need, with the hook's exact hashes; `--request` opens them |
 | `quorumgit approve hash <json>` | Compute an operation's hash |
 | `quorumgit hook install --repo <name>` | Install the pre-receive hook (hub model) |
 | `quorumgit audit [--entity <e>] [--entity-id <id>] [--limit <n>]` | Read the audit trail |
 
-`repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Commands that act as an agent (`claim`, `renew`, `release`, `task done`, `checkpoint`, `handoff create/accept/decline/cancel`, `approve request/vote`, and the operator actions `agent add`, `agent role`, `repo policy`) also take `--agent <name>`, which overrides `QUORUMGIT_AGENT`. At least one `--scope` is required to claim. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
+`repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Commands that act as an agent (`claim`, `renew`, `release`, `task done`, `checkpoint`, `handoff create/accept/decline/cancel`, `approve request/vote`, `approve prepare`, and the operator actions `agent add`, `agent role`, `repo policy`, `repo protect-path`, `repo allow-ref`) also take `--agent <name>`, which overrides `QUORUMGIT_AGENT`. At least one `--scope` is required to claim. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
 
 `quorumgit doctor` only checks worktree paths already recorded by QuorumGit. It reports:
 
@@ -283,6 +338,7 @@ QuorumGit v1 coordinates **cooperating agents**; the adversary is *accident, not
 - Agent identity is asserted (`QUORUMGIT_AGENT`), not cryptographically authenticated. Any local process can claim to be any agent.
 - The trust root is write access to the database and the filesystem. An actor with either can bypass governance.
 - The pre-receive hook governs `git push` only. Direct ref manipulation inside a repository bypasses it.
+- Content is governed when it first reaches the hub. Scopes are checked only on claimed branches, so changes pushed to an unclaimed branch (subject to protected paths) and later merged into a claimed one are not re-attributed to the claim.
 - Approval hashes provide exact-payload binding and tamper-evidence, not approver authentication.
 - Roles separate duties between cooperating agents. Because identity is asserted, a process willing to impersonate an operator can still do so; role separation stops an agent from authorizing its own work by accident or by default, not a determined impersonator.
 
@@ -304,6 +360,8 @@ pyright
 ```
 
 Supported interpreters: Python 3.11 through 3.14; `ruff` and `pyright` target the 3.11 floor so post-3.11 syntax and APIs fail the checks. CI runs `ruff check` once on Linux, and `pyright` and the test suite on Linux, macOS, and Windows with Python 3.11 and 3.14. `ruff` is pinned to an exact version in the `dev` extra because new ruff releases enable new rules; bump it deliberately and fix any new findings in the same change. Tests run against a real SQLite database and real Git repositories — nothing is mocked. The suite covers the full acceptance workflow (register → claim → isolate → block overlap → parallel work → checkpoint → handoff → accept → approval-gated takeover → audit → restart survival), real-push hook enforcement, concurrent voting/consumption/resolution races, and a branding gate that keeps application code free of any identity other than QuorumGit.
+
+Operating guidance for agents (the work loop, pushing through the hook, and keeping secrets out of the permanent record): [`docs/agent-guide.md`](docs/agent-guide.md).
 
 Design notes: [`docs/parallel-code-review.md`](docs/parallel-code-review.md) records which ideas from the Parallel Code project were adopted (the checkout-identity checks in `doctor`) and which were rejected.
 

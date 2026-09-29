@@ -63,6 +63,39 @@ def _protected_refs(conn: Connection, repository_id: int) -> list[str]:
     ]
 
 
+def _protected_paths(conn: Connection, repository_id: int) -> list[str]:
+    return [
+        row[0]
+        for row in conn.execute(
+            "SELECT path_glob FROM protected_paths WHERE repository_id = ? "
+            "ORDER BY id",
+            (repository_id,),
+        ).fetchall()
+    ]
+
+
+def _allowed_ref_namespaces(conn: Connection, repository_id: int) -> list[str]:
+    return [
+        row[0]
+        for row in conn.execute(
+            "SELECT prefix FROM allowed_ref_namespaces WHERE repository_id = ? "
+            "ORDER BY prefix",
+            (repository_id,),
+        ).fetchall()
+    ]
+
+
+def _repository_dict(conn: Connection, row) -> dict:
+    return {
+        "id": row[0],
+        "name": row[1],
+        "path": row[2],
+        "protected_refs": _protected_refs(conn, row[0]),
+        "protected_paths": _protected_paths(conn, row[0]),
+        "allowed_ref_namespaces": _allowed_ref_namespaces(conn, row[0]),
+    }
+
+
 def git_common_dir(path: str | Path) -> Path:
     """Return the canonical Git common directory for a repository path.
 
@@ -147,6 +180,7 @@ def add_repository(
     name: str,
     path: str | Path,
     protected_refs: list[str] | None = None,
+    protected_paths: list[str] | None = None,
 ) -> int:
     begin_immediate(conn)
     repo_path = Path(path).resolve()
@@ -177,6 +211,11 @@ def add_repository(
             "INSERT INTO protected_refs (repository_id, refname) VALUES (?, ?)",
             (repo_id, refname),
         )
+    for glob in protected_paths or []:
+        conn.execute(
+            "INSERT INTO protected_paths (repository_id, path_glob) VALUES (?, ?)",
+            (repo_id, _validate_path_glob(glob)),
+        )
     audit.record(
         conn,
         "repository.registered",
@@ -198,12 +237,7 @@ def get_repository(conn: Connection, name: str) -> dict:
     ).fetchone()
     if row is None:
         raise RegistryError(f"Repository is not registered: {name}")
-    return {
-        "id": row[0],
-        "name": row[1],
-        "path": row[2],
-        "protected_refs": _protected_refs(conn, row[0]),
-    }
+    return _repository_dict(conn, row)
 
 
 def approval_policy(conn: Connection, repository_id: int) -> dict:
@@ -282,19 +316,105 @@ def set_approval_policy(
     return after
 
 
+def _validate_path_glob(glob: str) -> str:
+    if not glob.strip() or glob.startswith("-"):
+        raise RegistryError(f"Invalid protected path glob: {glob!r}")
+    return glob
+
+
+def _validate_ref_namespace(prefix: str) -> str:
+    if (
+        not prefix.startswith("refs/")
+        or not prefix.endswith("/")
+        or len(prefix) <= len("refs//")
+        or "//" in prefix
+    ):
+        raise RegistryError(
+            f"Ref namespace must look like 'refs/<name>/', got {prefix!r}."
+        )
+    return prefix
+
+
+def set_protected_path(
+    conn: Connection,
+    repository: str,
+    glob: str,
+    *,
+    actor: str | None,
+    remove: bool = False,
+) -> list[str]:
+    """Add or remove a path glob whose changes always need an approval."""
+    begin_immediate(conn)
+    repo = get_repository(conn, repository)
+    require_operator(conn, actor, "Changing protected paths")
+    _validate_path_glob(glob)
+    if remove:
+        cur = conn.execute(
+            "DELETE FROM protected_paths WHERE repository_id = ? AND path_glob = ?",
+            (repo["id"], glob),
+        )
+    else:
+        cur = conn.execute(
+            "INSERT INTO protected_paths (repository_id, path_glob) VALUES (?, ?) "
+            "ON CONFLICT DO NOTHING",
+            (repo["id"], glob),
+        )
+    if cur.rowcount:
+        audit.record(
+            conn,
+            "repository.protected_path_removed" if remove
+            else "repository.protected_path_added",
+            "repository",
+            repo["id"],
+            agent=actor,
+            detail={"path_glob": glob},
+        )
+    return _protected_paths(conn, repo["id"])
+
+
+def set_allowed_ref_namespace(
+    conn: Connection,
+    repository: str,
+    prefix: str,
+    *,
+    actor: str | None,
+    remove: bool = False,
+) -> list[str]:
+    """Allow (or stop allowing) pushes to refs under a namespace prefix."""
+    begin_immediate(conn)
+    repo = get_repository(conn, repository)
+    require_operator(conn, actor, "Changing allowed ref namespaces")
+    _validate_ref_namespace(prefix)
+    if remove:
+        cur = conn.execute(
+            "DELETE FROM allowed_ref_namespaces "
+            "WHERE repository_id = ? AND prefix = ?",
+            (repo["id"], prefix),
+        )
+    else:
+        cur = conn.execute(
+            "INSERT INTO allowed_ref_namespaces (repository_id, prefix) "
+            "VALUES (?, ?) ON CONFLICT DO NOTHING",
+            (repo["id"], prefix),
+        )
+    if cur.rowcount:
+        audit.record(
+            conn,
+            "repository.ref_namespace_disallowed" if remove
+            else "repository.ref_namespace_allowed",
+            "repository",
+            repo["id"],
+            agent=actor,
+            detail={"prefix": prefix},
+        )
+    return _allowed_ref_namespaces(conn, repo["id"])
+
+
 def list_repositories(conn: Connection) -> list[dict]:
     rows = conn.execute(
         "SELECT id, name, path FROM repositories ORDER BY name"
     ).fetchall()
-    return [
-        {
-            "id": r[0],
-            "name": r[1],
-            "path": r[2],
-            "protected_refs": _protected_refs(conn, r[0]),
-        }
-        for r in rows
-    ]
+    return [_repository_dict(conn, r) for r in rows]
 
 
 def add_agent(

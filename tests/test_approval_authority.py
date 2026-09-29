@@ -359,7 +359,10 @@ def test_upgrade_leaves_no_agent_with_authority(tmp_path):
     conn.commit()
     conn.close()
 
-    assert store.migrate(local) == ["004_approval_authority.sql"]
+    assert store.migrate(local) == [
+        "004_approval_authority.sql",
+        "005_content_governance.sql",
+    ]
     upgraded = store.connect(local)
     try:
         assert registry.get_agent(upgraded, "self-approver")["role"] == "worker"

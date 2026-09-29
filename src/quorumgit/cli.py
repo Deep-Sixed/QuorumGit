@@ -10,7 +10,18 @@ import argparse
 import json
 import sys
 
-from . import __version__, audit, config, gate, handoff, registry, store, trees, work
+from . import (
+    __version__,
+    audit,
+    config,
+    gate,
+    git_objects,
+    handoff,
+    registry,
+    store,
+    trees,
+    work,
+)
 
 
 def _agent(args, cfg) -> str:
@@ -104,7 +115,11 @@ def cmd_doctor(args, cfg) -> int:
 def cmd_repo_add(args, cfg) -> int:
     with store.session(cfg) as conn:
         repo_id = registry.add_repository(
-            conn, args.name, args.path, protected_refs=args.protected_ref
+            conn,
+            args.name,
+            args.path,
+            protected_refs=args.protected_ref,
+            protected_paths=args.protected_path,
         )
         conn.commit()
     print(f"repository {args.name} registered (id {repo_id}).")
@@ -143,6 +158,39 @@ def cmd_repo_policy(args, cfg) -> int:
     print(f"approval threshold: {policy['threshold']}")
     print(f"approving roles: {', '.join(policy['roles'])}")
     print(f"requester may vote: {'yes' if policy['requester_may_vote'] else 'no'}")
+    with store.session(cfg) as conn:
+        repo = registry.get_repository(conn, args.name)
+    print(f"protected refs: {', '.join(repo['protected_refs']) or '-'}")
+    print(f"protected paths: {', '.join(repo['protected_paths']) or '-'}")
+    print(f"allowed ref namespaces: {', '.join(repo['allowed_ref_namespaces']) or '-'}")
+    return 0
+
+
+def cmd_repo_protect_path(args, cfg) -> int:
+    with store.session(cfg) as conn:
+        globs = registry.set_protected_path(
+            conn,
+            args.name,
+            args.glob,
+            actor=getattr(args, "agent", None) or cfg.agent,
+            remove=args.remove,
+        )
+        conn.commit()
+    print(f"protected paths for {args.name}: {', '.join(globs) or '-'}")
+    return 0
+
+
+def cmd_repo_allow_ref(args, cfg) -> int:
+    with store.session(cfg) as conn:
+        prefixes = registry.set_allowed_ref_namespace(
+            conn,
+            args.name,
+            args.prefix,
+            actor=getattr(args, "agent", None) or cfg.agent,
+            remove=args.remove,
+        )
+        conn.commit()
+    print(f"allowed ref namespaces for {args.name}: {', '.join(prefixes) or '-'}")
     return 0
 
 
@@ -451,6 +499,66 @@ def cmd_approve_vote(args, cfg) -> int:
     return 0
 
 
+def cmd_approve_prepare(args, cfg) -> int:
+    pusher = getattr(args, "agent", None) or cfg.agent
+    if args.request and not pusher:
+        raise SystemExit(
+            "Agent identity required to --request: pass --agent or set "
+            "QUORUMGIT_AGENT."
+        )
+    with store.session(cfg) as conn:
+        plan = gate.prepare_push(
+            conn,
+            args.repo,
+            args.ref,
+            args.clone,
+            None if args.delete else args.new,
+            pusher=pusher,
+        )
+        if args.request and not plan["refusals"]:
+            for entry in plan["operations"]:
+                approval = gate.request_approval(
+                    conn, entry["operation"], requested_by=pusher
+                )
+                entry["approval"] = {
+                    key: approval[key] for key in ("id", "status", "threshold")
+                }
+            conn.commit()
+    if args.json:
+        print(json.dumps(plan, indent=2, sort_keys=True))
+        return 1 if plan["refusals"] else 0
+
+    print(f"repository: {plan['repository']}")
+    print(f"refname: {plan['refname']}")
+    print(f"oldrev: {plan['oldrev']}")
+    print(f"newrev: {plan['newrev']}")
+    claim = plan["claim"]
+    if claim is not None:
+        print(f"claim: {claim['id']} by {claim['agent']} "
+              f"(scopes: {', '.join(claim['scopes'])})")
+    print(f"changed paths ({len(plan['paths'])}):")
+    for path in plan["paths"]:
+        print(f"  {path}")
+    for refusal in plan["refusals"]:
+        print(f"REFUSED: {refusal}")
+    if not plan["operations"]:
+        print("approvals required: none")
+    else:
+        print(f"approvals required ({len(plan['operations'])}):")
+    for entry in plan["operations"]:
+        operation = entry["operation"]
+        print(f"  {operation['type']} {entry['hash']}")
+        for path in operation.get("paths", []):
+            print(f"    {path}")
+        if "approval" in entry:
+            approval = entry["approval"]
+            print(f"    approval {approval['id']} status={approval['status']} "
+                  f"threshold={approval['threshold']}")
+    if plan["operations"] and not args.request and not plan["refusals"]:
+        print("re-run with --request to open these approvals.")
+    return 1 if plan["refusals"] else 0
+
+
 def cmd_approve_hash(args, cfg) -> int:
     print(gate.operation_hash(_operation_from_args(args)))
     return 0
@@ -512,6 +620,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("name"),
         sp.add_argument("path"),
         sp.add_argument("--protected-ref", action="append", default=[]),
+        sp.add_argument("--protected-path", action="append", default=[],
+                        help="path glob whose changes always need an approval"),
     ), parent=repo)
     add("list", cmd_repo_list, parent=repo)
     add("policy", cmd_repo_policy, lambda sp: (
@@ -525,6 +635,18 @@ def build_parser() -> argparse.ArgumentParser:
                              "the current set)"),
         sp.add_argument("--requester-may-vote", dest="requester_may_vote",
                         action=argparse.BooleanOptionalAction, default=None),
+    ), parent=repo)
+    add("protect-path", cmd_repo_protect_path, lambda sp: (
+        sp.add_argument("name"),
+        sp.add_argument("glob"),
+        sp.add_argument("--remove", action="store_true"),
+        sp.add_argument("--agent", help="operator making the change"),
+    ), parent=repo)
+    add("allow-ref", cmd_repo_allow_ref, lambda sp: (
+        sp.add_argument("name"),
+        sp.add_argument("prefix", help="ref namespace such as refs/tags/"),
+        sp.add_argument("--remove", action="store_true"),
+        sp.add_argument("--agent", help="operator making the change"),
     ), parent=repo)
 
     agent = sub.add_parser("agent").add_subparsers(dest="sub", required=True)
@@ -632,6 +754,21 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--agent"),
         sp.add_argument("--deny", action="store_true"),
     ), parent=ap)
+    add("prepare", cmd_approve_prepare, lambda sp: (
+        sp.add_argument("--repo", required=True),
+        sp.add_argument("--ref", required=True,
+                        help="ref to push (a bare name means refs/heads/<name>)"),
+        sp.add_argument("--new", default="HEAD",
+                        help="revision in your clone to push (default HEAD)"),
+        sp.add_argument("--delete", action="store_true",
+                        help="plan deleting the ref instead"),
+        sp.add_argument("-C", dest="clone", default=".",
+                        help="your clone (default: current directory)"),
+        sp.add_argument("--request", action="store_true",
+                        help="open an approval for every required operation"),
+        sp.add_argument("--json", action="store_true"),
+        sp.add_argument("--agent"),
+    ), parent=ap)
     add("hash", cmd_approve_hash,
         lambda sp: sp.add_argument("operation"), parent=ap)
 
@@ -662,6 +799,7 @@ def main(argv: list[str] | None = None) -> int:
         gate.GateError,
         handoff.HandoffError,
         config.ConfigError,
+        git_objects.GitObjectError,
     ) as exc:
         print(f"[quorumgit] ERROR: {exc}", file=sys.stderr)
         return 1
