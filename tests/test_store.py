@@ -156,3 +156,27 @@ def test_audit_append_only(conn):
     )
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         conn.execute("DELETE FROM audit_events WHERE entity = 'probe'")
+
+
+def test_session_commits_rolls_back_and_closes(tmp_path):
+    """CLI sessions end their transaction and close the native connection."""
+    local = Config(data_dir=tmp_path / "session", agent=None)
+    store.migrate(local)
+    try:
+        with store.session(local) as conn:
+            conn.execute("INSERT INTO agents (name) VALUES ('kept')")
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            conn.execute("SELECT 1")
+
+        with pytest.raises(RuntimeError), store.session(local) as conn:
+            conn.execute("INSERT INTO agents (name) VALUES ('dropped')")
+            raise RuntimeError("abort")
+
+        check = store.connect(local)
+        try:
+            names = {r[0] for r in check.execute("SELECT name FROM agents").fetchall()}
+        finally:
+            check.close()
+        assert "kept" in names and "dropped" not in names
+    finally:
+        store.destroy(local)

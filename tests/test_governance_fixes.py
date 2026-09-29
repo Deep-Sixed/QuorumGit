@@ -1,7 +1,8 @@
 """Regression tests for the second review round.
 
-1. An agent cannot authorize its own protected operation or takeover.
-2. A successor claim on the same branch inherits the superseded worktree.
+1. (Superseded by the repository approval policy tests on main.)
+2. A successor claim on another branch still gets a fresh worktree; same-branch
+   continuation is covered by main's worktree continuation tests.
 3. Scope globs are normalized before overlap comparison.
 4. Pushes to a claimed branch are held to the claim's declared scopes.
 5. Commit specs resolve to full OIDs and user errors never print tracebacks.
@@ -18,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from quorumgit import gate, handoff, registry, trees, work
+from quorumgit import handoff, registry, trees, work
 from tests.conftest import make_git_repo
 from tests.test_cli_hub import _cli
 from tests.test_gate import _commit, _push, _setup
@@ -74,175 +75,7 @@ def _no_traceback(result) -> None:
     assert result.stderr.startswith("[quorumgit] ERROR:"), result.stderr
 
 
-# ---------------------------------------------------------------- finding 1
-
-
-def _register(conn, *names):
-    for name in names:
-        conn.execute(
-            "INSERT INTO agents (name) VALUES (?) ON CONFLICT DO NOTHING", (name,)
-        )
-
-
-def _protected_op():
-    return {
-        "type": "protected_ref_update",
-        "repository": "self-approval",
-        "refname": "refs/heads/main",
-        "n": uuid.uuid4().hex,
-    }
-
-
-def test_consumer_cannot_use_its_own_approving_vote(conn):
-    _register(conn, "pusher", "operator")
-    op = _protected_op()
-    approval = gate.request_approval(conn, op, requested_by="pusher")
-    assert gate.vote(conn, approval["id"], "pusher", True)["status"] == "approved"
-
-    with pytest.raises(gate.GateError, match="cannot authorize its own"):
-        gate.consume_approval(conn, approval["id"], op, agent="pusher")
-    assert gate.get_approval_by_id(conn, approval["id"])["status"] == "approved"
-
-    # An independent approver can still vote on the approved instance, after
-    # which the same approval becomes usable by the pusher.
-    gate.vote(conn, approval["id"], "operator", True)
-    gate.consume_approval(conn, approval["id"], op, agent="pusher")
-    assert gate.get_approval_by_id(conn, approval["id"])["status"] == "consumed"
-
-
-def test_threshold_counts_only_independent_votes(conn):
-    _register(conn, "pusher", "op-1", "op-2")
-    op = _protected_op()
-    approval = gate.request_approval(conn, op, requested_by="op-1", threshold=2)
-    gate.vote(conn, approval["id"], "pusher", True)
-    gate.vote(conn, approval["id"], "op-1", True)
-    with pytest.raises(gate.GateError, match="needs 2 approving"):
-        gate.consume_approval(conn, approval["id"], op, agent="pusher")
-    gate.vote(conn, approval["id"], "op-2", True)
-    gate.consume_approval(conn, approval["id"], op, agent="pusher")
-
-
-def test_deny_revokes_an_approved_but_unused_approval(conn):
-    _register(conn, "pusher", "op-1", "op-2")
-    op = _protected_op()
-    approval = gate.request_approval(conn, op, requested_by="op-1")
-    gate.vote(conn, approval["id"], "op-1", True)
-    assert gate.vote(conn, approval["id"], "op-2", False)["status"] == "denied"
-    with pytest.raises(gate.GateError, match="not consumable"):
-        gate.consume_approval(conn, approval["id"], op, agent="pusher")
-
-
-def test_takeover_beneficiary_cannot_approve_itself(conn, tmp_path):
-    repo, _path, task, (a, b, op) = _local_setup(conn, tmp_path)
-    claim_id, _, _ = work.claim_task(conn, task, a, "feat/self", ["src/**"])
-    operation = {
-        "type": "lease_takeover",
-        "repository": repo,
-        "task_id": task,
-        "from_claim_id": claim_id,
-        "from_agent": a,
-        "to_agent": b,
-    }
-    approval = gate.request_approval(conn, operation, requested_by=b)
-    with pytest.raises(gate.GateError, match="authorizes itself"):
-        gate.vote(conn, approval["id"], b, True)
-    assert gate.vote(conn, approval["id"], op, True)["status"] == "approved"
-
-
-def test_hook_rejects_self_approved_protected_push(committed_conn, tmp_path, cfg):
-    conn = committed_conn
-    repo_name, hub, clone, a, b = _setup(conn, tmp_path)
-    _commit(clone, "newfile.txt")
-    op = {
-        "type": "protected_ref_update",
-        "repository": repo_name,
-        "refname": "refs/heads/main",
-        "oldrev": _git(Path(hub), "rev-parse", "refs/heads/main"),
-        "newrev": _git(clone, "rev-parse", "HEAD"),
-    }
-    approval = gate.request_approval(conn, op, requested_by=a)
-    gate.vote(conn, approval["id"], a, True)
-    conn.commit()
-
-    self_approved = _push(clone, a, "main", cfg=cfg)
-    assert self_approved.returncode != 0
-    assert "cannot authorize its own" in self_approved.stderr
-
-    gate.vote(conn, approval["id"], b, True)
-    conn.commit()
-    accepted = _push(clone, a, "main", cfg=cfg)
-    assert accepted.returncode == 0, accepted.stderr
-
-
 # ---------------------------------------------------------------- finding 2
-
-
-def test_reclaim_of_expired_task_inherits_same_branch_worktree(
-    committed_conn, tmp_path, cfg
-):
-    conn = committed_conn
-    _repo, _path, task, (a, b, _op) = _local_setup(conn, tmp_path)
-    first = _cli(cfg, "claim", str(task), "--branch", "feat/inherit",
-                 "--scope", "src/**", agent=a)
-    assert first.returncode == 0, first.stderr
-    old_claim = _claim_id(first.stdout)
-    old_wt = trees.worktree_for_claim(conn, old_claim)
-    assert old_wt is not None
-    (Path(old_wt["path"]) / "src" / "wip.py").write_text("uncommitted\n")
-
-    conn.execute(
-        "UPDATE claims SET lease_expires_at = unixepoch() - 10 WHERE id = ?",
-        (old_claim,),
-    )
-    conn.commit()
-
-    second = _cli(cfg, "claim", str(task), "--branch", "feat/inherit",
-                  "--scope", "src/**", agent=b)
-    assert second.returncode == 0, second.stderr
-    assert f"inherited from claim {old_claim}" in second.stdout
-    new_claim = _claim_id(second.stdout)
-
-    moved = trees.worktree_for_claim(conn, new_claim)
-    assert moved is not None and moved["path"] == old_wt["path"]
-    assert trees.worktree_for_claim(conn, old_claim) is None
-    assert (Path(moved["path"]) / "src" / "wip.py").read_text() == "uncommitted\n"
-    events = conn.execute(
-        "SELECT count(*) FROM audit_events "
-        "WHERE event_type = 'worktree.transferred' AND entity_id = ?",
-        (moved["id"],),
-    ).fetchone()
-    assert events is not None and events[0] == 1
-
-
-def test_approved_takeover_on_same_branch_inherits_worktree(
-    committed_conn, tmp_path, cfg
-):
-    conn = committed_conn
-    repo, _path, task, (a, b, op) = _local_setup(conn, tmp_path)
-    first = _cli(cfg, "claim", str(task), "--branch", "feat/take",
-                 "--scope", "src/**", agent=a)
-    assert first.returncode == 0, first.stderr
-    old_claim = _claim_id(first.stdout)
-    old_path = _worktree(conn, old_claim)["path"]
-
-    operation = {
-        "type": "lease_takeover",
-        "repository": repo,
-        "task_id": task,
-        "from_claim_id": old_claim,
-        "from_agent": a,
-        "to_agent": b,
-    }
-    approval = gate.request_approval(conn, operation, requested_by=op)
-    gate.vote(conn, approval["id"], op, True)
-    conn.commit()
-
-    taken = _cli(cfg, "claim", str(task), "--branch", "feat/take",
-                 "--scope", "src/**", "--takeover", agent=b)
-    assert taken.returncode == 0, taken.stderr
-    new_claim = _claim_id(taken.stdout)
-    assert _worktree(conn, new_claim)["path"] == old_path
-    assert gate.get_approval_by_id(conn, approval["id"])["status"] == "consumed"
 
 
 def test_reclaim_on_a_different_branch_creates_a_fresh_worktree(

@@ -25,17 +25,18 @@ QuorumGit makes each of these either impossible or explicitly governed, using me
 
 ## The mental model
 
-Seven concepts, in the order you meet them:
+Eight concepts, in the order you meet them:
 
 | Concept | What it is |
 |---|---|
 | **Repository** | A registered Git repo that QuorumGit governs. |
-| **Agent** | A registered identity. Set via `QUORUMGIT_AGENT` or `--agent`. |
+| **Agent** | A registered identity with one role — `worker` (the default), `reviewer`, or `operator`. Set via `QUORUMGIT_AGENT` or `--agent`. |
 | **Task** | A unit of work against one repository. |
 | **Claim** | An agent's exclusive lease on a task: names a branch, declares at least one write **scope** (path glob), and expires at a timestamp (default lease: 8 hours, set with `--lease-hours`). Expired leases make the task reclaimable and cannot be renewed — evaluated at read time, no timers. |
-| **Worktree** | An isolated `git worktree` created per claim. Agents never share a mutable checkout; Git itself refuses to check one branch out twice. |
+| **Worktree** | An isolated `git worktree` created per claim. Agents never share a mutable checkout; Git itself refuses to check one branch out twice. A claim that supersedes an earlier claim on the same task and branch continues its retained checkout instead of creating a second one. |
 | **Handoff** | A structured continuation record (done / remaining / exact commit / blockers) that transfers work to a successor instead of abandoning it. |
-| **Approval** | A sign-off by registered agents, hash-bound to one exact operation (a specific push, takeover, or deletion), consumed on use. |
+| **Approval** | A sign-off by eligible agents, hash-bound to one exact operation (a specific push, takeover, or deletion), consumed on use. |
+| **Approval policy** | Owned by each repository: how many votes an approval needs, which roles may cast them, and whether the requester may vote. The agent asking for permission never chooses its own quorum. |
 
 Everything an agent does — claim, renew, checkpoint, hand off, release — writes an audit event in the same database transaction. The audit table is append-only, enforced by a trigger.
 
@@ -58,7 +59,7 @@ Then initialize the store once:
 ```bash
 $ quorumgit init
 store: /home/you/.quorumgit/quorumgit.db
-migrations applied: ['001_core.sql', '002_approval_identities.sql', '003_ref_updates.sql']
+migrations applied: ['001_core.sql', '002_approval_identities.sql', '003_ref_updates.sql', '004_approval_authority.sql']
 contract: ok
 ```
 
@@ -72,6 +73,7 @@ Register a repository and two agents, then run one full work cycle:
 
 ```bash
 quorumgit repo add myproject /path/to/working-repo
+quorumgit agent add lead --role operator   # the first operator needs no sponsor
 quorumgit agent add agent-one
 quorumgit agent add agent-two
 export QUORUMGIT_AGENT=agent-one
@@ -81,9 +83,11 @@ quorumgit task add --repo myproject --title "implement feature X"
 
 quorumgit claim 1 --branch feat/x --scope 'src/**'
 # claim 1 acquired (CLEAR).
-# worktree: ~/.quorumgit/worktrees/myproject/task-1-agent-one-claim-1
+# worktree: ~/.quorumgit/worktrees/repo-1/claim-1-3f9a0c1e
 # branch: feat/x
 ```
+
+Managed worktree paths are built from database IDs plus a random suffix. Repository and agent names are display identities and never become path components, so no registered name can place a checkout outside `QUORUMGIT_DATA_DIR/worktrees`.
 
 The agent now works **inside that worktree** — edits, commits, tests — without touching anyone else's checkout. Along the way:
 
@@ -110,7 +114,7 @@ quorumgit handoff create 1 \
 
 QUORUMGIT_AGENT=agent-two quorumgit handoff accept 1
 # claim 2 acquired via handoff.
-# worktree: ~/.quorumgit/worktrees/myproject/task-1-agent-one-claim-1
+# worktree: ~/.quorumgit/worktrees/repo-1/claim-1-3f9a0c1e
 # branch: feat/x
 # continue from commit: <commit-oid>
 # remaining work: wire into CLI, integration tests
@@ -180,12 +184,11 @@ The flow, driven by the rejection messages themselves:
 #    protected_ref_update on refs/heads/main requires an approval
 #    bound to this exact update (hash sha256:ab12…).
 
-# 2. Any registered agent requests that exact operation, and an approver votes
-#    on the returned approval instance ID. The approver must be registered too:
-quorumgit agent add operator
-quorumgit approve request '{"type":"protected_ref_update","repository":"myproject","refname":"refs/heads/main","oldrev":"<old>","newrev":"<new>"}'
-# approval 17 hash=sha256:ab12… status=pending
-quorumgit approve vote 17 --agent operator
+# 2. The agent requests that exact operation; an operator votes on the returned
+#    approval instance ID. The threshold comes from the repository's policy:
+QUORUMGIT_AGENT=agent-one quorumgit approve request '{"type":"protected_ref_update","repository":"myproject","refname":"refs/heads/main","oldrev":"<old>","newrev":"<new>"}'
+# approval 17 hash=sha256:ab12… status=pending threshold=1
+quorumgit approve vote 17 --agent lead
 
 # 3. The same push now lands. Pushing it again — or replaying the approval — is rejected:
 #    the approval was consumed while Git held the ref lock, as the update committed.
@@ -194,14 +197,23 @@ quorumgit approve vote 17 --agent operator
 Rules that hold no matter what:
 
 - **An approval never bypasses branch reservations.** A claimed branch still accepts pushes only from its claiming agent; a branch frozen by an open handoff accepts none at all. The hook checks reservations *before* approvals.
-- **No agent authorizes itself.** The agent that uses an approval (the pusher, or the claimant of a takeover) never counts toward its threshold: its own yes vote is ignored at consumption, and a takeover's beneficiary cannot vote yes at all. If a self-vote was the only approval, another registered agent can still add theirs to the approved instance.
-- **Denial has precedence and is terminal.** One `--deny` vote denies the approval — including an approved one that has not yet been used; later yes votes are refused.
+- **Denial has precedence and is terminal.** One `--deny` vote denies the approval; later yes votes are refused.
 - **Consumption is single-use under concurrency.** Two simultaneous pushes racing for one approval produce exactly one accepted push — the loser is rejected, not silently allowed.
 - **Votes bind to one approval instance.** A delayed vote for an older denied or consumed instance cannot decide a newer request with the same operation hash. Requesters, voters, consumers, and pushers must name registered agents.
 - **A consumed approval is spent, not blacklisted.** Consumption moves the approval to a terminal `consumed` state (with `consumed_at`) rather than reusing `denied`, and only one *live* (`pending` or `approved`) approval may exist per operation hash. The same operation can therefore be requested and approved again later as a new approval instance — which matters for takeovers, whose payload is stable and legitimately repeatable. What is never possible is one approval authorizing twice.
-- The default threshold is 1; `--threshold` sets a higher one. "Operator" is a convention, not a role: any registered agent can vote, including the one that requested the approval. The agent that *uses* an approval may vote too, but its vote never counts toward that approval (see above). Because agent identity is asserted rather than authenticated, keeping approvals in human hands still depends on how agent identities are used (see the threat model).
+- **Nobody authorizes themselves.** Only agents whose role the repository's policy names may vote, in either direction. The requester may not vote unless the policy says so, the agent a takeover would benefit may not vote on it, and an agent that voted to approve an operation can never be the one that carries it out — pushes and takeovers by an approver are rejected, and a database trigger refuses the consumption even for writers that bypass the CLI.
+- **Authority is checked when it is used, not only when it is granted.** Consumption re-derives eligible votes from current roles and policy, so raising the threshold or demoting an approver invalidates approvals that no longer meet it.
+- **The repository owns the policy.** New repositories require one vote from an `operator`, and the requester may not vote. Change it with `quorumgit repo policy <repo> [--threshold <n>] [--role <role>]… [--requester-may-vote | --no-requester-may-vote]`. `approve request` no longer accepts `--threshold`.
+
+### Roles and administration
+
+Registering a `reviewer` or `operator`, changing a role (`quorumgit agent role <name> <role>`), and changing repository policy are themselves authority decisions, so each requires an operator acting through `--agent` or `QUORUMGIT_AGENT`, and each is audited. The single exception is bootstrap: while no operator exists, the first one can be designated by anyone. The last remaining operator cannot be demoted, so a store never falls back into bootstrap mode by accident.
+
+> **Upgrading.** Migration `004_approval_authority.sql` makes every existing agent a `worker` and gives every existing repository the default policy. Approvals granted under the old rules (including self-approvals) stop authorizing anything until an eligible operator votes on a fresh request. After running `quorumgit init`, designate an operator with `quorumgit agent role <name> operator`.
 
 Takeovers follow the same pattern: claiming a task someone else holds (`claim <task> --takeover`) prints the takeover operation to approve. Its payload includes the incumbent claim ID, so an unused approval cannot displace a later claim by the same agent. The takeover is atomic — the incumbent is released, the replacement claim created, and the approval consumed in one transaction, or none of it happens. A refused takeover leaves the incumbent untouched and the approval unconsumed. When the replacement claim uses the incumbent's branch, it inherits the incumbent's managed worktree (including uncommitted work), because Git will not check one branch out twice; reclaiming an expired lease on the same branch works the same way.
+
+The incumbent's checkout is not duplicated. When a claim supersedes an earlier claim on the same task and branch — an approved takeover, a reclaim after lease expiry, or a re-claim after `release` without `--remove-worktree` — the retained worktree, including any uncommitted work, is verified against its recorded repository and branch and transferred to the new claim (audited as `worktree.continued`). A retained checkout that has drifted to another branch or belongs to a different task is never adopted; the claim is refused with an explanation and rolls back entirely. A recorded checkout whose directory is gone has nothing to continue, so a fresh worktree is created and `quorumgit doctor` reports the stale record.
 
 ## Command reference
 
@@ -212,7 +224,9 @@ Takeovers follow the same pattern: claiming a task someone else holds (`claim <t
 | `quorumgit doctor [--repair]` | Detect and conservatively reconcile managed-worktree drift and stuck ref updates |
 | `quorumgit destroy --yes` | Delete the database file (managed worktrees under `QUORUMGIT_DATA_DIR/worktrees` are left in place) |
 | `quorumgit repo add <name> <path> [--protected-ref <ref>]…` | Register a repository |
-| `quorumgit agent add <name>` | Register an agent identity |
+| `quorumgit agent add <name> [--role worker\|reviewer\|operator]` | Register an agent identity (non-workers need an operator once one exists) |
+| `quorumgit agent role <name> <role>` | Change an agent's role (operator only, after bootstrap) |
+| `quorumgit repo policy <name> [--threshold <n>] [--role <role>]… [--[no-]requester-may-vote]` | Show or change a repository's approval policy (changes are operator only) |
 | `quorumgit task add --repo <name> --title <t> [--objective <o>]` | Create a task |
 | `quorumgit claim <task> --branch <b> --scope <glob>… [--no-worktree] [--takeover] [--override-overlap] [--lease-hours <h>]` | Claim a task |
 | `quorumgit renew <claim> [--lease-hours <h>]` | Extend a live, unexpired lease; expired claims must be acquired again |
@@ -223,13 +237,13 @@ Takeovers follow the same pattern: claiming a task someone else holds (`claim <t
 | `quorumgit handoff decline <id>` | Decline — addressee only; removes the retained worktree, and is refused if it has uncommitted changes |
 | `quorumgit handoff cancel <id>` | Cancel — creator only; removes the retained worktree, and is refused if it has uncommitted changes |
 | `quorumgit handoff list [--status <s>] / show <id>` | Inspect handoffs |
-| `quorumgit approve request <json> [--threshold <n>]` | Open an approval for an exact operation |
+| `quorumgit approve request <json>` | Open an approval for an exact operation, at the repository's threshold |
 | `quorumgit approve vote <approval-id> [--deny]` | Vote on one approval instance |
 | `quorumgit approve hash <json>` | Compute an operation's hash |
 | `quorumgit hook install --repo <name>` | Install the pre-receive and reference-transaction hooks (hub model) |
 | `quorumgit audit [--entity <e>] [--entity-id <id>] [--limit <n>]` | Read the audit trail |
 
-`repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Commands that act as an agent (`claim`, `renew`, `release`, `checkpoint`, `handoff create/accept/decline/cancel`, `approve request/vote`) also take `--agent <name>`, which overrides `QUORUMGIT_AGENT`. At least one `--scope` is required to claim. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
+`repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Commands that act as an agent (`claim`, `renew`, `release`, `checkpoint`, `handoff create/accept/decline/cancel`, `approve request/vote`, and the operator actions `agent add`, `agent role`, `repo policy`) also take `--agent <name>`, which overrides `QUORUMGIT_AGENT`. At least one `--scope` is required to claim. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
 
 `quorumgit doctor` only checks worktree paths already recorded by QuorumGit. It reports:
 
@@ -266,7 +280,8 @@ QuorumGit v1 coordinates **cooperating agents**; the adversary is *accident, not
 - Agent identity is asserted (`QUORUMGIT_AGENT`), not cryptographically authenticated. Any local process can claim to be any agent.
 - The trust root is write access to the database and the filesystem. An actor with either can bypass governance.
 - The hooks govern `git push` only. Direct ref manipulation inside a repository bypasses them.
-- Approval hashes provide exact-payload binding and tamper-evidence, not approver authentication. An agent's own vote never counts toward an approval it uses, but because identity is asserted, an agent can still vote under another registered agent's name.
+- Approval hashes provide exact-payload binding and tamper-evidence, not approver authentication.
+- Roles separate duties between cooperating agents. Because identity is asserted, a process willing to impersonate an operator can still do so; role separation stops an agent from authorizing its own work by accident or by default, not a determined impersonator.
 
 These are the correct trade-offs for preventing well-intentioned agents from colliding on one machine. They are not Byzantine fault tolerance, and this document will not pretend otherwise.
 
@@ -285,7 +300,7 @@ ruff check src tests
 pyright
 ```
 
-Supported interpreters: Python 3.11 through 3.14; `ruff` and `pyright` are pinned to the 3.11 floor so post-3.11 syntax and APIs fail the checks. CI runs `pyright` and the test suite on Linux, macOS, and Windows with Python 3.11 and 3.14; it does not run `ruff`, so run it locally. Tests run against a real SQLite database and real Git repositories — nothing is mocked. The suite covers the full acceptance workflow (register → claim → isolate → block overlap → parallel work → checkpoint → handoff → accept → approval-gated takeover → audit → restart survival), real-push hook enforcement, concurrent voting/consumption/resolution races, and a branding gate that keeps application code free of any identity other than QuorumGit.
+Supported interpreters: Python 3.11 through 3.14; `ruff` and `pyright` target the 3.11 floor so post-3.11 syntax and APIs fail the checks. CI runs `ruff check` once on Linux, and `pyright` and the test suite on Linux, macOS, and Windows with Python 3.11 and 3.14. `ruff` is pinned to an exact version in the `dev` extra because new ruff releases enable new rules; bump it deliberately and fix any new findings in the same change. Tests run against a real SQLite database and real Git repositories — nothing is mocked. The suite covers the full acceptance workflow (register → claim → isolate → block overlap → parallel work → checkpoint → handoff → accept → approval-gated takeover → audit → restart survival), real-push hook enforcement, concurrent voting/consumption/resolution races, and a branding gate that keeps application code free of any identity other than QuorumGit.
 
 Design notes: [`docs/parallel-code-review.md`](docs/parallel-code-review.md) records which ideas from the Parallel Code project were adopted (the checkout-identity checks in `doctor`) and which were rejected.
 

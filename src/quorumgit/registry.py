@@ -9,9 +9,49 @@ from pathlib import Path
 from . import audit
 from .store import Connection, begin_immediate
 
+ROLES = ("worker", "reviewer", "operator")
+DEFAULT_ROLE = "worker"
+
 
 class RegistryError(RuntimeError):
     pass
+
+
+def _validate_role(role: str) -> str:
+    if role not in ROLES:
+        raise RegistryError(
+            f"Unknown role {role!r}; expected one of: {', '.join(ROLES)}."
+        )
+    return role
+
+
+def _operator_count(conn: Connection) -> int:
+    row = conn.execute(
+        "SELECT count(*) FROM agents WHERE role = 'operator'"
+    ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def require_operator(conn: Connection, actor: str | None, action: str) -> None:
+    """Refuse an administrative change unless an operator performs it.
+
+    Roles and approval policy decide who may authorize protected operations,
+    so changing them is itself an authority decision. Until the first operator
+    exists there is nobody to ask, so the store is in bootstrap mode and the
+    change is allowed (and audited with whatever actor was given).
+    """
+    if _operator_count(conn) == 0:
+        return
+    if not actor:
+        raise RegistryError(
+            f"{action} requires an operator; pass --agent or set QUORUMGIT_AGENT."
+        )
+    row = get_agent(conn, actor)
+    if row["role"] != "operator":
+        raise RegistryError(
+            f"{action} requires an operator; {actor} is a {row['role']}."
+        )
 
 
 def _protected_refs(conn: Connection, repository_id: int) -> list[str]:
@@ -190,6 +230,82 @@ def get_repository(conn: Connection, name: str) -> dict:
     }
 
 
+def approval_policy(conn: Connection, repository_id: int) -> dict:
+    """The repository-owned rule for who may authorize its operations."""
+    row = conn.execute(
+        "SELECT approval_threshold, requester_may_vote FROM repositories "
+        "WHERE id = ?",
+        (repository_id,),
+    ).fetchone()
+    if row is None:
+        raise RegistryError(f"No such repository id: {repository_id}")
+    roles = [
+        r[0]
+        for r in conn.execute(
+            "SELECT role FROM repository_approval_roles "
+            "WHERE repository_id = ? ORDER BY role",
+            (repository_id,),
+        ).fetchall()
+    ]
+    return {
+        "threshold": row[0],
+        "requester_may_vote": bool(row[1]),
+        "roles": roles,
+    }
+
+
+def set_approval_policy(
+    conn: Connection,
+    repository: str,
+    *,
+    actor: str | None,
+    threshold: int | None = None,
+    roles: list[str] | None = None,
+    requester_may_vote: bool | None = None,
+) -> dict:
+    begin_immediate(conn)
+    repo = get_repository(conn, repository)
+    require_operator(conn, actor, "Changing approval policy")
+    before = approval_policy(conn, repo["id"])
+    if threshold is not None:
+        if threshold < 1:
+            raise RegistryError("Approval threshold must be at least 1.")
+        conn.execute(
+            "UPDATE repositories SET approval_threshold = ? WHERE id = ?",
+            (threshold, repo["id"]),
+        )
+    if roles is not None:
+        wanted = sorted({_validate_role(role) for role in roles})
+        if not wanted:
+            raise RegistryError("At least one approving role is required.")
+        conn.execute(
+            "DELETE FROM repository_approval_roles WHERE repository_id = ?",
+            (repo["id"],),
+        )
+        for role in wanted:
+            conn.execute(
+                "INSERT INTO repository_approval_roles (repository_id, role) "
+                "VALUES (?, ?)",
+                (repo["id"], role),
+            )
+    if requester_may_vote is not None:
+        conn.execute(
+            "UPDATE repositories SET requester_may_vote = ? WHERE id = ?",
+            (1 if requester_may_vote else 0, repo["id"]),
+        )
+    after = approval_policy(conn, repo["id"])
+    if after != before:
+        audit.record(
+            conn,
+            "repository.policy_changed",
+            "repository",
+            repo["id"],
+            agent=actor,
+            detail={"before": before, "after": after},
+        )
+    return after
+
+
 def list_repositories(conn: Connection) -> list[dict]:
     rows = conn.execute(
         "SELECT id, name, path FROM repositories ORDER BY name"
@@ -205,28 +321,70 @@ def list_repositories(conn: Connection) -> list[dict]:
     ]
 
 
-def add_agent(conn: Connection, name: str) -> int:
+def add_agent(
+    conn: Connection,
+    name: str,
+    role: str = DEFAULT_ROLE,
+    *,
+    actor: str | None = None,
+) -> int:
+    _validate_role(role)
     begin_immediate(conn)
+    if role != DEFAULT_ROLE:
+        require_operator(conn, actor, f"Registering a {role}")
     if conn.execute("SELECT 1 FROM agents WHERE name = ?", (name,)).fetchone():
         raise RegistryError(f"Agent is already registered: {name}")
     row = conn.execute(
-        "INSERT INTO agents (name) VALUES (?) RETURNING id", (name,)
+        "INSERT INTO agents (name, role) VALUES (?, ?) RETURNING id", (name, role)
     ).fetchone()
     assert row is not None
     agent_id = row[0]
-    audit.record(conn, "agent.registered", "agent", agent_id, agent=name)
+    detail = {"role": role}
+    if actor:
+        detail["registered_by"] = actor
+    audit.record(
+        conn, "agent.registered", "agent", agent_id, agent=name, detail=detail
+    )
     return agent_id
+
+
+def set_agent_role(
+    conn: Connection, name: str, role: str, *, actor: str | None
+) -> None:
+    _validate_role(role)
+    begin_immediate(conn)
+    target = get_agent(conn, name)
+    require_operator(conn, actor, "Changing an agent role")
+    if target["role"] == role:
+        return
+    if target["role"] == "operator" and _operator_count(conn) == 1:
+        # Demoting the last operator would drop the store back into bootstrap
+        # mode, where any agent could then promote itself.
+        raise RegistryError(
+            f"{name} is the last operator; designate another operator first."
+        )
+    conn.execute("UPDATE agents SET role = ? WHERE id = ?", (role, target["id"]))
+    audit.record(
+        conn,
+        "agent.role_changed",
+        "agent",
+        target["id"],
+        agent=actor,
+        detail={"agent": name, "from": target["role"], "to": role},
+    )
 
 
 def get_agent(conn: Connection, name: str) -> dict:
     row = conn.execute(
-        "SELECT id, name FROM agents WHERE name = ?", (name,)
+        "SELECT id, name, role FROM agents WHERE name = ?", (name,)
     ).fetchone()
     if row is None:
         raise RegistryError(f"Agent is not registered: {name}")
-    return {"id": row[0], "name": row[1]}
+    return {"id": row[0], "name": row[1], "role": row[2]}
 
 
 def list_agents(conn: Connection) -> list[dict]:
-    rows = conn.execute("SELECT id, name FROM agents ORDER BY name").fetchall()
-    return [{"id": r[0], "name": r[1]} for r in rows]
+    rows = conn.execute(
+        "SELECT id, name, role FROM agents ORDER BY name"
+    ).fetchall()
+    return [{"id": r[0], "name": r[1], "role": r[2]} for r in rows]

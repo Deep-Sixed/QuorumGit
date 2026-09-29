@@ -19,6 +19,7 @@ import pytest
 
 from quorumgit import gate, registry, store, work
 from quorumgit.config import Config
+from tests.conftest import approve
 from tests.test_gate import _commit, _push, _setup
 
 
@@ -32,6 +33,7 @@ def _rev(git_args: list[str], ref: str) -> str:
 
 
 def _approve_main(conn, repo_name: str, hub: Path, clone: Path) -> tuple[dict, dict]:
+    """Approve the clone's pending update of main: requested, then an operator votes."""
     op = {
         "type": "protected_ref_update",
         "repository": repo_name,
@@ -39,9 +41,7 @@ def _approve_main(conn, repo_name: str, hub: Path, clone: Path) -> tuple[dict, d
         "oldrev": _rev(["--git-dir", str(hub)], "refs/heads/main"),
         "newrev": _rev(["-C", str(clone)], "HEAD"),
     }
-    conn.execute("INSERT INTO agents (name) VALUES ('operator') ON CONFLICT DO NOTHING")
-    approval = gate.request_approval(conn, op, requested_by="operator")
-    gate.vote(conn, approval["id"], "operator", True)
+    approval = approve(conn, op, requested_by="requester")
     conn.commit()
     return op, approval
 
@@ -194,7 +194,7 @@ def test_abort_does_not_restore_over_a_newer_live_approval(
 
     # While the transaction is in flight the same operation is requested
     # again; the consumed instance is not live, so this opens a new one.
-    second = gate.request_approval(conn, op, requested_by="operator")
+    second = gate.request_approval(conn, op, requested_by="requester")
     conn.commit()
     assert second["id"] != first["id"] and second["status"] == "pending"
 

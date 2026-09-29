@@ -52,7 +52,7 @@ def cmd_status(args, cfg) -> int:
     except store.StoreError as exc:
         print(f"contract: VIOLATED — {exc}")
         return 1
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         for table in ("repositories", "agents", "tasks", "claims", "handoffs"):
             row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()
             assert row is not None
@@ -71,7 +71,7 @@ def cmd_destroy(args, cfg) -> int:
 
 def cmd_doctor(args, cfg) -> int:
     """Inspect and optionally reconcile worktree drift and stuck ref updates."""
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         findings = trees.doctor_worktrees(conn, repair=args.repair)
         ref_findings = gate.doctor_ref_updates(conn, repair=args.repair)
         if args.repair:
@@ -117,7 +117,7 @@ def cmd_doctor(args, cfg) -> int:
 
 
 def cmd_repo_add(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         repo_id = registry.add_repository(
             conn, args.name, args.path, protected_refs=args.protected_ref
         )
@@ -127,25 +127,70 @@ def cmd_repo_add(args, cfg) -> int:
 
 
 def cmd_repo_list(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         for repo in registry.list_repositories(conn):
             refs = ",".join(repo["protected_refs"]) or "-"
             print(f"{repo['id']}\t{repo['name']}\t{repo['path']}\tprotected:{refs}")
     return 0
 
 
+def cmd_repo_policy(args, cfg) -> int:
+    with store.session(cfg) as conn:
+        changing = (
+            args.threshold is not None
+            or args.role
+            or args.requester_may_vote is not None
+        )
+        if changing:
+            policy = registry.set_approval_policy(
+                conn,
+                args.name,
+                actor=getattr(args, "agent", None) or cfg.agent,
+                threshold=args.threshold,
+                roles=args.role or None,
+                requester_may_vote=args.requester_may_vote,
+            )
+            conn.commit()
+        else:
+            repo = registry.get_repository(conn, args.name)
+            policy = registry.approval_policy(conn, repo["id"])
+    print(f"repository: {args.name}")
+    print(f"approval threshold: {policy['threshold']}")
+    print(f"approving roles: {', '.join(policy['roles'])}")
+    print(f"requester may vote: {'yes' if policy['requester_may_vote'] else 'no'}")
+    return 0
+
+
 def cmd_agent_add(args, cfg) -> int:
-    with store.connect(cfg) as conn:
-        agent_id = registry.add_agent(conn, args.name)
+    with store.session(cfg) as conn:
+        agent_id = registry.add_agent(
+            conn,
+            args.name,
+            role=args.role,
+            actor=getattr(args, "agent", None) or cfg.agent,
+        )
         conn.commit()
-    print(f"agent {args.name} registered (id {agent_id}).")
+    print(f"agent {args.name} registered as {args.role} (id {agent_id}).")
+    return 0
+
+
+def cmd_agent_role(args, cfg) -> int:
+    with store.session(cfg) as conn:
+        registry.set_agent_role(
+            conn,
+            args.name,
+            args.role,
+            actor=getattr(args, "agent", None) or cfg.agent,
+        )
+        conn.commit()
+    print(f"agent {args.name} is now a {args.role}.")
     return 0
 
 
 def cmd_agent_list(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         for agent in registry.list_agents(conn):
-            print(f"{agent['id']}\t{agent['name']}")
+            print(f"{agent['id']}\t{agent['name']}\t{agent['role']}")
     return 0
 
 
@@ -153,7 +198,7 @@ def cmd_agent_list(args, cfg) -> int:
 
 
 def cmd_task_add(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         task_id = work.create_task(conn, args.repo, args.title, args.objective)
         conn.commit()
     print(f"task {task_id} created.")
@@ -161,7 +206,7 @@ def cmd_task_add(args, cfg) -> int:
 
 
 def cmd_task_list(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         for task in work.list_tasks(conn, repository=args.repo):
             print(f"{task['id']}\t{task['repository']}\t{task['status']}\t"
                   f"{task['title']}")
@@ -170,38 +215,43 @@ def cmd_task_list(args, cfg) -> int:
 
 def cmd_claim(args, cfg) -> int:
     agent = _agent(args, cfg)
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         takeover_operation = None
         takeover_approval = None
-        # Pin the incumbent (live or expired) under the task lock: a takeover
-        # approval binds to it, and a successor on the same branch inherits
-        # its worktree. claim_task() and every release take this same lock.
-        work.lock_task(conn, args.task_id)
-        holder = work.active_claim_for_task(conn, args.task_id)
-        if args.takeover and holder and not holder["expired"]:
-            task = work.get_task(conn, args.task_id)
-            takeover_operation = {
-                "type": "lease_takeover",
-                "repository": task["repository"],
-                "task_id": args.task_id,
-                "from_claim_id": holder["id"],
-                "from_agent": holder["agent"],
-                "to_agent": agent,
-            }
-            takeover_approval = gate.approved_instance(conn, takeover_operation)
-            if takeover_approval is None:
-                print(
-                    "[quorumgit] REFUSED: lease takeover requires approval.\n"
-                    f"operation hash: "
-                    f"{gate.operation_hash(takeover_operation)}\n"
-                    "Request it via `quorumgit approve request`; another "
-                    "registered agent must approve it with `quorumgit approve "
-                    "vote`. Operation:\n"
-                    f"{json.dumps(takeover_operation, sort_keys=True)}",
-                    file=sys.stderr,
+        if args.takeover:
+            # Bind the approval to a stable incumbent. claim_task() and every
+            # release take this same task lock, closing the stale-holder window.
+            work.lock_task(conn, args.task_id)
+            holder = work.active_claim_for_task(conn, args.task_id)
+            if holder and not holder["expired"]:
+                task = work.get_task(conn, args.task_id)
+                takeover_operation = {
+                    "type": "lease_takeover",
+                    "repository": task["repository"],
+                    "task_id": args.task_id,
+                    "from_claim_id": holder["id"],
+                    "from_agent": holder["agent"],
+                    "to_agent": agent,
+                }
+                takeover_approval = gate.approved_instance(
+                    conn, takeover_operation, consumer=agent
                 )
-                conn.commit()  # keep the conflict/audit trail
-                return 1
+                if takeover_approval is None:
+                    refusal = gate.approval_refusal(
+                        conn, takeover_operation, consumer=agent
+                    )
+                    print(
+                        "[quorumgit] REFUSED: lease takeover requires approval.\n"
+                        + (f"{refusal}\n" if refusal else "")
+                        + "operation hash: "
+                        f"{gate.operation_hash(takeover_operation)}\n"
+                        "Request/approve it via `quorumgit approve request/vote` "
+                        "with operation:\n"
+                        f"{json.dumps(takeover_operation, sort_keys=True)}",
+                        file=sys.stderr,
+                    )
+                    conn.commit()  # keep the conflict/audit trail
+                    return 1
         try:
             claim_id, classification, _ = work.claim_task(
                 conn,
@@ -234,18 +284,17 @@ def cmd_claim(args, cfg) -> int:
                 print(f"[quorumgit] REFUSED: {exc}", file=sys.stderr)
                 return 1
         wt = None
-        inherited = False
         if not args.no_worktree:
-            if holder is not None:
-                wt = trees.inherit_worktree(conn, holder["id"], claim_id, agent)
-                inherited = wt is not None
-            if wt is None:
-                wt = trees.create_worktree(conn, claim_id, cfg.worktrees_dir)
+            wt = trees.continue_or_create_worktree(conn, claim_id, cfg.worktrees_dir)
         conn.commit()
     print(f"claim {claim_id} acquired ({classification}).")
     if wt:
-        suffix = f" (inherited from claim {holder['id']})" if inherited and holder else ""
-        print(f"worktree: {wt['path']}{suffix}")
+        print(f"worktree: {wt['path']}")
+        if wt.get("continued_from_claim_id"):
+            print(
+                "continued retained worktree of claim "
+                f"{wt['continued_from_claim_id']} (uncommitted work preserved)"
+            )
         print(f"branch: {wt['branch']}")
     else:
         print(f"branch: {args.branch} (no worktree — work from your own clone "
@@ -254,7 +303,7 @@ def cmd_claim(args, cfg) -> int:
 
 
 def cmd_renew(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         work.renew_claim(conn, args.claim_id, _agent(args, cfg),
                          lease_hours=args.lease_hours)
         conn.commit()
@@ -264,7 +313,7 @@ def cmd_renew(args, cfg) -> int:
 
 def cmd_release(args, cfg) -> int:
     agent = _agent(args, cfg)
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         wt = trees.worktree_for_claim(conn, args.claim_id)
         if wt and wt["removed_at"] is None and args.remove_worktree:
             trees.remove_worktree(conn, args.claim_id, agent)
@@ -276,7 +325,7 @@ def cmd_release(args, cfg) -> int:
 
 def cmd_checkpoint(args, cfg) -> int:
     agent = _agent(args, cfg)
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         commit = args.commit
         if not commit:
             wt = trees.active_worktree_for_claim(conn, args.claim_id)
@@ -298,7 +347,7 @@ def cmd_checkpoint(args, cfg) -> int:
 
 def cmd_handoff_create(args, cfg) -> int:
     agent = _agent(args, cfg)
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         # An explicit --last-commit always wins; otherwise continue from the
         # managed worktree's HEAD.
         last_commit = args.last_commit
@@ -330,7 +379,7 @@ def cmd_handoff_create(args, cfg) -> int:
 
 
 def cmd_handoff_list(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         for h in handoff.list_handoffs(conn, status=args.status):
             print(f"{h['id']}\ttask {h['task_id']}\t{h['from_agent']} -> "
                   f"{h['to_agent'] or 'anyone'}\t{h['status']}")
@@ -338,7 +387,7 @@ def cmd_handoff_list(args, cfg) -> int:
 
 
 def cmd_handoff_show(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         h = handoff.get_handoff(conn, args.handoff_id)
     print(json.dumps(h, indent=2, default=str))
     return 0
@@ -346,7 +395,7 @@ def cmd_handoff_show(args, cfg) -> int:
 
 def cmd_handoff_accept(args, cfg) -> int:
     agent = _agent(args, cfg)
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         result = handoff.accept_handoff(conn, args.handoff_id, agent,
                                         lease_hours=args.lease_hours)
         conn.commit()
@@ -359,7 +408,7 @@ def cmd_handoff_accept(args, cfg) -> int:
 
 
 def cmd_handoff_decline(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         handoff.decline_handoff(conn, args.handoff_id, _agent(args, cfg))
         conn.commit()
     print(f"handoff {args.handoff_id} declined.")
@@ -367,7 +416,7 @@ def cmd_handoff_decline(args, cfg) -> int:
 
 
 def cmd_handoff_cancel(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         handoff.cancel_handoff(conn, args.handoff_id, _agent(args, cfg))
         conn.commit()
     print(f"handoff {args.handoff_id} cancelled.")
@@ -388,21 +437,20 @@ def _operation_from_args(args) -> dict:
 
 
 def cmd_approve_request(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         approval = gate.request_approval(
-            conn, _operation_from_args(args), requested_by=_agent(args, cfg),
-            threshold=args.threshold,
+            conn, _operation_from_args(args), requested_by=_agent(args, cfg)
         )
         conn.commit()
     print(
         f"approval {approval['id']} hash={approval['operation_hash']} "
-        f"status={approval['status']}"
+        f"status={approval['status']} threshold={approval['threshold']}"
     )
     return 0
 
 
 def cmd_approve_vote(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         approval = gate.vote(conn, args.approval_id, _agent(args, cfg),
                              approve=not args.deny)
         conn.commit()
@@ -422,7 +470,7 @@ def cmd_approve_hash(args, cfg) -> int:
 
 
 def cmd_hook_install(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         path = gate.install_hook(conn, args.repo)
         repo_path = registry.get_repository(conn, args.repo)["path"]
         conn.commit()
@@ -433,7 +481,7 @@ def cmd_hook_install(args, cfg) -> int:
 
 
 def cmd_hook_pre_receive(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         return gate.run_pre_receive(conn, args.repo, sys.stdin)
 
 
@@ -456,15 +504,20 @@ def cmd_hook_reference_transaction(args, cfg) -> int:
         label = "REJECTED" if args.state == "prepared" else f"WARNING ({args.state})"
         print(f"[quorumgit] {label}: {exc}", file=sys.stderr)
         return 1
-    with conn:
-        return gate.run_reference_transaction(conn, args.repo, args.state, sys.stdin)
+    try:
+        with conn:
+            return gate.run_reference_transaction(
+                conn, args.repo, args.state, sys.stdin
+            )
+    finally:
+        conn.close()
 
 
 # -------------------------------------------------------------------- audit
 
 
 def cmd_audit(args, cfg) -> int:
-    with store.connect(cfg) as conn:
+    with store.session(cfg) as conn:
         for event in audit.events(conn, entity=args.entity,
                                   entity_id=args.entity_id, limit=args.limit):
             print(f"{event['id']}\t{event['created_at']}\t{event['event_type']}"
@@ -502,9 +555,31 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--protected-ref", action="append", default=[]),
     ), parent=repo)
     add("list", cmd_repo_list, parent=repo)
+    add("policy", cmd_repo_policy, lambda sp: (
+        sp.add_argument("name"),
+        sp.add_argument("--agent", help="operator making the change"),
+        sp.add_argument("--threshold", type=int,
+                        help="eligible yes votes required"),
+        sp.add_argument("--role", action="append", default=[],
+                        choices=registry.ROLES,
+                        help="role whose votes count (repeatable; replaces "
+                             "the current set)"),
+        sp.add_argument("--requester-may-vote", dest="requester_may_vote",
+                        action=argparse.BooleanOptionalAction, default=None),
+    ), parent=repo)
 
     agent = sub.add_parser("agent").add_subparsers(dest="sub", required=True)
-    add("add", cmd_agent_add, lambda sp: sp.add_argument("name"), parent=agent)
+    add("add", cmd_agent_add, lambda sp: (
+        sp.add_argument("name"),
+        sp.add_argument("--role", choices=registry.ROLES,
+                        default=registry.DEFAULT_ROLE),
+        sp.add_argument("--agent", help="operator registering a non-worker"),
+    ), parent=agent)
+    add("role", cmd_agent_role, lambda sp: (
+        sp.add_argument("name"),
+        sp.add_argument("role", choices=registry.ROLES),
+        sp.add_argument("--agent", help="operator making the change"),
+    ), parent=agent)
     add("list", cmd_agent_list, parent=agent)
 
     task = sub.add_parser("task").add_subparsers(dest="sub", required=True)
@@ -584,7 +659,6 @@ def build_parser() -> argparse.ArgumentParser:
     add("request", cmd_approve_request, lambda sp: (
         sp.add_argument("operation", help="operation JSON object"),
         sp.add_argument("--agent"),
-        sp.add_argument("--threshold", type=int, default=1),
     ), parent=ap)
     add("vote", cmd_approve_vote, lambda sp: (
         sp.add_argument("approval_id", type=int),

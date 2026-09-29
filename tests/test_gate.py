@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from quorumgit import gate, registry, store, work
-from tests.conftest import make_git_repo
+from tests.conftest import OPERATOR, approve, ensure_agent, make_git_repo, register_repo
 
 
 def _register_agents(conn, *names):
@@ -101,30 +101,34 @@ def test_operation_hash_requires_fields():
         gate.operation_hash({"type": "x"})
 
 
-def test_vote_threshold_and_deny(conn):
-    _register_agents(conn, "op", "voter-1", "voter-2")
-    op = {"type": "test_op", "repository": "r", "n": 1}
-    approval = gate.request_approval(conn, op, requested_by="op", threshold=2)
+def test_vote_threshold_and_deny(conn, approval_repo):
+    _register_agents(conn, "op")
+    ensure_agent(conn, OPERATOR, "operator")
+    ensure_agent(conn, "voter-1", "operator")
+    ensure_agent(conn, "voter-2", "operator")
+    registry.set_approval_policy(conn, approval_repo, actor=OPERATOR, threshold=2)
+    op = {"type": "test_op", "repository": approval_repo, "n": 1}
+    approval = gate.request_approval(conn, op, requested_by="op")
     assert approval["status"] == "pending"
+    assert approval["threshold"] == 2
     gate.vote(conn, approval["id"], "voter-1", True)
     assert gate.get_approval(conn, approval["operation_hash"])["status"] == "pending"
     result = gate.vote(conn, approval["id"], "voter-2", True)
     assert result["status"] == "approved"
     assert gate.is_approved(conn, op)
 
-    op2 = {"type": "test_op", "repository": "r", "n": 2}
+    op2 = {"type": "test_op", "repository": approval_repo, "n": 2}
     approval2 = gate.request_approval(conn, op2, requested_by="op")
     result2 = gate.vote(conn, approval2["id"], "voter-1", False)
     assert result2["status"] == "denied"
     assert not gate.is_approved(conn, op2)
 
 
-def test_consume_approval_is_single_use(conn):
+def test_consume_approval_is_single_use(conn, approval_repo):
     """One approval instance cannot authorize two operations."""
-    op = {"type": "protected_ref_update", "repository": "r", "n": 1}
+    op = {"type": "protected_ref_update", "repository": approval_repo, "n": 1}
     _register_agents(conn, "op", "pusher-1", "pusher-2")
-    approval = gate.request_approval(conn, op, requested_by="op")
-    gate.vote(conn, approval["id"], "op", True)
+    approval = approve(conn, op, requested_by="op")
     assert gate.is_approved(conn, op)
     gate.consume_approval(conn, approval["id"], op, agent="pusher-1")
     consumed = gate.get_approval(conn, gate.operation_hash(op))
@@ -135,46 +139,46 @@ def test_consume_approval_is_single_use(conn):
         gate.consume_approval(conn, approval["id"], op, agent="pusher-2")
 
 
-def test_consumed_operation_can_be_approved_again(conn):
+def test_consumed_operation_can_be_approved_again(conn, approval_repo):
     """A consumed exact takeover may be requested again as a new instance."""
     op = {
         "type": "repeatable_test_operation",
-        "repository": "r",
+        "repository": approval_repo,
         "task_id": 7,
         "from_agent": "a",
         "to_agent": "b",
     }
-    _register_agents(conn, "operator", "b")
-    first = gate.request_approval(conn, op, requested_by="operator")
-    gate.vote(conn, first["id"], "operator", True)
+    _register_agents(conn, "b")
+    first = approve(conn, op, requested_by="b")
     gate.consume_approval(conn, first["id"], op, agent="b")
     assert gate.get_approval(conn, gate.operation_hash(op))["status"] == "consumed"
 
-    second = gate.request_approval(conn, op, requested_by="operator")
+    second = gate.request_approval(conn, op, requested_by="b")
     assert second["id"] != first["id"]
     assert second["status"] == "pending"
-    gate.vote(conn, second["id"], "operator", True)
+    gate.vote(conn, second["id"], OPERATOR, True)
     assert gate.is_approved(conn, op)
 
 
-def test_consume_approval_concurrent_single_winner(initialized_store):
+def test_consume_approval_concurrent_single_winner(initialized_store, tmp_path):
     """Two real SQLite connections race to consume one approval; one wins.
 
     The second consumer is already in flight and blocked on SQLite's writer
     reservation before the first commits. This preserves the original genuine
     two-connection race while asserting BEGIN IMMEDIATE semantics.
     """
-    op = {
-        "type": "protected_ref_update",
-        "repository": "race-repo",
-        "n": uuid.uuid4().hex,
-    }
     setup = store.connect(initialized_store)
-    _register_agents(setup, "op", "pusher-1", "pusher-2")
-    approval = gate.request_approval(setup, op, requested_by="op")
-    gate.vote(setup, approval["id"], "op", True)
-    setup.commit()
-    setup.close()
+    try:
+        op = {
+            "type": "protected_ref_update",
+            "repository": register_repo(setup, tmp_path / "race", prefix="race"),
+            "n": uuid.uuid4().hex,
+        }
+        _register_agents(setup, "op", "pusher-1", "pusher-2")
+        approval = approve(setup, op, requested_by="op")
+        setup.commit()
+    finally:
+        setup.close()
 
     conn1 = store.connect(initialized_store)
     racer_error: list[Exception] = []
@@ -245,9 +249,7 @@ def test_hook_protected_ref_requires_approval(committed_conn, tmp_path, cfg):
         "oldrev": oldrev,
         "newrev": newrev,
     }
-    _register_agents(committed_conn, "operator")
-    approval = gate.request_approval(committed_conn, op, requested_by="operator")
-    gate.vote(committed_conn, approval["id"], "operator", True)
+    approve(committed_conn, op, requested_by=a)
     committed_conn.commit()
 
     result = _push(clone, a, "main", cfg=cfg)
