@@ -343,11 +343,38 @@ def migrate(target: Config | str | Path) -> list[str]:
 # ------------------------------------------------------------ contract check
 
 
+# One SQL token: a quoted literal or identifier (kept exactly), a comment
+# (dropped), a word or number, a multi-character operator, or any other
+# single character. Whitespace between tokens is insignificant.
+_SQL_TOKEN = re.compile(
+    r"""'(?:[^']|'')*'"""
+    r'|"(?:[^"]|"")*"'
+    r"|`(?:[^`]|``)*`"
+    r"|\[[^\]]*\]"
+    r"|--[^\n]*"
+    r"|/\*.*?\*/"
+    r"|\w+"
+    r"|<>|!=|<=|>=|==|\|\||<<|>>"
+    r"|\S",
+    re.DOTALL,
+)
+
+
 def _normalized_sql(sql: str | None) -> str | None:
-    """Schema SQL with formatting-only whitespace removed."""
+    """Schema SQL as a token sequence, ignoring formatting.
+
+    Keyword and bare-name case, whitespace, and comments do not change what
+    SQLite builds, so they are normalized away; quoted literals and quoted
+    identifiers are compared exactly.
+    """
     if sql is None:
         return None
-    return re.sub(r" ?([(),;]) ?", r"\1", " ".join(sql.split()))
+    tokens = []
+    for token in _SQL_TOKEN.findall(sql):
+        if token.startswith(("--", "/*")):
+            continue
+        tokens.append(token if token[0] in "'\"`[" else token.lower())
+    return " ".join(tokens)
 
 
 def _schema_objects(conn: Connection) -> dict[tuple[str, str], tuple[str, str | None]]:
