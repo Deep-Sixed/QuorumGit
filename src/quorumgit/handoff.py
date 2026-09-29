@@ -195,8 +195,8 @@ def accept_handoff(
         handoff_id=handoff_id,
     )
 
-    wt = trees.worktree_for_claim(conn, handoff["from_claim_id"])
-    if wt and wt["removed_at"] is None:
+    wt = trees.active_worktree_for_claim(conn, handoff["from_claim_id"])
+    if wt:
         trees.transfer_worktree(conn, wt["id"], claim_id)
 
     cur = conn.execute(

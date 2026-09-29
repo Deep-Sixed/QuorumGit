@@ -257,9 +257,9 @@ def cmd_checkpoint(args, cfg) -> int:
     with store.connect(cfg) as conn:
         commit = args.commit
         if not commit:
-            wt = trees.worktree_for_claim(conn, args.claim_id)
+            wt = trees.active_worktree_for_claim(conn, args.claim_id)
             if wt is None:
-                print("No worktree for this claim; pass --commit <oid>.",
+                print("No active worktree for this claim; pass --commit <oid>.",
                       file=sys.stderr)
                 return 1
             commit = trees.head_commit(wt["path"])
@@ -276,10 +276,11 @@ def cmd_checkpoint(args, cfg) -> int:
 def cmd_handoff_create(args, cfg) -> int:
     agent = _agent(args, cfg)
     with store.connect(cfg) as conn:
-        wt = trees.worktree_for_claim(conn, args.claim_id)
+        wt = trees.active_worktree_for_claim(conn, args.claim_id)
         last_commit = trees.head_commit(wt["path"]) if wt else args.last_commit
         if not last_commit:
-            print("Provide --last-commit (no worktree found).", file=sys.stderr)
+            print("Provide --last-commit (no active worktree for this claim).",
+                  file=sys.stderr)
             return 1
         record = {
             "completed": args.completed,
