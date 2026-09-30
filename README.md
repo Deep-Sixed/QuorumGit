@@ -8,7 +8,7 @@ QuorumGit prevents coding agents (or humans) working the same codebase from step
 agent-one ──┐
 agent-two ──┼──► quorumgit CLI ──► local SQLite file (claims, leases, approvals, audit)
 reviewer  ──┘                          │
-                                       └──► git pre-receive hook (push enforcement)
+                                       └──► git pre-receive + reference-transaction hooks (push enforcement)
 ```
 
 ## The problem it solves
@@ -43,7 +43,7 @@ Everything an agent does — claim, renew, checkpoint, hand off, release — wri
 
 ## Installation
 
-Requirements: **Python 3.11–3.14**, **Git 2.17 or newer** (the first release with `git worktree remove`). There is no database to install, no server to run, and no extension to provision: the store is a single SQLite 3 database file under `QUORUMGIT_DATA_DIR`, accessed through Python's standard-library [`sqlite3`](https://docs.python.org/3/library/sqlite3.html) module. QuorumGit has no third-party runtime dependencies. The Python interpreter must be linked against SQLite 3.38 or newer (every supported CPython release from python.org, Homebrew, and current Linux distributions is); `quorumgit` refuses to open the store otherwise.
+Requirements: **Python 3.11–3.14**, **Git 2.28 or newer** (the first release with the `reference-transaction` hook that hub push enforcement relies on; the local model alone needs only 2.17, for `git worktree remove`). There is no database to install, no server to run, and no extension to provision: the store is a single SQLite 3 database file under `QUORUMGIT_DATA_DIR`, accessed through Python's standard-library [`sqlite3`](https://docs.python.org/3/library/sqlite3.html) module. QuorumGit has no third-party runtime dependencies. The Python interpreter must be linked against SQLite 3.38 or newer (every supported CPython release from python.org, Homebrew, and current Linux distributions is); `quorumgit` refuses to open the store otherwise.
 
 > **Platform note.** Linux, macOS, and Windows are supported on every Python from 3.11 to 3.14.
 
@@ -64,7 +64,7 @@ migrations applied: ['001_core.sql', '002_approval_identities.sql', '004_approva
 contract: ok
 ```
 
-`init` creates the state directory, applies migrations, and verifies the runtime contract (required migrations, tables, and governance triggers, foreign keys on, WAL journal mode). It is idempotent — re-run it any time.
+`init` creates the state directory, applies migrations, and verifies the runtime contract: required migrations, tables, and governance triggers, foreign keys on, WAL journal mode, and **every schema object the governance rules depend on**. The expected schema is derived by replaying the bundled migrations in memory, so a store whose triggers or unique indexes are missing or altered — or that carries extra indexes or triggers, or was migrated by a newer version — fails the contract instead of silently losing an invariant. Every command runs this check. It is idempotent — re-run it any time.
 
 `quorumgit status` shows the store path, contract state, and row counts. If the store is missing or incomplete, every command exits non-zero: there is **one storage backend and no fallback**, by design.
 
@@ -127,7 +127,7 @@ QUORUMGIT_AGENT=agent-two quorumgit handoff accept 1
 # remaining work: wire into CLI, integration tests
 ```
 
-Creating a handoff releases the original claim but keeps its worktree; accepting transfers that same worktree to the new claim. When the claim has an active worktree, the handoff records the worktree's `HEAD` as the last commit; `--last-commit` is used when there is none (hub model, or a worktree removed by `doctor --repair`).
+Creating a handoff releases the original claim but keeps its worktree; accepting transfers that same worktree to the new claim. The handoff records `--last-commit` as the continuation point when given (any commit spec, stored as the full OID), otherwise the active worktree's `HEAD`; a claim without an active worktree (hub model, or a worktree removed by `doctor --repair`) must pass `--last-commit`.
 
 What just *didn't* happen, silently: a second agent claiming task 1 (**BLOCKED**), claiming another task on branch `feat/x` (**CONFLICTING**), or claiming a task whose scopes overlap `src/**` (**OVERLAPPING**, refused unless explicitly overridden and audited). While the handoff was open, the task, branch, and declared scopes were **reserved** for continuation until agent-two accepted.
 
@@ -151,7 +151,7 @@ Where the registered repository sits determines how enforcement works. Pick one 
 
 **Local model** — the registered repo is a working checkout on the same machine. Claims create isolated worktrees; agents commit directly in them. Coordination is entirely claim-based; no pushes, no hook needed. This is the default and the simplest setup — the quick start above is the local model.
 
-**Hub model** — the registered repo is a **bare** hub that agents push to from their own clones. Enforcement moves to a pre-receive hook:
+**Hub model** — the registered repo is a **bare** hub that agents push to from their own clones. Enforcement moves to a pair of Git hooks, `pre-receive` and `reference-transaction`:
 
 ```bash
 git clone --bare /path/to/source myproject.git
@@ -174,9 +174,11 @@ Owning the branch is necessary but not sufficient: when the branch has a live cl
 
 The hook learns who is pushing from `QUORUMGIT_AGENT` in its own environment, which Git passes through only when the remote is a **local path** (as `origin` is above). Over SSH or HTTP the variable does not reach the hook, so every push is rejected as unidentified. The hook also opens the store under its own `QUORUMGIT_DATA_DIR`, so pushers must use the same data directory as the rest of the deployment.
 
+**Authorization is bound to the ref update itself.** `pre-receive` checks the push and records each exact ref update it accepted — with the paths it derived and the approvals it needs — but spends nothing. Git's `reference-transaction` hook then runs at the `prepared` stage, after Git has locked the refs and while it can still abort, re-checks every rule against the store's current state using the paths `pre-receive` recorded, and only then consumes the approvals. If ownership changed after `pre-receive` (a release, takeover, or handoff), the update is aborted. If Git refuses the update after `pre-receive` (another hook, a lost ref lock), no approval is spent; if Git aborts after `prepared`, the consumed approvals are restored. The `committed`/`aborted` outcome of every governed update is recorded. `pre-receive` refuses pushes when the transaction hook is missing, modified, or not executable. A transaction that carries an agent identity must match a fresh `pre-receive` validation (and a store that has vanished fails it closed); only unidentified ref transactions — local maintenance in the hub — pass through.
+
 Accepting a handoff in the hub model prints `worktree: (none — create manually)`: there is no managed worktree to transfer, so the successor fetches the branch into its own clone and continues from the reported commit.
 
-Checkpoints in the hub model take an explicit `--commit <oid>`. Continuation points are **verified, not trusted**: the commit must exist in the registered repository, and when the claimed branch exists, be reachable from it. A typo'd or fabricated OID is rejected.
+Checkpoints in the hub model take an explicit `--commit <oid>` (any commit spec Git resolves — a full or abbreviated OID or a ref — recorded as the full OID). Continuation points are **verified, not trusted**: the commit must exist in the registered repository, and when the claimed branch exists, be reachable from it. A typo'd or fabricated OID is rejected.
 
 ## Content governance
 
@@ -247,7 +249,7 @@ QUORUMGIT_AGENT=agent-one quorumgit approve request '{"type":"protected_ref_upda
 quorumgit approve vote 17 --agent lead
 
 # 3. The same push now lands. Pushing it again — or replaying the approval — is rejected:
-#    the approval was consumed atomically when the operation was accepted.
+#    the approval was consumed while Git held the ref lock, as the update committed.
 ```
 
 Rules that hold no matter what:
@@ -279,7 +281,7 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 |---|---|
 | `quorumgit init` | Start/provision the store (idempotent) |
 | `quorumgit status` | Store health, contract check, row counts |
-| `quorumgit doctor [--repair]` | Detect and conservatively reconcile recorded managed-worktree drift |
+| `quorumgit doctor [--repair]` | Detect and conservatively reconcile managed-worktree drift and stuck ref updates |
 | `quorumgit destroy --yes` | Delete the database file (managed worktrees under `QUORUMGIT_DATA_DIR/worktrees` are left in place) |
 | `quorumgit repo add <name> <path> [--protected-ref <ref>]… [--protected-path <glob>]…` | Register a repository |
 | `quorumgit agent add <name> [--role worker\|reviewer\|operator]` | Register an agent identity (non-workers need an operator once one exists) |
@@ -291,9 +293,9 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit task done <task> [--note <n>] [--remove-worktree]` | Close a task for good — live claim holder only; releases the claim |
 | `quorumgit claim <task> --branch <b> --scope <glob>… [--no-worktree] [--takeover] [--override-overlap] [--lease-hours <h>]` | Claim a task |
 | `quorumgit renew <claim> [--lease-hours <h>]` | Extend a live, unexpired lease; expired claims must be acquired again |
-| `quorumgit checkpoint <claim> [--commit <oid>] [--note <n>]` | Record verified progress |
+| `quorumgit checkpoint <claim> [--commit <commit>] [--note <n>]` | Record verified progress |
 | `quorumgit release <claim> [--remove-worktree] [--reason <r>]` | Release a claim; the task returns to `open` |
-| `quorumgit handoff create <claim> --completed <c> --remaining <r> [--to <agent>] [--files-changed <f>]… [--blockers <b>]… [--validation <v>] [--last-commit <oid>]` | Hand work off (`--last-commit` only when the claim has no active worktree) |
+| `quorumgit handoff create <claim> --completed <c> --remaining <r> [--to <agent>] [--files-changed <f>]… [--blockers <b>]… [--validation <v>] [--last-commit <commit>]` | Hand work off (from `--last-commit` when given, else the active worktree's HEAD) |
 | `quorumgit handoff accept <id> [--lease-hours <h>]` | Continue handed-off work (addressee, or anyone if unaddressed) |
 | `quorumgit handoff decline <id>` | Decline — addressee only; removes the retained worktree, and is refused if it has uncommitted changes |
 | `quorumgit handoff cancel <id>` | Cancel — creator only; removes the retained worktree, and is refused if it has uncommitted changes |
@@ -302,7 +304,7 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit approve vote <approval-id> [--deny]` | Vote on one approval instance |
 | `quorumgit approve prepare --repo <name> --ref <ref> [--new <rev> \| --delete] [-C <clone>] [--request] [--json]` | Show every approval a push would need, with the hook's exact hashes; `--request` opens them |
 | `quorumgit approve hash <json>` | Compute an operation's hash |
-| `quorumgit hook install --repo <name>` | Install the pre-receive hook (hub model) |
+| `quorumgit hook install --repo <name>` | Install the pre-receive and reference-transaction hooks (hub model) |
 | `quorumgit audit [--entity <e>] [--entity-id <id>] [--limit <n>]` | Read the audit trail |
 
 `repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Commands that act as an agent (`claim`, `renew`, `release`, `task done`, `checkpoint`, `handoff create/accept/decline/cancel`, `approve request/vote`, `approve prepare`, and the operator actions `agent add`, `agent role`, `repo policy`, `repo protect-path`, `repo allow-ref`) also take `--agent <name>`, which overrides `QUORUMGIT_AGENT`. At least one `--scope` is required to claim. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
@@ -314,7 +316,11 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 - `unexpectedly_present` — recorded as removed, but the directory exists again. `--repair` removes it.
 - `repository_mismatch`, `branch_mismatch`, `detached_head`, `unverifiable_checkout` — the checkout at the recorded path no longer matches the recorded repository and branch. These are never repaired automatically; inspect them by hand.
 
-Repairs use ordinary non-forced `git worktree remove`, so dirty worktrees are reported instead of destroyed. `doctor` exits non-zero while any finding remains unresolved.
+Repairs use ordinary non-forced `git worktree remove`, so dirty worktrees are reported instead of destroyed.
+
+`doctor` also reports governed ref updates stuck in `prepared` for more than five minutes — ones whose `committed`/`aborted` hook never recorded an outcome (a killed process, an unreachable store). It reads the outcome from the ref itself: at the update's new value (or gone, for a deletion) means Git committed; still at the old value means Git aborted, and `--repair` restores the approvals consumed for it. A ref that has since moved elsewhere, or is still locked by Git, is reported for manual inspection and never guessed at.
+
+`doctor` exits non-zero while any finding remains unresolved.
 
 ## Configuration
 
@@ -339,7 +345,7 @@ QuorumGit v1 coordinates **cooperating agents**; the adversary is *accident, not
 
 - Agent identity is asserted (`QUORUMGIT_AGENT`), not cryptographically authenticated. Any local process can claim to be any agent.
 - The trust root is write access to the database and the filesystem. An actor with either can bypass governance.
-- The pre-receive hook governs `git push` only. Direct ref manipulation inside a repository bypasses it.
+- The hooks govern `git push` only. Direct ref manipulation inside a repository bypasses them.
 - A claim's scopes are measured against the mainline: the default branch and the protected refs. Content that reached the mainline is not charged to a claim that later merges it, so if the default branch is not protected, a change pushed there directly (subject to protected paths) is never checked against any claim. Protect the default branch.
 - Approval hashes provide exact-payload binding and tamper-evidence, not approver authentication.
 - Roles separate duties between cooperating agents. Because identity is asserted, a process willing to impersonate an operator can still do so; role separation stops an agent from authorizing its own work by accident or by default, not a determined impersonator.
