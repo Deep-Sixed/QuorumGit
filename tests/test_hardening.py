@@ -137,6 +137,42 @@ def test_contract_tolerates_formatting_only_schema_differences(fresh_store):
     store.verify_contract(fresh_store)
 
 
+def test_contract_tolerates_keyword_case_and_operator_spacing(fresh_store):
+    _tamper(
+        fresh_store,
+        "DROP INDEX approvals_one_live_per_operation",
+        "create unique index approvals_one_live_per_operation on approvals"
+        "(operation_hash) where status in ('pending','approved') -- rebuilt",
+    )
+    store.verify_contract(fresh_store)
+
+
+def test_contract_still_rejects_a_changed_literal(fresh_store):
+    _tamper(
+        fresh_store,
+        "DROP INDEX approvals_one_live_per_operation",
+        "CREATE UNIQUE INDEX approvals_one_live_per_operation ON approvals"
+        "(operation_hash) WHERE status IN ('pending', 'APPROVED')",
+    )
+    with pytest.raises(
+        store.ContractViolation, match="altered index approvals_one_live_per_operation"
+    ):
+        store.verify_contract(fresh_store)
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "same"),
+    [
+        ("CHECK (role <> '')", "check(role<>'')", True),
+        ("x IN ('a', 'b')", "x in ('a','b') /* c */", True),
+        ("x = 'Worker'", "x = 'worker'", False),
+        ('CREATE TABLE "T"(a)', 'create table "t"(a)', False),
+    ],
+)
+def test_schema_sql_normalization(a, b, same):
+    assert (store._normalized_sql(a) == store._normalized_sql(b)) is same
+
+
 # ------------------------------------------------------ repository identity
 
 
