@@ -1,7 +1,8 @@
-"""`task done`: the claim holder closes a task for good.
+"""`task done` and `task reopen`.
 
 Completing releases the live claim and moves the task to the terminal `done`
-status in one transaction; nobody can claim a done task afterwards.
+status in one transaction; nobody can claim a done task afterwards. Only an
+operator can reopen one, with an audited reason.
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ from pathlib import Path
 import pytest
 
 from quorumgit import handoff, registry, trees, work
+from quorumgit.registry import RegistryError
+from tests.conftest import OPERATOR, ensure_agent
 from tests.test_cli_hub import _cli
 
 
@@ -157,3 +160,79 @@ def test_cli_done_refuses_dirty_worktree_and_changes_nothing(
     assert done.returncode == 0, done.stderr
     assert "worktree removed" not in done.stdout
     assert (path / "uncommitted.txt").exists()
+
+
+# ------------------------------------------------------------------ reopen
+
+
+def test_operator_reopens_done_task(conn, git_repo):
+    task, a, b, suffix = _setup(conn, git_repo)
+    ensure_agent(conn, OPERATOR, "operator")
+    _claim(conn, task, a, suffix)
+    work.complete_task(conn, task, a)
+
+    work.reopen_task(conn, task, OPERATOR, reason="regression found")
+
+    assert work.get_task(conn, task)["status"] == "open"
+    detail = conn.execute(
+        "SELECT detail FROM audit_events WHERE event_type = 'task.reopened' "
+        "AND entity = 'task' AND entity_id = ?",
+        (task,),
+    ).fetchone()
+    assert detail is not None and '"reason":"regression found"' in detail[0]
+    # Reopened work is claimable again, by anyone.
+    claim, _, _ = work.claim_task(
+        conn, task, b, branch=f"fix/{suffix}", scope_globs=[f"src/{suffix}/**"]
+    )
+    assert work.get_claim(conn, claim)["agent"] == b
+
+
+def test_worker_cannot_reopen(conn, git_repo):
+    task, a, _, suffix = _setup(conn, git_repo)
+    ensure_agent(conn, OPERATOR, "operator")
+    _claim(conn, task, a, suffix)
+    work.complete_task(conn, task, a)
+
+    # Not even the agent that completed it: done is final for workers.
+    with pytest.raises(RegistryError, match="requires an operator"):
+        work.reopen_task(conn, task, a, reason="changed my mind")
+    assert work.get_task(conn, task)["status"] == "done"
+
+
+def test_only_done_tasks_reopen_and_reason_is_required(conn, git_repo):
+    task, a, _, suffix = _setup(conn, git_repo)
+    ensure_agent(conn, OPERATOR, "operator")
+
+    with pytest.raises(work.WorkError, match="is open, not done"):
+        work.reopen_task(conn, task, OPERATOR, reason="why")
+    _claim(conn, task, a, suffix)
+    with pytest.raises(work.WorkError, match="is claimed, not done"):
+        work.reopen_task(conn, task, OPERATOR, reason="why")
+
+    work.complete_task(conn, task, a)
+    with pytest.raises(work.WorkError, match="requires a --reason"):
+        work.reopen_task(conn, task, OPERATOR, reason="   ")
+    assert work.get_task(conn, task)["status"] == "done"
+
+
+def test_cli_reopen(committed_conn, git_repo, cfg):
+    conn = committed_conn
+    task, a, _, suffix = _setup(conn, git_repo)
+    ensure_agent(conn, OPERATOR, "operator")
+    conn.commit()
+    _cli_claim(cfg, task, a, suffix)
+    assert _cli(cfg, "task", "done", str(task), agent=a).returncode == 0
+
+    refused = _cli(cfg, "task", "reopen", str(task), "--reason", "x", agent=a)
+    assert refused.returncode == 1
+    assert "requires an operator" in refused.stderr
+
+    missing_reason = _cli(cfg, "task", "reopen", str(task), agent=OPERATOR)
+    assert missing_reason.returncode == 2
+
+    reopened = _cli(
+        cfg, "task", "reopen", str(task), "--reason", "flaky fix", agent=OPERATOR
+    )
+    assert reopened.returncode == 0, reopened.stderr
+    assert f"task {task} reopened." in reopened.stdout
+    assert work.get_task(conn, task)["status"] == "open"
