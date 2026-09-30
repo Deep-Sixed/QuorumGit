@@ -174,7 +174,10 @@ def test_upgrade_expands_short_protected_ref_names(tmp_path):
     finally:
         conn.close()
 
-    assert store.migrate(local) == ["010_protected_ref_names.sql"]
+    assert store.migrate(local) == [
+        "010_protected_ref_names.sql",
+        "011_quorum_consumer_separation.sql",
+    ]
     upgraded = store.connect(local)
     try:
         refs = sorted(
