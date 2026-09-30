@@ -45,6 +45,7 @@ def _lease_seconds(lease_hours: float) -> int:
 def create_task(
     conn: Connection, repository: str, title: str, objective: str = ""
 ) -> int:
+    begin_immediate(conn)
     repo = get_repository(conn, repository)
     row = conn.execute(
         """
@@ -411,24 +412,32 @@ def paths_within(paths: list[str], scopes: list[str]) -> list[str]:
 
 def verify_commit(
     repo_path: str, commit_oid: str, branch: str | None = None
-) -> None:
-    """Require an existing commit, reachable from the branch when it exists."""
-    exists = (
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo_path),
-                "cat-file",
-                "-e",
-                f"{commit_oid}^{{commit}}",
-            ],
-            capture_output=True,
-            check=False,
-        ).returncode
-        == 0
+) -> str:
+    """Resolve a commit to its full object ID and verify it as a continuation.
+
+    Accepts anything Git resolves to a commit (full or abbreviated OID, a ref)
+    and returns the canonical lowercase full OID. The commit must exist in the
+    registered repository and be reachable from the branch when it exists.
+    """
+    spec = commit_oid.strip()
+    if not spec or spec.startswith("-"):
+        raise WorkError(f"Invalid commit: {commit_oid!r}")
+    resolved = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_path),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{spec}^{{commit}}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    if not exists:
+    oid = resolved.stdout.strip().lower()
+    if resolved.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
         raise WorkError(
             f"Commit {commit_oid} does not exist in the registered repository."
         )
@@ -458,7 +467,7 @@ def verify_commit(
                         str(repo_path),
                         "merge-base",
                         "--is-ancestor",
-                        commit_oid,
+                        oid,
                         f"refs/heads/{branch}",
                     ],
                     capture_output=True,
@@ -471,6 +480,7 @@ def verify_commit(
                     f"Commit {commit_oid} is not reachable from branch "
                     f"{branch!r} in the registered repository."
                 )
+    return oid
 
 
 def classify(
@@ -899,7 +909,9 @@ def add_checkpoint(
             f"Claim {claim_id} belongs to {claim['agent']}, not {agent}."
         )
     task = get_task(conn, claim["task_id"])
-    verify_commit(task["repository_path"], commit_oid, branch=claim["branch"])
+    commit_oid = verify_commit(
+        task["repository_path"], commit_oid, branch=claim["branch"]
+    )
     row = conn.execute(
         """
         INSERT INTO checkpoints (claim_id, commit_oid, note, detail)
@@ -916,4 +928,13 @@ def add_checkpoint(
         agent=agent,
         detail={"commit": commit_oid, "note": note},
     )
+    return row[0]
+
+
+def checkpoint_commit(conn: Connection, checkpoint_id: int) -> str:
+    row = conn.execute(
+        "SELECT commit_oid FROM checkpoints WHERE id = ?", (checkpoint_id,)
+    ).fetchone()
+    if row is None:
+        raise WorkError(f"No such checkpoint: {checkpoint_id}")
     return row[0]
