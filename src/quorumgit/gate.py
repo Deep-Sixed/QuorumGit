@@ -6,8 +6,9 @@ carries (see git_objects), never from what an agent declared it would modify:
 changes outside the pushing claim's scopes and changes to protected paths are
 approval-governed just like protected refs, force pushes, and deletions. Who may authorize is owned by the operation's repository:
 its approval policy names the threshold, the roles whose votes count, and
-whether the requester may vote. An agent that approved an operation may never
-be the one that carries it out. Enforcement is fail-closed: any hook error
+whether the requester may vote. A consumer's own yes vote never contributes
+to the authorization it uses; a surplus vote may be withdrawn atomically at
+consumption when enough other approvals remain. Enforcement is fail-closed: any hook error
 rejects the push.
 """
 
@@ -222,8 +223,15 @@ def required_approvals(conn: Connection, approval: dict, policy: dict) -> int:
 def _authorization_refusal(
     conn: Connection, approval: dict, consumer: dict | None
 ) -> str | None:
-    """Why an approved instance cannot authorize this consumer now, or None."""
+    """Why an approved instance cannot authorize this consumer now, or None.
+
+    A consumer's own yes vote never contributes to the authorization it uses.
+    If enough other eligible yes votes remain, consumption may withdraw that
+    surplus vote atomically; otherwise separation of duties refuses the use.
+    """
     policy = _policy_for(conn, approval)
+    eligible = _eligible_approvals(conn, approval, policy)
+    required = required_approvals(conn, approval, policy)
     if consumer is not None:
         approved_by_consumer = conn.execute(
             "SELECT 1 FROM votes WHERE approval_id = ? AND voter_agent_id = ? "
@@ -231,12 +239,17 @@ def _authorization_refusal(
             (approval["id"], consumer["id"]),
         ).fetchone()
         if approved_by_consumer is not None:
-            return (
-                f"{consumer['name']} approved this operation and may not also "
-                "carry it out."
+            others = _eligible_approvals(
+                conn, approval, policy, exclude_agent_id=consumer["id"]
             )
-    eligible = _eligible_approvals(conn, approval, policy)
-    required = required_approvals(conn, approval, policy)
+            if others < required:
+                return (
+                    f"{consumer['name']} approved this operation; excluding that "
+                    f"vote leaves {others} eligible approval(s), but policy "
+                    f"requires {required}. Another eligible agent must approve "
+                    "before this approver can carry it out."
+                )
+            eligible = others
     if eligible < required:
         basis = " (2/3 + 1 of eligible approvers)" if policy["quorum"] else ""
         return (
@@ -497,6 +510,19 @@ def consume_approval(
     refusal = _authorization_refusal(conn, approval, consumer)
     if refusal is not None:
         raise GateError(f"Approval {approval_id} cannot authorize {agent}: {refusal}")
+    withdrawn = conn.execute(
+        "DELETE FROM votes WHERE approval_id = ? AND voter_agent_id = ? AND vote = 1",
+        (approval["id"], consumer["id"]),
+    )
+    if withdrawn.rowcount:
+        audit.record(
+            conn,
+            "approval.vote_withdrawn_for_execution",
+            "approval",
+            approval["id"],
+            agent=agent,
+            detail={"hash": op_hash},
+        )
     cur = conn.execute(
         "UPDATE approvals SET status = 'consumed', consumed_at = unixepoch(), "
         "consumed_by_agent_id = ? "
@@ -606,7 +632,7 @@ def governed_operations(
     )
     if refname in repo["protected_refs"]:
         operations.append({"type": "protected_ref_update", **base})
-    elif deletion:
+    if deletion:
         operations.append({"type": "ref_delete", **base})
     elif forced:
         operations.append({"type": "force_update", **base})
