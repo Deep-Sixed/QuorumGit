@@ -158,6 +158,33 @@ def ref_tips(git_dir: str | Path) -> list[str]:
     return sorted(tips)
 
 
+def _commit_at(git_dir: str | Path, ref: str) -> str | None:
+    """The commit a ref names (tags peeled), or None if it names none."""
+    _refuse_option(ref)
+    result = subprocess.run(
+        ["git", "--git-dir", str(git_dir), "rev-parse", "--verify", "--quiet",
+         f"{ref}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    oid = result.stdout.strip()
+    return oid if result.returncode == 0 and oid else None
+
+
+def mainline_tips(git_dir: str | Path, protected_refs: list[str]) -> list[str]:
+    """Commits the default branch (HEAD) and the protected refs point at.
+
+    This is the shared baseline a claimed branch is measured against. Other
+    branches are someone's work in progress, and nothing checks the scopes of
+    an unclaimed one, so content taken from them counts against the claim that
+    brings it in. A ref that is missing or names no commit is skipped, which
+    only shrinks the baseline and makes the scope check stricter.
+    """
+    tips = {oid for ref in ("HEAD", *protected_refs) if (oid := _commit_at(git_dir, ref))}
+    return sorted(tips)
+
+
 def new_commits(
     git_dir: str | Path, newrev: str, known_tips: list[str]
 ) -> list[str]:
@@ -185,12 +212,14 @@ def commit_paths(git_dir: str | Path, commit: str) -> list[str]:
 def changed_paths(
     git_dir: str | Path, oldrev: str, newrev: str, known_tips: list[str]
 ) -> list[str]:
-    """Paths this update brings into the repository, sorted and de-duplicated.
+    """Paths the commits reachable from newrev but not from oldrev or
+    known_tips introduce, sorted and de-duplicated.
 
-    Content already reachable from an existing ref was governed when it first
-    arrived, so only commits new to the repository are inspected. Merging
-    another branch in therefore does not re-attribute that branch's changes
-    to the pusher. A deletion carries no content.
+    What counts as already known depends on the check. Protected paths are
+    checked on every push to every ref, so content reachable from any
+    existing ref (ref_tips) was governed when it arrived. Claim scopes are
+    checked only on claimed branches, so they are measured against the
+    mainline alone (mainline_tips). A deletion carries no content.
     """
     if is_zero(newrev):
         return []

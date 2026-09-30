@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -96,6 +97,28 @@ def _repository_dict(conn: Connection, row) -> dict:
     }
 
 
+# Variables Git exports to hooks that select a repository. A lookup of a
+# specific path must not inherit them, or every path resolves to the hook's
+# repository.
+_REPOSITORY_SELECTING_ENV = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_QUARANTINE_PATH",
+)
+
+
+def path_scoped_git_env() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _REPOSITORY_SELECTING_ENV
+    }
+
+
 def git_common_dir(path: str | Path) -> Path:
     """Return the canonical Git common directory for a repository path.
 
@@ -109,6 +132,7 @@ def git_common_dir(path: str | Path) -> Path:
         capture_output=True,
         text=True,
         check=False,
+        env=path_scoped_git_env(),
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
@@ -206,7 +230,7 @@ def add_repository(
     ).fetchone()
     assert row is not None
     repo_id = row[0]
-    for refname in protected_refs or []:
+    for refname in dict.fromkeys(protected_refs or []):
         conn.execute(
             "INSERT INTO protected_refs (repository_id, refname) VALUES (?, ?)",
             (repo_id, refname),
@@ -593,6 +617,8 @@ def add_agent(
     begin_immediate(conn)
     if role != DEFAULT_ROLE:
         require_operator(conn, actor, f"Registering a {role}")
+    if conn.execute("SELECT 1 FROM agents WHERE name = ?", (name,)).fetchone():
+        raise RegistryError(f"Agent is already registered: {name}")
     row = conn.execute(
         "INSERT INTO agents (name, role) VALUES (?, ?) RETURNING id", (name, role)
     ).fetchone()

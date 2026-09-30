@@ -81,28 +81,43 @@ def cmd_destroy(args, cfg) -> int:
 
 
 def cmd_doctor(args, cfg) -> int:
-    """Inspect and optionally reconcile recorded managed-worktree drift."""
+    """Inspect and optionally reconcile worktree drift and stuck ref updates."""
     with store.session(cfg) as conn:
         findings = trees.doctor_worktrees(conn, repair=args.repair)
+        ref_findings = gate.doctor_ref_updates(conn, repair=args.repair)
         if args.repair:
             conn.commit()
-    if not findings:
-        print("worktrees: ok")
-        return 0
     unresolved = False
-    for finding in findings:
-        state = "repaired" if finding.get("repaired") else "detected"
+
+    def state_of(finding: dict) -> str:
+        nonlocal unresolved
         if finding.get("error"):
-            state = f"repair failed: {finding['error']}"
             unresolved = True
-        elif not finding.get("repaired"):
-            unresolved = True
+            prefix = "repair failed" if args.repair else "unresolvable"
+            return f"{prefix}: {finding['error']}"
+        if finding.get("repaired"):
+            return "repaired"
+        unresolved = True
+        return "detected"
+
+    for finding in findings:
         print(
             f"worktree {finding['worktree_id']} claim {finding['claim_id']}: "
-            f"{finding['issue']} — {state} — {finding['path']}"
+            f"{finding['issue']} — {state_of(finding)} — {finding['path']}"
         )
-    if args.repair and not unresolved:
-        print("worktrees: reconciled")
+    for finding in ref_findings:
+        outcome = f" (git {finding['outcome']})" if finding.get("outcome") else ""
+        print(
+            f"ref update {finding['ref_update_id']} {finding['repository']} "
+            f"{finding['refname']}: {finding['issue']}{outcome} — {state_of(finding)}"
+        )
+    if not findings:
+        print("worktrees: ok")
+    if not ref_findings:
+        print("ref updates: ok")
+    if not unresolved:
+        if args.repair and (findings or ref_findings):
+            print("worktrees: reconciled")
         return 0
     if not args.repair:
         print("re-run with `quorumgit doctor --repair` to reconcile safe cases.")
@@ -408,6 +423,7 @@ def cmd_checkpoint(args, cfg) -> int:
             commit = trees.head_commit(wt["path"])
         cp_id = work.add_checkpoint(conn, args.claim_id, agent, commit,
                                     note=args.note)
+        commit = work.checkpoint_commit(conn, cp_id)
         conn.commit()
     print(f"checkpoint {cp_id} at {commit}.")
     return 0
@@ -419,12 +435,16 @@ def cmd_checkpoint(args, cfg) -> int:
 def cmd_handoff_create(args, cfg) -> int:
     agent = _agent(args, cfg)
     with store.session(cfg) as conn:
-        wt = trees.active_worktree_for_claim(conn, args.claim_id)
-        last_commit = trees.head_commit(wt["path"]) if wt else args.last_commit
+        # An explicit --last-commit always wins; otherwise continue from the
+        # managed worktree's HEAD.
+        last_commit = args.last_commit
         if not last_commit:
-            print("Provide --last-commit (no active worktree for this claim).",
-                  file=sys.stderr)
-            return 1
+            wt = trees.active_worktree_for_claim(conn, args.claim_id)
+            if wt is None:
+                print("Provide --last-commit (no active worktree for this claim).",
+                      file=sys.stderr)
+                return 1
+            last_commit = trees.head_commit(wt["path"])
         record = {
             "completed": args.completed,
             "remaining": args.remaining,
@@ -439,6 +459,7 @@ def cmd_handoff_create(args, cfg) -> int:
         handoff_id = handoff.create_handoff(
             conn, args.claim_id, agent, record, to_agent=args.to
         )
+        last_commit = handoff.get_handoff(conn, handoff_id)["record"]["last_commit"]
         conn.commit()
     print(f"handoff {handoff_id} created (last commit {last_commit}).")
     return 0
@@ -493,9 +514,12 @@ def cmd_handoff_cancel(args, cfg) -> int:
 
 
 def _operation_from_args(args) -> dict:
-    operation = json.loads(args.operation)
+    try:
+        operation = json.loads(args.operation)
+    except json.JSONDecodeError as exc:
+        raise gate.GateError(f"Operation is not valid JSON: {exc}") from exc
     if not isinstance(operation, dict):
-        raise SystemExit("Operation must be a JSON object.")
+        raise gate.GateError("Operation must be a JSON object.")
     return operation
 
 
@@ -595,14 +619,45 @@ def cmd_approve_hash(args, cfg) -> int:
 def cmd_hook_install(args, cfg) -> int:
     with store.session(cfg) as conn:
         path = gate.install_hook(conn, args.repo)
+        repo_path = registry.get_repository(conn, args.repo)["path"]
         conn.commit()
     print(f"pre-receive hook installed: {path}")
+    print("reference-transaction hook installed: "
+          f"{gate._effective_hook(repo_path, 'reference-transaction')}")
     return 0
 
 
 def cmd_hook_pre_receive(args, cfg) -> int:
     with store.session(cfg) as conn:
         return gate.run_pre_receive(conn, args.repo, sys.stdin)
+
+
+def cmd_hook_reference_transaction(args, cfg) -> int:
+    if not store.database_path(cfg).exists():
+        # Without a store, only unidentified local ref maintenance may pass.
+        # Every push is identified (pre-receive requires it), so a store that
+        # vanished after pre-receive must not wave its update through.
+        if args.state == "prepared" and cfg.agent:
+            print(
+                "[quorumgit] REJECTED: the store is missing; cannot re-validate "
+                f"this update by {cfg.agent}.",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+    try:
+        conn = store.connect(cfg)
+    except store.StoreError as exc:
+        label = "REJECTED" if args.state == "prepared" else f"WARNING ({args.state})"
+        print(f"[quorumgit] {label}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        with conn:
+            return gate.run_reference_transaction(
+                conn, args.repo, args.state, sys.stdin
+            )
+    finally:
+        conn.close()
 
 
 # -------------------------------------------------------------------- audit
@@ -808,6 +863,10 @@ def build_parser() -> argparse.ArgumentParser:
         lambda sp: sp.add_argument("--repo", required=True), parent=hook)
     add("pre-receive", cmd_hook_pre_receive,
         lambda sp: sp.add_argument("--repo", required=True), parent=hook)
+    add("reference-transaction", cmd_hook_reference_transaction, lambda sp: (
+        sp.add_argument("--repo", required=True),
+        sp.add_argument("state"),
+    ), parent=hook)
 
     add("audit", cmd_audit, lambda sp: (
         sp.add_argument("--entity"),
