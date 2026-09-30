@@ -653,6 +653,32 @@ def _requirement_message(operation: dict, refusal: str | None) -> str:
     return message
 
 
+def update_paths(
+    objects_dir: str | Path,
+    hub_dir: str | Path,
+    repo: dict,
+    oldrev: str,
+    newrev: str,
+    known_tips: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """(paths, scope_paths) for one ref update, from one walk of its commits.
+
+    Objects are read from ``objects_dir`` (the hub inside the hook, the
+    agent's clone for ``approve prepare``); both baselines come from the
+    registered hub: every ref tip for ``paths``, the mainline for
+    ``scope_paths`` (see governed_operations).
+    """
+    if known_tips is None:
+        known_tips = git_objects.ref_tips(hub_dir)
+    paths, scope_paths = git_objects.changed_paths_against(
+        objects_dir,
+        oldrev,
+        newrev,
+        [known_tips, git_objects.mainline_tips(hub_dir, repo["protected_refs"])],
+    )
+    return paths, scope_paths
+
+
 def evaluate_ref_update(
     conn: Connection,
     repository: str,
@@ -696,17 +722,12 @@ def evaluate_ref_update(
             )
 
     try:
-        if paths is None:
-            paths = git_objects.changed_paths(
-                git_dir, oldrev, newrev, git_objects.ref_tips(git_dir)
+        if paths is None or scope_paths is None:
+            derived_paths, derived_scope_paths = update_paths(
+                git_dir, git_dir, repo, oldrev, newrev
             )
-        if scope_paths is None:
-            scope_paths = git_objects.changed_paths(
-                git_dir,
-                oldrev,
-                newrev,
-                git_objects.mainline_tips(git_dir, repo["protected_refs"]),
-            )
+            paths = derived_paths if paths is None else paths
+            scope_paths = derived_scope_paths if scope_paths is None else scope_paths
         operations = governed_operations(
             conn, repo, refname, oldrev, newrev, git_dir, paths, scope_paths
         )
@@ -741,6 +762,8 @@ def check_ref_update(
     oldrev: str,
     newrev: str,
     refname: str,
+    paths: list[str] | None = None,
+    scope_paths: list[str] | None = None,
 ) -> None:
     """pre-receive: validate one ref update and record it for its transaction.
 
@@ -749,7 +772,15 @@ def check_ref_update(
     once Git has locked the ref, in the reference-transaction hook.
     """
     repo, granted, paths, scope_paths = evaluate_ref_update(
-        conn, repository, git_dir, pusher, oldrev, newrev, refname
+        conn,
+        repository,
+        git_dir,
+        pusher,
+        oldrev,
+        newrev,
+        refname,
+        paths=paths,
+        scope_paths=scope_paths,
     )
     operations = [operation for _, operation in granted]
     row = conn.execute(
@@ -844,13 +875,9 @@ def prepare_push(
             "ref you can push to before preparing this push, so the plan "
             "matches what the hook will see."
         )
-    paths = git_objects.changed_paths(local_dir, oldrev, newrev, known)
     # Mainline tips are hub ref tips, so the check above covers them too.
-    scope_paths = git_objects.changed_paths(
-        local_dir,
-        oldrev,
-        newrev,
-        git_objects.mainline_tips(hub_dir, repo["protected_refs"]),
+    paths, scope_paths = update_paths(
+        local_dir, hub_dir, repo, oldrev, newrev, known_tips=known
     )
 
     refusals: list[str] = []
@@ -890,6 +917,31 @@ def prepare_push(
     }
 
 
+def _derive_pushed_paths(
+    conn: Connection,
+    repository: str,
+    git_dir: str,
+    updates: list[tuple[str, str, str]],
+) -> list[tuple[list[str], list[str]]]:
+    """(paths, scope_paths) for every update, read from Git alone.
+
+    This is the expensive part of a push check (it reads every new commit),
+    so it runs before the store's write reservation is taken: other agents'
+    commands and pushes are not held up while a large push is inspected.
+    Commits are immutable, and the paths are recorded with the validation,
+    so the reference transaction re-checks the update against these same
+    paths under the ref locks.
+    """
+    repo = get_repository(conn, repository)
+    derived = []
+    for oldrev, newrev, _refname in updates:
+        try:
+            derived.append(update_paths(git_dir, git_dir, repo, oldrev, newrev))
+        except git_objects.GitObjectError as exc:
+            raise PushRejected(f"Unable to inspect pushed objects: {exc}") from exc
+    return derived
+
+
 def run_pre_receive(
     conn: Connection, repository: str, stdin_lines: Iterable[str]
 ) -> int:
@@ -900,7 +952,6 @@ def run_pre_receive(
         return 1
     pusher = os.environ.get("QUORUMGIT_AGENT") or None
     try:
-        begin_immediate(conn)
         if pusher is None:
             raise PushRejected(
                 "Pusher identity required; set QUORUMGIT_AGENT to a registered agent."
@@ -909,17 +960,25 @@ def run_pre_receive(
             get_agent(conn, pusher)
         except RegistryError as exc:
             raise PushRejected(f"Pusher identity is not registered: {pusher}") from exc
-        saw_update = False
-        for line in stdin_lines:
-            parts = line.split()
-            if not parts:
-                continue
-            if len(parts) != 3:
-                raise PushRejected(f"Malformed pre-receive input: {line!r}")
-            saw_update = True
-            check_ref_update(conn, repository, git_dir, pusher, *parts)
-        if not saw_update:
+        updates = _parse_updates(stdin_lines, hook="pre-receive")
+        if not updates:
             raise PushRejected("No ref updates supplied on stdin.")
+        derived = _derive_pushed_paths(conn, repository, git_dir, updates)
+        begin_immediate(conn)
+        for (oldrev, newrev, refname), (paths, scope_paths) in zip(
+            updates, derived, strict=True
+        ):
+            check_ref_update(
+                conn,
+                repository,
+                git_dir,
+                pusher,
+                oldrev,
+                newrev,
+                refname,
+                paths=paths,
+                scope_paths=scope_paths,
+            )
         # Without the transaction hook nothing would re-validate at update
         # time or consume approvals, so a missing one must reject the push.
         _require_reference_transaction_hook(conn, repository)
@@ -945,14 +1004,16 @@ VALIDATION_TTL_SECONDS = 300
 PREPARED_STUCK_AFTER_SECONDS = VALIDATION_TTL_SECONDS
 
 
-def _parse_updates(stdin_lines: Iterable[str]) -> list[tuple[str, str, str]]:
+def _parse_updates(
+    stdin_lines: Iterable[str], hook: str = "reference-transaction"
+) -> list[tuple[str, str, str]]:
     updates = []
     for line in stdin_lines:
         parts = line.split()
         if not parts:
             continue
         if len(parts) != 3:
-            raise PushRejected(f"Malformed reference-transaction input: {line!r}")
+            raise PushRejected(f"Malformed {hook} input: {line!r}")
         updates.append((parts[0], parts[1], parts[2]))
     return updates
 

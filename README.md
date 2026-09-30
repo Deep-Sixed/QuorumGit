@@ -60,7 +60,7 @@ Then initialize the store once:
 ```bash
 $ quorumgit init
 store: /home/you/.quorumgit/quorumgit.db
-migrations applied: ['001_core.sql', '002_approval_identities.sql', '004_approval_authority.sql', '005_content_governance.sql', '006_ref_updates.sql', '007_ref_update_scope_paths.sql', '008_operation_policies.sql', '009_approval_quorum.sql']
+migrations applied: ['001_core.sql', '002_approval_identities.sql', '004_approval_authority.sql', '005_content_governance.sql', '006_ref_updates.sql', '007_ref_update_scope_paths.sql', '008_operation_policies.sql', '009_approval_quorum.sql', '010_protected_ref_names.sql']
 contract: ok
 ```
 
@@ -277,6 +277,8 @@ Rules that hold no matter what:
 
 Registering a `reviewer` or `operator`, changing a role (`quorumgit agent role <name> <role>`), and changing repository policy are themselves authority decisions, so each requires an operator acting through `--agent` or `QUORUMGIT_AGENT`, and each is audited. The single exception is bootstrap: while no operator exists, the first one can be designated by anyone. The last remaining operator cannot be demoted, so a store never falls back into bootstrap mode by accident.
 
+> **Upgrading to full protected ref names.** Protected refs are matched against the full names Git hands the hooks, so one registered as a short name (`--protected-ref main`) used to protect nothing. Migration `010_protected_ref_names.sql` rewrites short names to the branch they name (`main` becomes `refs/heads/main`); from then on pushes to those branches need their `protected_ref_update` approval, as intended. Check `quorumgit repo policy <repo>` after running `quorumgit init`.
+
 > **Upgrading to per-operation policy.** Migration `008_operation_policies.sql` adds no overrides, so every operation keeps following the repository default until an operator sets one.
 
 > **Upgrading to content governance.** Migration `005_content_governance.sql` restricts every existing repository to `refs/heads/`. If your agents push tags or other refs, allow those namespaces with `quorumgit repo allow-ref` after running `quorumgit init`. Claimed branches now also enforce their scopes at push time, so a claim declared too narrowly will ask for `out_of_scope_push` approvals.
@@ -295,10 +297,11 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit status` | Store health, contract check, row counts |
 | `quorumgit doctor [--repair]` | Detect and conservatively reconcile managed-worktree drift and stuck ref updates |
 | `quorumgit destroy --yes` | Delete the database file (managed worktrees under `QUORUMGIT_DATA_DIR/worktrees` are left in place) |
-| `quorumgit repo add <name> <path> [--protected-ref <ref>]… [--protected-path <glob>]…` | Register a repository |
+| `quorumgit repo add <name> <path> [--protected-ref <ref>]… [--protected-path <glob>]…` | Register a repository (a bare `--protected-ref` name is taken as a branch: `main` is stored as `refs/heads/main`) |
 | `quorumgit agent add <name> [--role worker\|reviewer\|operator]` | Register an agent identity (non-workers need an operator once one exists) |
 | `quorumgit agent role <name> <role>` | Change an agent's role (operator only, after bootstrap) |
 | `quorumgit repo policy <name> [--operation <type> [--inherit]] [--threshold <n>] [--role <role>]… [--[no-]requester-may-vote] [--[no-]quorum]` | Show or change a repository's default approval policy, or its override for one operation type (changes are operator only); also shows protected refs, protected paths, and allowed ref namespaces |
+| `quorumgit repo protect-ref <name> <ref> [--remove]` | Require a `protected_ref_update` approval for every update of a ref, such as `refs/heads/main`; a bare name is taken as a branch (operator only) |
 | `quorumgit repo protect-path <name> <glob> [--remove]` | Require an approval for any push changing matching paths (operator only) |
 | `quorumgit repo allow-ref <name> <prefix> [--remove]` | Allow pushes to a ref namespace such as `refs/tags/` (operator only) |
 | `quorumgit task add --repo <name> --title <t> [--objective <o>]` | Create a task |
@@ -320,7 +323,7 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit hook install --repo <name>` | Install the pre-receive and reference-transaction hooks (hub model) |
 | `quorumgit audit [--entity <e>] [--entity-id <id>] [--limit <n>]` | Read the audit trail |
 
-`repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Commands that act as an agent (`claim`, `renew`, `release`, `task done`, `checkpoint`, `handoff create/accept/decline/cancel`, `approve request/vote`, `approve prepare`, and the operator actions `task reopen`, `agent add`, `agent role`, `repo policy`, `repo protect-path`, `repo allow-ref`) also take `--agent <name>`, which overrides `QUORUMGIT_AGENT`. At least one `--scope` is required to claim. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
+`repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Commands that act as an agent (`claim`, `renew`, `release`, `task done`, `checkpoint`, `handoff create/accept/decline/cancel`, `approve request/vote`, `approve prepare`, and the operator actions `task reopen`, `agent add`, `agent role`, `repo policy`, `repo protect-ref`, `repo protect-path`, `repo allow-ref`) also take `--agent <name>`, which overrides `QUORUMGIT_AGENT`. At least one `--scope` is required to claim. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
 
 `quorumgit doctor` only checks worktree paths already recorded by QuorumGit. It reports:
 

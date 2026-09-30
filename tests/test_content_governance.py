@@ -116,6 +116,113 @@ def test_changed_paths_count_only_content_new_to_the_repository(tmp_path):
     assert git_objects.changed_paths(git_dir, feat, git_objects.ZERO_OID, []) == []
 
 
+def _paths_one_commit_at_a_time(git_dir: Path, commit: str) -> list[str]:
+    """The per-commit derivation paths_by_commit replaces, as an oracle."""
+    out = subprocess.run(
+        ["git", "--git-dir", str(git_dir), "diff-tree", "-r", "-c", "--root",
+         "--no-renames", "--name-only", "--no-commit-id", "-z", commit],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    return [path for path in out.split("\0") if path]
+
+
+def test_batched_paths_match_one_commit_at_a_time(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    root = _edit(repo, "README.md", message="root")
+    _git(repo, "checkout", "-b", "side")
+    _edit(repo, "odd dir/a:b c.txt", message="side")
+    _git(repo, "checkout", "main")
+    _edit(repo, "infra/prod.tf", message="mainline")
+    _git(repo, "merge", "--no-edit", "side")  # clean merge: nothing of its own
+    _git(repo, "checkout", "-b", "evil", "HEAD~1")
+    _edit(repo, "infra/prod.tf", message="conflicting")
+    _git(repo, "checkout", "main")
+    _git(repo, "merge", "--no-edit", "-X", "ours", "evil")
+    _edit(repo, "infra/prod.tf", message="hand-edited merge result")
+    _git(repo, "commit", "--allow-empty", "-m", "empty")
+    # A path spelled exactly like another commit's ID stays a path.
+    _edit(repo, root, message="named after the root commit")
+    git_dir = git_objects.absolute_git_dir(repo)
+    commits = _git(repo, "rev-list", "--all").split()
+
+    batched = git_objects.paths_by_commit(git_dir, commits)
+    assert batched == {
+        commit: _paths_one_commit_at_a_time(git_dir, commit) for commit in commits
+    }
+    assert root in {path for paths in batched.values() for path in paths}
+    assert git_objects.paths_by_commit(git_dir, []) == {}
+
+
+def test_path_derivation_runs_a_fixed_number_of_git_processes(tmp_path, monkeypatch):
+    """A push's cost in Git processes does not grow with its commit count."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    base = head = _edit(repo, "README.md", message="base")
+    for i in range(40):
+        head = _edit(repo, f"src/file{i % 7}.py", message=f"commit {i}")
+    git_dir = git_objects.absolute_git_dir(repo)
+
+    calls = []
+    real_run = subprocess.run
+
+    def counting_run(*args, **kwargs):
+        calls.append(args[0])
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(git_objects.subprocess, "run", counting_run)
+    paths, scope_paths = git_objects.changed_paths_against(
+        git_dir, git_objects.ZERO_OID, head, [[base], []]
+    )
+    assert paths == [f"src/file{i}.py" for i in range(7)]
+    assert scope_paths == ["README.md", *paths]
+    # One commit walk per baseline plus one diff-tree, not one per commit.
+    assert len(calls) == 3
+
+
+def test_pre_receive_reads_pushed_objects_before_reserving_the_store(
+    committed_conn, tmp_path, monkeypatch
+):
+    """Inspecting a push must not hold every other agent's command up."""
+    conn = committed_conn
+    repo_name, hub, clone, agent_a, _ = _setup(conn, tmp_path)
+    _git(clone, "checkout", "-b", "feature")
+    newrev = _edit(clone, "docs/new.md", message="feature")
+    # Put the objects in the hub without a ref (or any hook), as a push's
+    # quarantine would before pre-receive runs.
+    subprocess.run(
+        ["git", "--git-dir", str(hub), "-c", "core.hooksPath=/dev/null",
+         "fetch", "--quiet", str(clone), "feature"],
+        check=True, capture_output=True,
+    )
+
+    reserved_while_reading = []
+    real_update_paths = gate.update_paths
+
+    def watching_update_paths(*args, **kwargs):
+        reserved_while_reading.append(conn.in_transaction)
+        return real_update_paths(*args, **kwargs)
+
+    monkeypatch.setattr(gate, "update_paths", watching_update_paths)
+    monkeypatch.setenv("GIT_DIR", str(hub))
+    monkeypatch.setenv("QUORUMGIT_AGENT", agent_a)
+    zero = git_objects.zero_oid_like(newrev)
+    status = gate.run_pre_receive(
+        conn, repo_name, [f"{zero} {newrev} refs/heads/feature\n"]
+    )
+
+    assert status == 0
+    assert reserved_while_reading == [False]
+    recorded = conn.execute(
+        "SELECT paths FROM ref_updates WHERE refname = 'refs/heads/feature' "
+        "AND newrev = ?",
+        (newrev,),
+    ).fetchone()
+    assert recorded is not None and json.loads(recorded[0]) == ["docs/new.md"]
+
+
 # ------------------------------------------------------------ claimed scopes
 
 
