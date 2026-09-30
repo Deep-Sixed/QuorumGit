@@ -5,7 +5,7 @@ This is the short version of how a coding agent should behave in a repository go
 ## Identity
 
 - Always act as your own registered agent: set `QUORUMGIT_AGENT` (or pass `--agent`) once per session and never change it to another agent's name. Identity is asserted, not authenticated — QuorumGit trusts you to be who you say you are.
-- Never vote on an approval you requested, benefit from, or intend to carry out. The repository's policy refuses most of these; don't go looking for the ones it doesn't.
+- Never vote on an approval you requested, benefit from, or intend to carry out. The repository's policy refuses most of these; under quorum policy a consumer's own yes vote is explicitly excluded from authorizing that consumer, but agents should still keep approval and execution separate when possible.
 
 ## The work loop
 
@@ -24,7 +24,7 @@ This is the short version of how a coding agent should behave in a repository go
 - **Plan before you push.** `quorumgit approve prepare --repo <repo> --ref <branch>` shows the paths your push changes and every approval it needs, with the exact hashes the hook will demand. If it says `approvals required: none`, push.
 - If approvals are needed, first ask whether the push should be different: changes outside your scopes usually mean the work belongs to another task, or your claim should have declared more. Only when the change is right, run `prepare … --request` and wait for an eligible reviewer or operator to vote.
 - Fetch before planning. A plan is bound to the hub's current ref value; if the hub moves, re-plan.
-- Never force-push, delete refs, or push to protected refs as a workaround. Each needs its own approval, and each approval authorizes one exact update once.
+- Never force-push, delete refs, or push to protected refs as a workaround. Each rule needs its own approval, and the rules compose: a force push to a protected ref needs both `protected_ref_update` and `force_update`; deleting a protected ref needs both `protected_ref_update` and `ref_delete`. Each approval authorizes one exact update once.
 - A rejected push is information, not an obstacle: read the reason and act on it. Don't retry the same push hoping for a different answer.
 
 ## Secrets
