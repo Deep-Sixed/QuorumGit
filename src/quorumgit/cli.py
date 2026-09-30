@@ -275,6 +275,14 @@ def cmd_task_done(args, cfg) -> int:
     return 0
 
 
+def cmd_task_reopen(args, cfg) -> int:
+    agent = _agent(args, cfg)
+    with store.session(cfg) as conn:
+        work.reopen_task(conn, args.task_id, agent, reason=args.reason)
+    print(f"task {args.task_id} reopened.")
+    return 0
+
+
 def cmd_claim(args, cfg) -> int:
     agent = _agent(args, cfg)
     with store.session(cfg) as conn:
@@ -733,6 +741,11 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--remove-worktree", action="store_true",
                         help="remove the claim's worktree; refused if it has "
                              "uncommitted changes"),
+    ), parent=task)
+    add("reopen", cmd_task_reopen, lambda sp: (
+        sp.add_argument("task_id", type=int),
+        sp.add_argument("--agent", help="operator reopening the task"),
+        sp.add_argument("--reason", required=True),
     ), parent=task)
 
     add("claim", cmd_claim, lambda sp: (
