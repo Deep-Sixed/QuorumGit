@@ -359,6 +359,82 @@ def test_new_claimed_branch_is_measured_from_the_default_branch(
     assert pushed.returncode == 0, pushed.stderr
 
 
+# -------------------------------------------------------- ref rule composition
+
+
+def test_protected_ref_force_and_delete_keep_specific_policies(conn, tmp_path):
+    repo_path = tmp_path / "ref-composition"
+    repo_path.mkdir()
+    _git(repo_path, "init", "-q", "-b", "main")
+    base = _edit(repo_path, "README.md", message="base")
+
+    _git(repo_path, "checkout", "-q", "-b", "old")
+    oldrev = _edit(repo_path, "old.txt", message="old")
+    _git(repo_path, "checkout", "-q", "-b", "new", base)
+    newrev = _edit(repo_path, "new.txt", message="new")
+
+    repo_name = f"compose-{uuid.uuid4().hex[:8]}"
+    registry.add_repository(conn, repo_name, repo_path, protected_refs=["main"])
+    ensure_agent(conn, OPERATOR, "operator")
+    ensure_agent(conn, "requester")
+    registry.set_approval_policy(
+        conn,
+        repo_name,
+        actor=OPERATOR,
+        operation_type="force_update",
+        threshold=2,
+    )
+    registry.set_approval_policy(
+        conn,
+        repo_name,
+        actor=OPERATOR,
+        operation_type="ref_delete",
+        threshold=3,
+    )
+    registered = registry.get_repository(conn, repo_name)
+    git_dir = git_objects.absolute_git_dir(repo_path)
+
+    forced = gate.governed_operations(
+        conn,
+        registered,
+        "refs/heads/main",
+        oldrev,
+        newrev,
+        git_dir,
+        [],
+        [],
+    )
+    assert [op["type"] for op in forced] == [
+        "protected_ref_update",
+        "force_update",
+    ]
+    protected_approval = gate.request_approval(
+        conn, forced[0], requested_by="requester"
+    )
+    force_approval = gate.request_approval(conn, forced[1], requested_by="requester")
+    assert protected_approval["threshold"] == 1
+    assert force_approval["threshold"] == 2
+
+    deleted = gate.governed_operations(
+        conn,
+        registered,
+        "refs/heads/main",
+        oldrev,
+        git_objects.zero_oid_like(oldrev),
+        git_dir,
+        [],
+        [],
+    )
+    assert [op["type"] for op in deleted] == [
+        "protected_ref_update",
+        "ref_delete",
+    ]
+    delete_approval = gate.request_approval(
+        conn, deleted[1], requested_by="requester"
+    )
+    assert delete_approval["threshold"] == 3
+
+
 # ----------------------------------------------------------- protected paths
 
 
@@ -499,7 +575,8 @@ def test_prepare_reports_refusals_without_writing(committed_conn, tmp_path, cfg)
 
     deletion = gate.prepare_push(conn, repo_name, "main", clone, None)
     assert [e["operation"]["type"] for e in deletion["operations"]] == [
-        "protected_ref_update"
+        "protected_ref_update",
+        "ref_delete",
     ]
     assert deletion["paths"] == []
 
