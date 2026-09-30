@@ -221,6 +221,30 @@ def _protected_hub(committed_conn, tmp_path):
     return repo_name, hub, clone, a, b
 
 
+def test_prederived_paths_can_recompute_missing_field_changes(
+    committed_conn, tmp_path
+):
+    """Replay of a pre-field migration validation must recompute fields."""
+    conn = committed_conn
+    repo_name, hub, _clone, a, _b = _protected_hub(conn, tmp_path)
+    git_dir = git_objects.absolute_git_dir(hub)
+    head = git_objects.ref_value(git_dir, "refs/heads/main")
+
+    result = gate.evaluate_ref_update(
+        conn,
+        repo_name,
+        str(git_dir),
+        a,
+        head,
+        head,
+        "refs/heads/unprotected-replay",
+        paths=[],
+        scope_paths=[],
+        field_changes=None,
+    )
+    assert result[2:] == ([], [], [])
+
+
 def test_hook_governs_only_the_protected_value(committed_conn, tmp_path, cfg):
     conn = committed_conn
     repo_name, _hub, clone, a, _b = _protected_hub(conn, tmp_path)

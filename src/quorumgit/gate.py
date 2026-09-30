@@ -768,8 +768,6 @@ def evaluate_ref_update(
             field_changes = structured.field_changes(
                 git_dir, oldrev, newrev, known, repo["protected_fields"]
             )
-            paths = derived_paths if paths is None else paths
-            scope_paths = derived_scope_paths if scope_paths is None else scope_paths
         operations = governed_operations(
             conn, repo, refname, oldrev, newrev, git_dir, paths, scope_paths,
             field_changes,
@@ -1119,7 +1117,7 @@ def _find_update(
         "approval_ids": json_loads(row[4], []),
         # NULL for an update validated before migration 007: recompute.
         "scope_paths": json_loads(row[5], None),
-        # NULL for an update validated before migration 010: recompute.
+        # NULL for an update validated before migration 012: recompute.
         "field_changes": json_loads(row[6], None),
     }
 
