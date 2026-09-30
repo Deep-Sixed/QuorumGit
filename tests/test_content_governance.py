@@ -499,9 +499,28 @@ def test_prepare_reports_refusals_without_writing(committed_conn, tmp_path, cfg)
 
     deletion = gate.prepare_push(conn, repo_name, "main", clone, None)
     assert [e["operation"]["type"] for e in deletion["operations"]] == [
-        "protected_ref_update"
+        "protected_ref_update",
+        "ref_delete",
     ]
     assert deletion["paths"] == []
+
+
+def test_protected_ref_force_update_needs_both_policies(
+    committed_conn, tmp_path, cfg
+):
+    conn = committed_conn
+    repo_name, _hub, clone, _a, _b = _setup(conn, tmp_path)
+
+    # Build an unrelated commit so replacing protected main is a force update.
+    _git(clone, "checkout", "--orphan", "rewrite")
+    _git(clone, "rm", "-rf", ".")
+    _edit(clone, "replacement.txt", message="replacement")
+
+    plan = gate.prepare_push(conn, repo_name, "main", clone)
+    assert [e["operation"]["type"] for e in plan["operations"]] == [
+        "protected_ref_update",
+        "force_update",
+    ]
 
 
 # ------------------------------------------------- review regressions (#23)

@@ -204,19 +204,31 @@ def required_approvals(conn: Connection, approval: dict, policy: dict) -> int:
     """Eligible yes votes this approval needs under the current policy.
 
     With quorum mode on, the requirement is 2/3 + 1 of the agents eligible to
-    vote on this particular approval — excluding the requester (unless the
-    policy lets it vote) and a takeover's beneficiary — and never less than
-    the policy's fixed threshold. Counting only eligible agents keeps those
-    exclusions from making approval impossible while other approvers exist.
+    vote on this particular approval and never less than the policy's fixed
+    threshold. When the requester is itself eligible to vote, quorum mode
+    leaves one eligible agent outside the required yes-vote set so approving
+    the operation cannot consume every possible requester/executor under the
+    separation-of-duties rule. An explicit fixed threshold may still require
+    unanimity.
+
     The same requirement decides votes and is re-checked at use time, so an
-    approval's status never disagrees with whether it can be used; who may
-    use it is a separate rule (an approver can never carry out its own
-    approval).
+    approval's status never disagrees with whether it can be used; an agent
+    that voted yes still may never carry the approval out.
     """
     if not policy["quorum"]:
         return policy["threshold"]
     eligible = _eligible_approver_count(conn, approval, policy)
-    return max(policy["threshold"], quorum_threshold(eligible))
+    quorum = quorum_threshold(eligible)
+    requester_id = approval.get("requested_by_agent_id")
+    if requester_id is not None and eligible > 1:
+        row = conn.execute(
+            "SELECT id, name, role FROM agents WHERE id = ?", (requester_id,)
+        ).fetchone()
+        if row is not None:
+            requester = {"id": row[0], "name": row[1], "role": row[2]}
+            if _vote_refusal(approval, policy, requester) is None:
+                quorum = min(quorum, eligible - 1)
+    return max(policy["threshold"], quorum)
 
 
 def _authorization_refusal(
@@ -606,7 +618,7 @@ def governed_operations(
     )
     if refname in repo["protected_refs"]:
         operations.append({"type": "protected_ref_update", **base})
-    elif deletion:
+    if deletion:
         operations.append({"type": "ref_delete", **base})
     elif forced:
         operations.append({"type": "force_update", **base})

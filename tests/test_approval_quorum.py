@@ -80,6 +80,27 @@ def test_requester_exclusion_shrinks_the_eligible_set(quorum_store, tmp_path):
     gate.consume_approval(conn, approval["id"], _op(repo), agent="pusher")
 
 
+def test_requester_quorum_leaves_an_executor(quorum_store, tmp_path):
+    """Requester voting cannot make quorum consume every possible executor."""
+    _local, conn = quorum_store
+    _operators(conn, "a", "b", "c")
+    repo = register_repo(conn, tmp_path / "q-requester-executor")
+    registry.set_approval_policy(
+        conn, repo, actor="a", quorum=True, requester_may_vote=True
+    )
+
+    op = _op(repo)
+    approval = gate.request_approval(conn, op, "a")
+    # Raw 2/3 + 1 over three eligible operators is three, but requiring all
+    # three would leave no non-approver able to consume the approval. Quorum
+    # mode therefore leaves one eligible requester/executor outside the
+    # required yes-vote set unless a fixed threshold explicitly says otherwise.
+    assert approval["threshold"] == 2
+    gate.vote(conn, approval["id"], "b", True)
+    assert gate.vote(conn, approval["id"], "c", True)["status"] == "approved"
+    gate.consume_approval(conn, approval["id"], op, agent="a")
+
+
 def test_status_and_usability_use_the_same_requirement(quorum_store, tmp_path):
     """A non-voting operator carrying out the operation does not lower quorum.
 
