@@ -207,3 +207,106 @@ def test_cli_quorum_policy(quorum_store, tmp_path):
 
     off = cli("repo", "policy", repo, "--no-quorum", "--agent", "a")
     assert "approval threshold: 1" in off.stdout
+
+
+def _typed_op(repo: str, op_type: str, n: int = 0) -> dict:
+    return {"type": op_type, "repository": repo, "n": n}
+
+
+def test_override_turns_quorum_on_for_one_operation_type(quorum_store, tmp_path):
+    _local, conn = quorum_store
+    _operators(conn, "a", "b", "c", "d")
+    registry.add_agent(conn, "worker")
+    repo = register_repo(conn, tmp_path / "q-override-on")
+    repo_id = registry.get_repository(conn, repo)["id"]
+    registry.set_approval_policy(
+        conn, repo, actor="a", operation_type="force_update", quorum=True
+    )
+
+    assert registry.approval_policy(conn, repo_id)["quorum"] is False
+    assert registry.approval_policy(conn, repo_id, "force_update")["quorum"] is True
+    forced = gate.request_approval(conn, _typed_op(repo, "force_update"), "worker")
+    assert forced["threshold"] == 3
+    plain = gate.request_approval(
+        conn, _typed_op(repo, "protected_ref_update"), "worker"
+    )
+    assert plain["threshold"] == 1
+
+
+def test_override_turns_quorum_off_and_unset_inherits(quorum_store, tmp_path):
+    _local, conn = quorum_store
+    _operators(conn, "a", "b", "c", "d")
+    registry.add_agent(conn, "worker")
+    repo = register_repo(conn, tmp_path / "q-override-off")
+    repo_id = registry.get_repository(conn, repo)["id"]
+    registry.set_approval_policy(conn, repo, actor="a", quorum=True)
+    registry.set_approval_policy(
+        conn, repo, actor="a", operation_type="out_of_scope_push", quorum=False
+    )
+    # An override that sets only the threshold keeps inheriting quorum mode.
+    registry.set_approval_policy(
+        conn, repo, actor="a", operation_type="ref_delete", threshold=2
+    )
+
+    overrides = registry.operation_policy_overrides(conn, repo_id)
+    assert overrides["out_of_scope_push"]["quorum"] is False
+    assert overrides["ref_delete"]["quorum"] is None
+    unscoped = gate.request_approval(
+        conn, _typed_op(repo, "out_of_scope_push"), "worker"
+    )
+    assert unscoped["threshold"] == 1
+    delete = gate.request_approval(conn, _typed_op(repo, "ref_delete"), "worker")
+    assert delete["threshold"] == 3
+
+    with pytest.raises(registry.RegistryError, match="--quorum"):
+        registry.set_approval_policy(
+            conn, repo, actor="a", operation_type="ref_delete",
+            inherit=True, quorum=True,
+        )
+
+
+def test_stale_quorum_approval_reopens_for_the_missing_votes(quorum_store, tmp_path):
+    """New approvers raise quorum; the next eligible vote reopens and decides it."""
+    _local, conn = quorum_store
+    _operators(conn, "a", "b")
+    registry.add_agent(conn, "worker")
+    repo = register_repo(conn, tmp_path / "q-reopen")
+    registry.set_approval_policy(conn, repo, actor="a", quorum=True)
+
+    op = _op(repo)
+    approval = gate.request_approval(conn, op, "worker")
+    gate.vote(conn, approval["id"], "a", True)
+    assert gate.vote(conn, approval["id"], "b", True)["status"] == "approved"
+
+    # With four operators, 2 of 4 is below 2/3 + 1 (3): the approval is stale.
+    registry.add_agent(conn, "c", role="operator", actor="a")
+    registry.add_agent(conn, "d", role="operator", actor="a")
+    assert gate.vote(conn, approval["id"], "c", True)["status"] == "approved"
+    gate.consume_approval(conn, approval["id"], op, agent="worker")
+
+
+def test_cli_shows_quorum_on_an_override(quorum_store, tmp_path):
+    local, conn = quorum_store
+    _operators(conn, "a", "b", "c")
+    repo = register_repo(conn, tmp_path / "q-cli-override")
+    conn.commit()
+
+    env = {**os.environ, "QUORUMGIT_DATA_DIR": str(local.data_dir)}
+    env.pop("QUORUMGIT_AGENT", None)
+
+    def cli(*args: str) -> subprocess.CompletedProcess:
+        result = subprocess.run(
+            [sys.executable, "-m", "quorumgit", *args],
+            env=env, capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        return result
+
+    shown = cli(
+        "repo", "policy", repo, "--operation", "force_update", "--quorum",
+        "--agent", "a",
+    )
+    assert "force_update (override): threshold 2/3 + 1" in shown.stdout
+    listing = cli("repo", "policy", repo)
+    assert "approval threshold: 1" in listing.stdout
+    assert "  force_update: threshold 2/3 + 1" in listing.stdout
