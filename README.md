@@ -60,7 +60,7 @@ Then initialize the store once:
 ```bash
 $ quorumgit init
 store: /home/you/.quorumgit/quorumgit.db
-migrations applied: ['001_core.sql', '002_approval_identities.sql', '004_approval_authority.sql', '005_content_governance.sql', '006_ref_updates.sql', '007_ref_update_scope_paths.sql', '008_operation_policies.sql', '009_approval_quorum.sql', '010_protected_ref_names.sql', '011_quorum_consumer_separation.sql']
+migrations applied: ['001_core.sql', '002_approval_identities.sql', '004_approval_authority.sql', '005_content_governance.sql', '006_ref_updates.sql', '007_ref_update_scope_paths.sql', '008_operation_policies.sql', '009_approval_quorum.sql', '010_protected_ref_names.sql', '011_quorum_consumer_separation.sql', '012_protected_fields.sql']
 contract: ok
 ```
 
@@ -202,6 +202,15 @@ push → identify pusher → branch reservations → allowed ref namespace
   quorumgit repo protect-path myproject 'migrations/**' --agent lead
   quorumgit repo add other /path/to/other.git --protected-path 'infrastructure/**'
   ```
+- **Protected fields** (structured rules) govern one value inside JSON or TOML files rather than the whole file. A push needs a `protected_field_update` approval only when it changes that value; other edits to the same file are ordinary content. The value is named by a [JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901) (`''` for the whole document), and the format comes from the glob's extension unless `--format` says otherwise:
+
+  ```bash
+  quorumgit repo protect-field myproject config/state.json /max_depth --agent lead
+  quorumgit repo protect-field myproject 'services/*/settings.toml' /limits/replicas --agent lead
+  quorumgit repo protect-field myproject config/state /schema_version --format json --agent lead
+  ```
+
+  Values are compared per new commit, like paths: a commit changes a value when it differs from the value in every parent, so a clean merge changes nothing and a change reverted later in the same push still counts. Values compare by JSON type and content, so `1`, `1.0`, and `true` differ while reordered object keys do not. A value appearing or disappearing is a change, and content that cannot be parsed or read counts as a change (rules fail closed).
 - **Allowed ref namespaces.** Every repository accepts pushes to `refs/heads/` only. Tags, notes, and custom refs are refused until an operator opts in: `quorumgit repo allow-ref myproject refs/tags/ --agent lead` (`--remove` withdraws it). Branch claims, reservations, and scopes apply to `refs/heads/`; protected refs and protected paths apply to every allowed namespace.
 
 One push can need several approvals — a direct push to protected `main` that edits a protected path needs both `protected_ref_update` and `protected_path_update`. Ref-level rules compose too: force-updating a protected ref needs both `protected_ref_update` and `force_update`, while deleting one needs both `protected_ref_update` and `ref_delete`. They are all-or-nothing: the hook lists every missing approval at once, and consumes none unless all are usable.
@@ -263,7 +272,7 @@ Rules that hold no matter what:
 - **Authority is checked when it is used, not only when it is granted.** Consumption re-derives eligible votes from current roles and policy, so raising the threshold or demoting an approver invalidates approvals that no longer meet it. Such an approval is reopened by the next vote on it, so eligible agents can bring it up to the new requirement instead of requesting it again.
 - **The repository owns the policy.** New repositories require one vote from an `operator`, and the requester may not vote. Change it with `quorumgit repo policy <repo> [--threshold <n>] [--role <role>]… [--requester-may-vote | --no-requester-may-vote] [--quorum | --no-quorum]`. `approve request` no longer accepts `--threshold`.
 - **Quorum mode scales the threshold with the approvers.** With `--quorum` (on the default or on one operation type's override), an operation needs **2/3 + 1 of the agents eligible to approve it** — agents holding an approving role, minus the requester (unless the policy lets it vote) and a takeover's beneficiary — and never fewer than `--threshold`. For example, with four operators a worker's request needs 3 of the 4, while an operator's own request is decided by the other three and needs all 3 of them. At consumption time, if the consumer also cast a yes vote, that vote is excluded and quorum is recomputed over the other eligible approvers; the consumer therefore never helps authorize itself. Because eligibility is counted when the approval is used, adding approvers raises the bar for approvals not yet used, just as raising `--threshold` does.
-- **Policy can differ per operation type.** A repository's policy is its default; it may override the threshold, the approving roles, whether the requester may vote, or quorum mode for any of `protected_ref_update`, `force_update`, `ref_delete`, `out_of_scope_push`, `protected_path_update`, and `lease_takeover`. Fields an override leaves unset keep following the default, and `--inherit` removes the override. The effective policy is enforced by the same database triggers, and re-derived at consumption like any other policy change.
+- **Policy can differ per operation type.** A repository's policy is its default; it may override the threshold, the approving roles, whether the requester may vote, or quorum mode for any of `protected_ref_update`, `force_update`, `ref_delete`, `out_of_scope_push`, `protected_path_update`, `protected_field_update`, and `lease_takeover`. Fields an override leaves unset keep following the default, and `--inherit` removes the override. The effective policy is enforced by the same database triggers, and re-derived at consumption like any other policy change.
 
   ```bash
   quorumgit repo policy myproject --operation force_update --threshold 2 --agent lead
@@ -280,6 +289,8 @@ Registering a `reviewer` or `operator`, changing a role (`quorumgit agent role <
 > **Upgrading quorum consumer separation.** Migration `011_quorum_consumer_separation.sql` keeps fixed-threshold separation unchanged and makes quorum consumption exclude a consumer's own yes vote from both the counting votes and the quorum denominator. This prevents a small quorum from becoming impossible to execute while preserving independent authorization.
 >
 > **Upgrading to full protected ref names.** Protected refs are matched against the full names Git hands the hooks, so one registered as a short name (`--protected-ref main`) used to protect nothing. Migration `010_protected_ref_names.sql` rewrites short names to the branch they name (`main` becomes `refs/heads/main`); from then on pushes to those branches need their `protected_ref_update` approval, as intended. Check `quorumgit repo policy <repo>` after running `quorumgit init`.
+>
+> **Upgrading to protected fields.** Migration `012_protected_fields.sql` adds no rules, so nothing changes until an operator adds one with `quorumgit repo protect-field`.
 
 > **Upgrading to per-operation policy.** Migration `008_operation_policies.sql` adds no overrides, so every operation keeps following the repository default until an operator sets one.
 
@@ -305,6 +316,7 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit repo policy <name> [--operation <type> [--inherit]] [--threshold <n>] [--role <role>]… [--[no-]requester-may-vote] [--[no-]quorum]` | Show or change a repository's default approval policy, or its override for one operation type (changes are operator only); also shows protected refs, protected paths, and allowed ref namespaces |
 | `quorumgit repo protect-ref <name> <ref> [--remove]` | Require a `protected_ref_update` approval for every update of a ref, such as `refs/heads/main`; a bare name is taken as a branch (operator only) |
 | `quorumgit repo protect-path <name> <glob> [--remove]` | Require an approval for any push changing matching paths (operator only) |
+| `quorumgit repo protect-field <name> <glob> <pointer> [--format json\|toml] [--remove]` | Require an approval for any push changing one value inside matching JSON/TOML files (operator only) |
 | `quorumgit repo allow-ref <name> <prefix> [--remove]` | Allow pushes to a ref namespace such as `refs/tags/` (operator only) |
 | `quorumgit task add --repo <name> --title <t> [--objective <o>]` | Create a task |
 | `quorumgit task done <task> [--note <n>] [--remove-worktree]` | Close a task — live claim holder only; releases the claim |
@@ -325,7 +337,7 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit hook install --repo <name>` | Install the pre-receive and reference-transaction hooks (hub model) |
 | `quorumgit audit [--entity <e>] [--entity-id <id>] [--limit <n>]` | Read the audit trail |
 
-`repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Commands that act as an agent (`claim`, `renew`, `release`, `task done`, `checkpoint`, `handoff create/accept/decline/cancel`, `approve request/vote`, `approve prepare`, and the operator actions `task reopen`, `agent add`, `agent role`, `repo policy`, `repo protect-ref`, `repo protect-path`, `repo allow-ref`) also take `--agent <name>`, which overrides `QUORUMGIT_AGENT`. At least one `--scope` is required to claim. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
+`repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Commands that act as an agent (`claim`, `renew`, `release`, `task done`, `checkpoint`, `handoff create/accept/decline/cancel`, `approve request/vote`, `approve prepare`, and the operator actions `task reopen`, `agent add`, `agent role`, `repo policy`, `repo protect-ref`, `repo protect-path`, `repo protect-field`, `repo allow-ref`) also take `--agent <name>`, which overrides `QUORUMGIT_AGENT`. At least one `--scope` is required to claim. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.
 
 `quorumgit doctor` only checks worktree paths already recorded by QuorumGit. It reports:
 

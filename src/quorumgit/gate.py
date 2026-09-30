@@ -25,7 +25,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from . import audit, git_objects
+from . import audit, git_objects, structured
 from .canonical import stable_hash
 from .git_objects import is_zero, zero_oid_like
 from .registry import (
@@ -603,6 +603,7 @@ def governed_operations(
     git_dir: str | Path,
     paths: list[str],
     scope_paths: list[str],
+    field_changes: list[dict] | None = None,
 ) -> list[dict]:
     """Every approval one ref update needs, derived from what it carries.
 
@@ -651,6 +652,10 @@ def governed_operations(
     protected = paths_within(paths, repo["protected_paths"])
     if protected:
         operations.append({"type": "protected_path_update", **base, "paths": protected})
+    if field_changes:
+        operations.append(
+            {"type": "protected_field_update", **base, "fields": field_changes}
+        )
     return operations
 
 
@@ -673,6 +678,10 @@ def _requirement_message(operation: dict, refusal: str | None) -> str:
         )
     elif operation.get("paths"):
         message += f" Paths: {_describe_paths(operation['paths'])}."
+    elif operation.get("fields"):
+        message += " Fields: " + _describe_paths(
+            [f"{field['path']}#{field['pointer']}" for field in operation["fields"]]
+        ) + "."
     if refusal:
         message += f" {refusal}"
     return message
@@ -714,14 +723,15 @@ def evaluate_ref_update(
     refname: str,
     paths: list[str] | None = None,
     scope_paths: list[str] | None = None,
-) -> tuple[dict, list[tuple[dict, dict]], list[str], list[str]]:
+    field_changes: list[dict] | None = None,
+) -> tuple[dict, list[tuple[dict, dict]], list[str], list[str], list[dict]]:
     """Apply every push rule to one ref update without changing any state.
 
     Returns (repository, [(approval, operation)] the update needs, paths,
-    scope_paths). Raises PushRejected. Runs in pre-receive and again at the
+    scope_paths, field_changes). Raises PushRejected. Runs in pre-receive and again at the
     reference transaction's `prepared` stage, against the state current while
     Git holds the ref locks. The second run passes both path lists
-    pre-receive derived, so the operations (and their hashes) are the ones
+    pre-receive derived (and the field changes), so the operations (and their hashes) are the ones
     that were approved even when an earlier ref of the same push has since
     made its commits known or moved the mainline.
     """
@@ -753,8 +763,14 @@ def evaluate_ref_update(
             )
             paths = derived_paths if paths is None else paths
             scope_paths = derived_scope_paths if scope_paths is None else scope_paths
+        if field_changes is None:
+            known = git_objects.ref_tips(git_dir)
+            field_changes = structured.field_changes(
+                git_dir, oldrev, newrev, known, repo["protected_fields"]
+            )
         operations = governed_operations(
-            conn, repo, refname, oldrev, newrev, git_dir, paths, scope_paths
+            conn, repo, refname, oldrev, newrev, git_dir, paths, scope_paths,
+            field_changes,
         )
     except git_objects.GitObjectError as exc:
         raise PushRejected(f"Unable to inspect pushed objects: {exc}") from exc
@@ -776,7 +792,7 @@ def evaluate_ref_update(
                 "and request every approval this push needs."
             )
         raise PushRejected(" ".join(missing))
-    return repo, granted, paths, scope_paths
+    return repo, granted, paths, scope_paths, field_changes
 
 
 def check_ref_update(
@@ -789,6 +805,7 @@ def check_ref_update(
     refname: str,
     paths: list[str] | None = None,
     scope_paths: list[str] | None = None,
+    field_changes: list[dict] | None = None,
 ) -> None:
     """pre-receive: validate one ref update and record it for its transaction.
 
@@ -796,7 +813,7 @@ def check_ref_update(
     pre-receive (another hook, a lost ref lock), so approvals are spent only
     once Git has locked the ref, in the reference-transaction hook.
     """
-    repo, granted, paths, scope_paths = evaluate_ref_update(
+    repo, granted, paths, scope_paths, field_changes = evaluate_ref_update(
         conn,
         repository,
         git_dir,
@@ -806,15 +823,16 @@ def check_ref_update(
         refname,
         paths=paths,
         scope_paths=scope_paths,
+        field_changes=field_changes,
     )
     operations = [operation for _, operation in granted]
     row = conn.execute(
         """
         INSERT INTO ref_updates (
             repository_id, refname, oldrev, newrev, pusher_agent_id,
-            paths, scope_paths, operations
+            paths, scope_paths, field_changes, operations
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING id
         """,
         (
@@ -825,6 +843,7 @@ def check_ref_update(
             get_agent(conn, pusher)["id"],
             json_dumps(paths),
             json_dumps(scope_paths),
+            json_dumps(field_changes),
             json_dumps(operations),
         ),
     ).fetchone()
@@ -904,6 +923,9 @@ def prepare_push(
     paths, scope_paths = update_paths(
         local_dir, hub_dir, repo, oldrev, newrev, known_tips=known
     )
+    field_changes = structured.field_changes(
+        local_dir, oldrev, newrev, known, repo["protected_fields"]
+    )
 
     refusals: list[str] = []
     namespace = ref_namespace_refusal(repo, refname)
@@ -926,7 +948,8 @@ def prepare_push(
                     f"(claim {claim['id']}), not {pusher}."
                 )
     operations = governed_operations(
-        conn, repo, refname, oldrev, newrev, local_dir, paths, scope_paths
+        conn, repo, refname, oldrev, newrev, local_dir, paths, scope_paths,
+        field_changes,
     )
     return {
         "repository": repo["name"],
@@ -934,6 +957,7 @@ def prepare_push(
         "oldrev": oldrev,
         "newrev": newrev,
         "paths": paths,
+        "fields": field_changes,
         "claim": claim,
         "refusals": refusals,
         "operations": [
@@ -942,26 +966,31 @@ def prepare_push(
     }
 
 
-def _derive_pushed_paths(
+def _derive_pushed_content(
     conn: Connection,
     repository: str,
     git_dir: str,
     updates: list[tuple[str, str, str]],
-) -> list[tuple[list[str], list[str]]]:
-    """(paths, scope_paths) for every update, read from Git alone.
+) -> list[tuple[list[str], list[str], list[dict]]]:
+    """Paths, scope paths and protected fields for every update.
 
-    This is the expensive part of a push check (it reads every new commit),
-    so it runs before the store's write reservation is taken: other agents'
-    commands and pushes are not held up while a large push is inspected.
-    Commits are immutable, and the paths are recorded with the validation,
-    so the reference transaction re-checks the update against these same
-    paths under the ref locks.
+    Git-object inspection is the expensive part of a push check, so all of it
+    runs before the store's write reservation is taken. Commits are immutable,
+    and the derived content is recorded with the validation for replay under
+    the reference-transaction lock.
     """
     repo = get_repository(conn, repository)
+    known = git_objects.ref_tips(git_dir)
     derived = []
     for oldrev, newrev, _refname in updates:
         try:
-            derived.append(update_paths(git_dir, git_dir, repo, oldrev, newrev))
+            paths, scope_paths = update_paths(
+                git_dir, git_dir, repo, oldrev, newrev, known_tips=known
+            )
+            field_changes = structured.field_changes(
+                git_dir, oldrev, newrev, known, repo["protected_fields"]
+            )
+            derived.append((paths, scope_paths, field_changes))
         except git_objects.GitObjectError as exc:
             raise PushRejected(f"Unable to inspect pushed objects: {exc}") from exc
     return derived
@@ -988,9 +1017,9 @@ def run_pre_receive(
         updates = _parse_updates(stdin_lines, hook="pre-receive")
         if not updates:
             raise PushRejected("No ref updates supplied on stdin.")
-        derived = _derive_pushed_paths(conn, repository, git_dir, updates)
+        derived = _derive_pushed_content(conn, repository, git_dir, updates)
         begin_immediate(conn)
-        for (oldrev, newrev, refname), (paths, scope_paths) in zip(
+        for (oldrev, newrev, refname), (paths, scope_paths, field_changes) in zip(
             updates, derived, strict=True
         ):
             check_ref_update(
@@ -1003,6 +1032,7 @@ def run_pre_receive(
                 refname,
                 paths=paths,
                 scope_paths=scope_paths,
+                field_changes=field_changes,
             )
         # Without the transaction hook nothing would re-validate at update
         # time or consume approvals, so a missing one must reject the push.
@@ -1058,7 +1088,8 @@ def _find_update(
     """
     row = conn.execute(
         """
-        SELECT u.id, u.oldrev, a.name, u.paths, u.approval_ids, u.scope_paths
+        SELECT u.id, u.oldrev, a.name, u.paths, u.approval_ids, u.scope_paths,
+               u.field_changes
         FROM ref_updates u JOIN agents a ON a.id = u.pusher_agent_id
         WHERE u.repository_id = ? AND u.status = ? AND u.refname = ?
           AND u.newrev = ? AND (u.oldrev = ? OR ?)
@@ -1086,6 +1117,8 @@ def _find_update(
         "approval_ids": json_loads(row[4], []),
         # NULL for an update validated before migration 007: recompute.
         "scope_paths": json_loads(row[5], None),
+        # NULL for an update validated before migration 012: recompute.
+        "field_changes": json_loads(row[6], None),
     }
 
 
@@ -1144,7 +1177,7 @@ def _prepare_updates(
                 f"Update of {refname} was validated for {found['pusher']}, "
                 f"not {pusher or 'an unidentified pusher'}."
             )
-        _, granted, _, _ = evaluate_ref_update(
+        _, granted, _, _, _ = evaluate_ref_update(
             conn,
             repository,
             git_dir,
@@ -1154,6 +1187,7 @@ def _prepare_updates(
             refname,
             paths=found["paths"],
             scope_paths=found["scope_paths"],
+            field_changes=found["field_changes"],
         )
         assert pusher is not None
         for approval, operation in granted:

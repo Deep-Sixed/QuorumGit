@@ -228,6 +228,7 @@ def cmd_repo_policy(args, cfg) -> int:
         repo = registry.get_repository(conn, args.name)
     print(f"protected refs: {', '.join(repo['protected_refs']) or '-'}")
     print(f"protected paths: {', '.join(repo['protected_paths']) or '-'}")
+    print(f"protected fields: {_describe_fields(repo['protected_fields'])}")
     print(f"allowed ref namespaces: {', '.join(repo['allowed_ref_namespaces']) or '-'}")
     return 0
 
@@ -257,6 +258,28 @@ def cmd_repo_protect_path(args, cfg) -> int:
         )
         conn.commit()
     print(f"protected paths for {args.name}: {', '.join(globs) or '-'}")
+    return 0
+
+
+def _describe_fields(rules: list[dict]) -> str:
+    return ", ".join(
+        f"{rule['path_glob']}#{rule['pointer']} ({rule['format']})" for rule in rules
+    ) or "-"
+
+
+def cmd_repo_protect_field(args, cfg) -> int:
+    with store.session(cfg) as conn:
+        rules = registry.set_protected_field(
+            conn,
+            args.name,
+            args.glob,
+            args.pointer,
+            actor=getattr(args, "agent", None) or cfg.agent,
+            fmt=args.format,
+            remove=args.remove,
+        )
+        conn.commit()
+    print(f"protected fields for {args.name}: {_describe_fields(rules)}")
     return 0
 
 
@@ -647,6 +670,8 @@ def cmd_approve_prepare(args, cfg) -> int:
         print(f"  {operation['type']} {entry['hash']}")
         for path in operation.get("paths", []):
             print(f"    {path}")
+        for field in operation.get("fields", []):
+            print(f"    {field['path']}#{field['pointer']}")
         if "approval" in entry:
             approval = entry["approval"]
             print(f"    approval {approval['id']} status={approval['status']} "
@@ -786,6 +811,17 @@ def build_parser() -> argparse.ArgumentParser:
     add("protect-path", cmd_repo_protect_path, lambda sp: (
         sp.add_argument("name"),
         sp.add_argument("glob"),
+        sp.add_argument("--remove", action="store_true"),
+        sp.add_argument("--agent", help="operator making the change"),
+    ), parent=repo)
+    add("protect-field", cmd_repo_protect_field, lambda sp: (
+        sp.add_argument("name"),
+        sp.add_argument("glob", help="files the rule applies to, e.g. config/*.json"),
+        sp.add_argument("pointer",
+                        help="JSON Pointer to the protected value, e.g. "
+                             "/limits/max_depth ('' for the whole document)"),
+        sp.add_argument("--format", choices=("json", "toml"),
+                        help="file format (default: from the glob's extension)"),
         sp.add_argument("--remove", action="store_true"),
         sp.add_argument("--agent", help="operator making the change"),
     ), parent=repo)
