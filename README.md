@@ -25,7 +25,7 @@ QuorumGit makes each of these either impossible or explicitly governed, using me
 
 ## The mental model
 
-Eight concepts, in the order you meet them:
+Nine concepts, in the order you meet them:
 
 | Concept | What it is |
 |---|---|
@@ -39,7 +39,7 @@ Eight concepts, in the order you meet them:
 | **Approval policy** | Owned by each repository: how many votes an approval needs, which roles may cast them, and whether the requester may vote — as a default, optionally overridden per operation type (a force push can need more votes than a takeover). The agent asking for permission never chooses its own quorum. |
 | **Content governance** | In the hub model, what a push *actually changes* is derived from the Git objects it carries and checked against the pushing claim's scopes and the repository's protected paths. |
 
-Everything an agent does — claim, renew, checkpoint, hand off, release — writes an audit event in the same database transaction. The audit table is append-only, enforced by a trigger.
+Everything an agent does — claim, renew, checkpoint, hand off, release, complete — writes an audit event in the same database transaction. The audit table is append-only, enforced by a trigger.
 
 ## Installation
 
@@ -66,7 +66,7 @@ contract: ok
 
 `init` creates the state directory, applies migrations, and verifies the runtime contract: required migrations, tables, and governance triggers, foreign keys on, WAL journal mode, and **every schema object the governance rules depend on**. The expected schema is derived by replaying the bundled migrations in memory, so a store whose triggers or unique indexes are missing or altered — or that carries extra indexes or triggers, or was migrated by a newer version — fails the contract instead of silently losing an invariant. Every command runs this check. It is idempotent — re-run it any time.
 
-`quorumgit status` shows the store path, contract state, and row counts. If the store is missing or incomplete, every command exits non-zero: there is **one storage backend and no fallback**, by design.
+`quorumgit status` shows the store's database path (labelled `uri:`), contract state, and row counts; when no store exists it prints `running: false` and exits non-zero. If the store is missing or incomplete, every command exits non-zero: there is **one storage backend and no fallback**, by design.
 
 ## Quick start (five minutes)
 
@@ -277,15 +277,22 @@ Rules that hold no matter what:
 
 Registering a `reviewer` or `operator`, changing a role (`quorumgit agent role <name> <role>`), and changing repository policy are themselves authority decisions, so each requires an operator acting through `--agent` or `QUORUMGIT_AGENT`, and each is audited. The single exception is bootstrap: while no operator exists, the first one can be designated by anyone. The last remaining operator cannot be demoted, so a store never falls back into bootstrap mode by accident.
 
-> **Upgrading to per-operation policy.** Migration `008_operation_policies.sql` adds no overrides, so every operation keeps following the repository default until an operator sets one.
-
-> **Upgrading to content governance.** Migration `005_content_governance.sql` restricts every existing repository to `refs/heads/`. If your agents push tags or other refs, allow those namespaces with `quorumgit repo allow-ref` after running `quorumgit init`. Claimed branches now also enforce their scopes at push time, so a claim declared too narrowly will ask for `out_of_scope_push` approvals.
-
-> **Upgrading.** Migration `004_approval_authority.sql` makes every existing agent a `worker` and gives every existing repository the default policy. Approvals granted under the old rules (including self-approvals) stop authorizing anything until an eligible operator votes on a fresh request. After running `quorumgit init`, designate an operator with `quorumgit agent role <name> operator`.
-
 Takeovers follow the same pattern: claiming a task someone else holds (`claim <task> --takeover`) prints the takeover operation to approve. Its payload includes the incumbent claim ID, so an unused approval cannot displace a later claim by the same agent. The takeover is atomic — the incumbent is released, the replacement claim created, and the approval consumed in one transaction, or none of it happens. A refused takeover leaves the incumbent untouched and the approval unconsumed.
 
 The incumbent's checkout is not duplicated. When a claim supersedes an earlier claim on the same task and branch — an approved takeover, a reclaim after lease expiry, or a re-claim after `release` without `--remove-worktree` — the retained worktree, including any uncommitted work, is verified against its recorded repository and branch and transferred to the new claim (audited as `worktree.continued`). A retained checkout that has drifted to another branch or belongs to a different task is never adopted; the claim is refused with an explanation and rolls back entirely. A recorded checkout whose directory is gone has nothing to continue, so a fresh worktree is created and `quorumgit doctor` reports the stale record.
+
+## Upgrading
+
+Run `quorumgit init` after installing a new version; it applies pending migrations and re-checks the contract. What each migration means for an existing store, in the order they apply:
+
+- **`004_approval_authority.sql`** makes every existing agent a `worker` and gives every existing repository the default policy. Approvals granted under the old rules (including self-approvals) stop authorizing anything until an eligible operator votes on a fresh request. Designate an operator with `quorumgit agent role <name> operator`.
+- **`005_content_governance.sql`** restricts every existing repository to `refs/heads/`. If your agents push tags or other refs, allow those namespaces with `quorumgit repo allow-ref`. Claimed branches now also enforce their scopes at push time, so a claim declared too narrowly will ask for `out_of_scope_push` approvals.
+- **`006_ref_updates.sql`** adds the `reference-transaction` hook. Until you run `quorumgit hook install --repo <name>` again on every hub, **every push to it is rejected** (the rejection says so).
+- `007_ref_update_scope_paths.sql`, `008_operation_policies.sql` (no overrides are created, so every operation keeps following the repository default) and `009_approval_quorum.sql` (quorum mode starts off) need nothing.
+
+Migration numbers skip `003`: that number was used only on development branches that were never merged, so a store built from `main` never has one.
+
+**Moving or reinstalling QuorumGit on a hub.** The installed hooks start QuorumGit through the absolute path of the Python interpreter that ran `hook install`. If that interpreter moves — a Python upgrade, a rebuilt virtualenv, reinstalling the tool — pushes fail, and `hook install` refuses to overwrite hooks that are QuorumGit's but no longer match ("Existing QuorumGit-managed hook differs"). Delete both hook files, then run `quorumgit hook install --repo <name>` again. Inside the hub, `git rev-parse --git-path hooks/pre-receive` and `git rev-parse --git-path hooks/reference-transaction` print where they are (this honors `core.hooksPath`).
 
 ## Command reference
 
@@ -317,7 +324,7 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit approve vote <approval-id> [--deny]` | Vote on one approval instance |
 | `quorumgit approve prepare --repo <name> --ref <ref> [--new <rev> \| --delete] [-C <clone>] [--request] [--json]` | Show every approval a push would need, with the hook's exact hashes; `--request` opens them |
 | `quorumgit approve hash <json>` | Compute an operation's hash |
-| `quorumgit hook install --repo <name>` | Install the pre-receive and reference-transaction hooks (hub model) |
+| `quorumgit hook install --repo <name>` | Install the pre-receive and reference-transaction hooks (hub model); Git calls them as `quorumgit hook pre-receive` and `quorumgit hook reference-transaction`, which you never run by hand |
 | `quorumgit audit [--entity <e>] [--entity-id <id>] [--limit <n>]` | Read the audit trail |
 
 `repo list`, `agent list`, and `task list [--repo <name>]` enumerate what's registered. Commands that act as an agent (`claim`, `renew`, `release`, `task done`, `checkpoint`, `handoff create/accept/decline/cancel`, `approve request/vote`, `approve prepare`, and the operator actions `task reopen`, `agent add`, `agent role`, `repo policy`, `repo protect-path`, `repo allow-ref`) also take `--agent <name>`, which overrides `QUORUMGIT_AGENT`. At least one `--scope` is required to claim. Exit codes: `0` success, `1` refused/violation/error, `2` usage error.

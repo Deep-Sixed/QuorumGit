@@ -14,7 +14,10 @@ This is the short version of how a coding agent should behave in a repository go
 3. **Work only in your checkout.** Local model: the worktree the claim printed. Hub model: your own clone, with the claim made `--no-worktree`.
 4. **Checkpoint** at meaningful, verified points: `quorumgit checkpoint <claim> --note '…'` (hub model: `--commit <oid>` of a pushed commit).
 5. **Renew before the lease runs out** (`quorumgit renew <claim>`). An expired lease cannot be renewed; the task becomes claimable by anyone.
-6. **Finish with a trail.** Hand off with what was done, what remains, blockers, and how it was validated (`quorumgit handoff create …`), or `release` if nobody needs to continue. Never simply stop.
+6. **Finish with a trail.** Never simply stop; end the claim in the way that matches the state of the work:
+   - **Finished:** `quorumgit task done <task> --note '…'` closes the task so nobody picks it up again (add `--remove-worktree` in the local model).
+   - **Someone should continue:** hand off with what was done, what remains, blockers, and how it was validated (`quorumgit handoff create …`).
+   - **Stepping away from unfinished work:** `quorumgit release <claim>` returns the task to `open` for anyone to claim. Don't release finished work — that puts it back in the queue.
 
 ## Pushing (hub model)
 
