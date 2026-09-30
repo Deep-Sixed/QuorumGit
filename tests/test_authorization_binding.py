@@ -42,6 +42,7 @@ UPGRADE_MIGRATIONS = [
     "005_content_governance.sql",
     "006_ref_updates.sql",
     "007_ref_update_scope_paths.sql",
+    "008_operation_policies.sql",
 ]
 
 
@@ -210,7 +211,8 @@ def test_contract_rejects_001_only_store_until_all_migrations_apply(tmp_path):
         "Missing required migrations: "
         "['002_approval_identities.sql', '004_approval_authority.sql', "
         "'005_content_governance.sql', "
-        "'006_ref_updates.sql', '007_ref_update_scope_paths.sql']"
+        "'006_ref_updates.sql', '007_ref_update_scope_paths.sql', "
+        "'008_operation_policies.sql']"
     )
     with pytest.raises(store.ContractViolation, match=re.escape(message)):
         store.verify_contract(cfg)

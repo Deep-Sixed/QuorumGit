@@ -36,7 +36,7 @@ Eight concepts, in the order you meet them:
 | **Worktree** | An isolated `git worktree` created per claim. Agents never share a mutable checkout; Git itself refuses to check one branch out twice. A claim that supersedes an earlier claim on the same task and branch continues its retained checkout instead of creating a second one. |
 | **Handoff** | A structured continuation record (done / remaining / exact commit / blockers) that transfers work to a successor instead of abandoning it. |
 | **Approval** | A sign-off by eligible agents, hash-bound to one exact operation (a specific push, takeover, or deletion), consumed on use. |
-| **Approval policy** | Owned by each repository: how many votes an approval needs, which roles may cast them, and whether the requester may vote. The agent asking for permission never chooses its own quorum. |
+| **Approval policy** | Owned by each repository: how many votes an approval needs, which roles may cast them, and whether the requester may vote — as a default, optionally overridden per operation type (a force push can need more votes than a takeover). The agent asking for permission never chooses its own quorum. |
 | **Content governance** | In the hub model, what a push *actually changes* is derived from the Git objects it carries and checked against the pushing claim's scopes and the repository's protected paths. |
 
 Everything an agent does — claim, renew, checkpoint, hand off, release — writes an audit event in the same database transaction. The audit table is append-only, enforced by a trigger.
@@ -60,7 +60,7 @@ Then initialize the store once:
 ```bash
 $ quorumgit init
 store: /home/you/.quorumgit/quorumgit.db
-migrations applied: ['001_core.sql', '002_approval_identities.sql', '004_approval_authority.sql', '005_content_governance.sql']
+migrations applied: ['001_core.sql', '002_approval_identities.sql', '004_approval_authority.sql', '005_content_governance.sql', '006_ref_updates.sql', '007_ref_update_scope_paths.sql', '008_operation_policies.sql']
 contract: ok
 ```
 
@@ -260,12 +260,23 @@ Rules that hold no matter what:
 - **Votes bind to one approval instance.** A delayed vote for an older denied or consumed instance cannot decide a newer request with the same operation hash. Requesters, voters, consumers, and pushers must name registered agents.
 - **A consumed approval is spent, not blacklisted.** Consumption moves the approval to a terminal `consumed` state (with `consumed_at`) rather than reusing `denied`, and only one *live* (`pending` or `approved`) approval may exist per operation hash. The same operation can therefore be requested and approved again later as a new approval instance — which matters for takeovers, whose payload is stable and legitimately repeatable. What is never possible is one approval authorizing twice.
 - **Nobody authorizes themselves.** Only agents whose role the repository's policy names may vote, in either direction. The requester may not vote unless the policy says so, the agent a takeover would benefit may not vote on it, and an agent that voted to approve an operation can never be the one that carries it out — pushes and takeovers by an approver are rejected, and a database trigger refuses the consumption even for writers that bypass the CLI.
-- **Authority is checked when it is used, not only when it is granted.** Consumption re-derives eligible votes from current roles and policy, so raising the threshold or demoting an approver invalidates approvals that no longer meet it.
+- **Authority is checked when it is used, not only when it is granted.** Consumption re-derives eligible votes from current roles and policy, so raising the threshold or demoting an approver invalidates approvals that no longer meet it. Such an approval is reopened by the next vote on it, so eligible agents can bring it up to the new requirement instead of requesting it again.
 - **The repository owns the policy.** New repositories require one vote from an `operator`, and the requester may not vote. Change it with `quorumgit repo policy <repo> [--threshold <n>] [--role <role>]… [--requester-may-vote | --no-requester-may-vote]`. `approve request` no longer accepts `--threshold`.
+- **Policy can differ per operation type.** A repository's policy is its default; it may override the threshold, the approving roles, or whether the requester may vote for any of `protected_ref_update`, `force_update`, `ref_delete`, `out_of_scope_push`, `protected_path_update`, and `lease_takeover`. Fields an override leaves unset keep following the default, and `--inherit` removes the override. The effective policy is enforced by the same database triggers, and re-derived at consumption like any other policy change.
+
+  ```bash
+  quorumgit repo policy myproject --operation force_update --threshold 2 --agent lead
+  quorumgit repo policy myproject --operation ref_delete --threshold 2 --agent lead
+  quorumgit repo policy myproject --operation out_of_scope_push --role reviewer --role operator --agent lead
+  quorumgit repo policy myproject                                        # default plus every override
+  quorumgit repo policy myproject --operation force_update --inherit --agent lead
+  ```
 
 ### Roles and administration
 
 Registering a `reviewer` or `operator`, changing a role (`quorumgit agent role <name> <role>`), and changing repository policy are themselves authority decisions, so each requires an operator acting through `--agent` or `QUORUMGIT_AGENT`, and each is audited. The single exception is bootstrap: while no operator exists, the first one can be designated by anyone. The last remaining operator cannot be demoted, so a store never falls back into bootstrap mode by accident.
+
+> **Upgrading to per-operation policy.** Migration `008_operation_policies.sql` adds no overrides, so every operation keeps following the repository default until an operator sets one.
 
 > **Upgrading to content governance.** Migration `005_content_governance.sql` restricts every existing repository to `refs/heads/`. If your agents push tags or other refs, allow those namespaces with `quorumgit repo allow-ref` after running `quorumgit init`. Claimed branches now also enforce their scopes at push time, so a claim declared too narrowly will ask for `out_of_scope_push` approvals.
 
@@ -286,7 +297,7 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit repo add <name> <path> [--protected-ref <ref>]… [--protected-path <glob>]…` | Register a repository |
 | `quorumgit agent add <name> [--role worker\|reviewer\|operator]` | Register an agent identity (non-workers need an operator once one exists) |
 | `quorumgit agent role <name> <role>` | Change an agent's role (operator only, after bootstrap) |
-| `quorumgit repo policy <name> [--threshold <n>] [--role <role>]… [--[no-]requester-may-vote]` | Show or change a repository's approval policy (changes are operator only); also shows protected refs, protected paths, and allowed ref namespaces |
+| `quorumgit repo policy <name> [--operation <type> [--inherit]] [--threshold <n>] [--role <role>]… [--[no-]requester-may-vote]` | Show or change a repository's default approval policy, or its override for one operation type (changes are operator only); also shows protected refs, protected paths, and allowed ref namespaces |
 | `quorumgit repo protect-path <name> <glob> [--remove]` | Require an approval for any push changing matching paths (operator only) |
 | `quorumgit repo allow-ref <name> <prefix> [--remove]` | Allow pushes to a ref namespace such as `refs/tags/` (operator only) |
 | `quorumgit task add --repo <name> --title <t> [--objective <o>]` | Create a task |

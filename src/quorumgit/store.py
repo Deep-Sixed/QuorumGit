@@ -55,6 +55,8 @@ REQUIRED_TABLES = (
     "protected_paths",
     "allowed_ref_namespaces",
     "ref_updates",
+    "operation_approval_policies",
+    "operation_approval_roles",
 )
 
 # Engine-level governance rules. A store missing any of these would still
@@ -73,6 +75,11 @@ REQUIRED_TRIGGERS = (
     "approvals_consumer_is_not_approver",
     "repositories_default_ref_namespaces",
 )
+
+
+# Views the governance triggers read from; a store missing one would pass the
+# table and trigger checks yet fail on the next vote.
+REQUIRED_VIEWS = ("approval_effective_policy",)
 
 
 class StoreError(RuntimeError):
@@ -497,6 +504,19 @@ def verify_contract(target: Config | Connection | str | Path) -> None:
             raise ContractViolation(
                 f"Missing required governance triggers: {sorted(missing_triggers)}."
             )
+
+        views = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'view'"
+            ).fetchall()
+        }
+        missing_views = set(REQUIRED_VIEWS) - views
+        if missing_views:
+            raise ContractViolation(
+                f"Missing required governance views: {sorted(missing_views)}."
+            )
+
         _verify_schema_objects(conn)
 
         foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
