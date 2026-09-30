@@ -6,9 +6,8 @@ carries (see git_objects), never from what an agent declared it would modify:
 changes outside the pushing claim's scopes and changes to protected paths are
 approval-governed just like protected refs, force pushes, and deletions. Who may authorize is owned by the operation's repository:
 its approval policy names the threshold, the roles whose votes count, and
-whether the requester may vote. A consumer's own yes vote never contributes
-to the authorization it uses; a surplus vote may be withdrawn atomically at
-consumption when enough other approvals remain. Enforcement is fail-closed: any hook error
+whether the requester may vote. An agent that approved an operation may never
+be the one that carries it out. Enforcement is fail-closed: any hook error
 rejects the push.
 """
 
@@ -205,33 +204,38 @@ def required_approvals(conn: Connection, approval: dict, policy: dict) -> int:
     """Eligible yes votes this approval needs under the current policy.
 
     With quorum mode on, the requirement is 2/3 + 1 of the agents eligible to
-    vote on this particular approval — excluding the requester (unless the
-    policy lets it vote) and a takeover's beneficiary — and never less than
-    the policy's fixed threshold. Counting only eligible agents keeps those
-    exclusions from making approval impossible while other approvers exist.
+    vote on this particular approval and never less than the policy's fixed
+    threshold. When the requester is itself eligible to vote, quorum mode
+    leaves one eligible agent outside the required yes-vote set so approving
+    the operation cannot consume every possible requester/executor under the
+    separation-of-duties rule. An explicit fixed threshold may still require
+    unanimity.
+
     The same requirement decides votes and is re-checked at use time, so an
-    approval's status never disagrees with whether it can be used; who may
-    use it is a separate rule (an approver can never carry out its own
-    approval).
+    approval's status never disagrees with whether it can be used; an agent
+    that voted yes still may never carry the approval out.
     """
     if not policy["quorum"]:
         return policy["threshold"]
     eligible = _eligible_approver_count(conn, approval, policy)
-    return max(policy["threshold"], quorum_threshold(eligible))
+    quorum = quorum_threshold(eligible)
+    requester_id = approval.get("requested_by_agent_id")
+    if requester_id is not None and eligible > 1:
+        row = conn.execute(
+            "SELECT id, name, role FROM agents WHERE id = ?", (requester_id,)
+        ).fetchone()
+        if row is not None:
+            requester = {"id": row[0], "name": row[1], "role": row[2]}
+            if _vote_refusal(approval, policy, requester) is None:
+                quorum = min(quorum, eligible - 1)
+    return max(policy["threshold"], quorum)
 
 
 def _authorization_refusal(
     conn: Connection, approval: dict, consumer: dict | None
 ) -> str | None:
-    """Why an approved instance cannot authorize this consumer now, or None.
-
-    A consumer's own yes vote never contributes to the authorization it uses.
-    If enough other eligible yes votes remain, consumption may withdraw that
-    surplus vote atomically; otherwise separation of duties refuses the use.
-    """
+    """Why an approved instance cannot authorize this consumer now, or None."""
     policy = _policy_for(conn, approval)
-    eligible = _eligible_approvals(conn, approval, policy)
-    required = required_approvals(conn, approval, policy)
     if consumer is not None:
         approved_by_consumer = conn.execute(
             "SELECT 1 FROM votes WHERE approval_id = ? AND voter_agent_id = ? "
@@ -239,17 +243,12 @@ def _authorization_refusal(
             (approval["id"], consumer["id"]),
         ).fetchone()
         if approved_by_consumer is not None:
-            others = _eligible_approvals(
-                conn, approval, policy, exclude_agent_id=consumer["id"]
+            return (
+                f"{consumer['name']} approved this operation and may not also "
+                "carry it out."
             )
-            if others < required:
-                return (
-                    f"{consumer['name']} approved this operation; excluding that "
-                    f"vote leaves {others} eligible approval(s), but policy "
-                    f"requires {required}. Another eligible agent must approve "
-                    "before this approver can carry it out."
-                )
-            eligible = others
+    eligible = _eligible_approvals(conn, approval, policy)
+    required = required_approvals(conn, approval, policy)
     if eligible < required:
         basis = " (2/3 + 1 of eligible approvers)" if policy["quorum"] else ""
         return (
@@ -510,19 +509,6 @@ def consume_approval(
     refusal = _authorization_refusal(conn, approval, consumer)
     if refusal is not None:
         raise GateError(f"Approval {approval_id} cannot authorize {agent}: {refusal}")
-    withdrawn = conn.execute(
-        "DELETE FROM votes WHERE approval_id = ? AND voter_agent_id = ? AND vote = 1",
-        (approval["id"], consumer["id"]),
-    )
-    if withdrawn.rowcount:
-        audit.record(
-            conn,
-            "approval.vote_withdrawn_for_execution",
-            "approval",
-            approval["id"],
-            agent=agent,
-            detail={"hash": op_hash},
-        )
     cur = conn.execute(
         "UPDATE approvals SET status = 'consumed', consumed_at = unixepoch(), "
         "consumed_by_agent_id = ? "
