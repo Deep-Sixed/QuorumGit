@@ -74,6 +74,8 @@ REQUIRED_TRIGGERS = (
     "vote_updates_require_eligible_voter",
     "approvals_consumer_is_not_approver",
     "repositories_default_ref_namespaces",
+    "protected_refs_require_full_name",
+    "protected_ref_updates_require_full_name",
 )
 
 

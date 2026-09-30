@@ -366,6 +366,7 @@ def test_upgrade_leaves_no_agent_with_authority(tmp_path):
         "007_ref_update_scope_paths.sql",
         "008_operation_policies.sql",
         "009_approval_quorum.sql",
+        "010_protected_ref_names.sql",
     ]
     upgraded = store.connect(local)
     try:

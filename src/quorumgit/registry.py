@@ -230,7 +230,9 @@ def add_repository(
     ).fetchone()
     assert row is not None
     repo_id = row[0]
-    for refname in dict.fromkeys(protected_refs or []):
+    for refname in dict.fromkeys(
+        normalize_protected_ref(ref) for ref in protected_refs or []
+    ):
         conn.execute(
             "INSERT INTO protected_refs (repository_id, refname) VALUES (?, ?)",
             (repo_id, refname),
@@ -529,6 +531,67 @@ def _set_operation_override(
                 "INSERT INTO operation_approval_roles (policy_id, role) VALUES (?, ?)",
                 (policy_id, role),
             )
+
+
+def normalize_protected_ref(ref: str) -> str:
+    """The full ref name a protected ref is stored and matched as.
+
+    Git hands the hooks full names (``refs/heads/main``), and a protected ref
+    is matched against them exactly, so a short branch name stored as typed
+    would protect nothing. A name outside ``refs/`` is therefore taken as a
+    branch; anything Git would not accept as a ref name is refused.
+    """
+    name = ref.strip()
+    full = name if name.startswith("refs/") else f"refs/heads/{name}"
+    if not name or name.startswith("-") or name == "HEAD":
+        raise RegistryError(f"Invalid protected ref: {ref!r}")
+    result = subprocess.run(
+        ["git", "check-ref-format", full],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=path_scoped_git_env(),
+    )
+    if result.returncode != 0:
+        raise RegistryError(f"Invalid protected ref: {ref!r} is not a valid ref name.")
+    return full
+
+
+def set_protected_ref(
+    conn: Connection,
+    repository: str,
+    ref: str,
+    *,
+    actor: str | None,
+    remove: bool = False,
+) -> list[str]:
+    """Add or remove a ref whose every update needs an approval."""
+    begin_immediate(conn)
+    repo = get_repository(conn, repository)
+    require_operator(conn, actor, "Changing protected refs")
+    refname = normalize_protected_ref(ref)
+    if remove:
+        cur = conn.execute(
+            "DELETE FROM protected_refs WHERE repository_id = ? AND refname = ?",
+            (repo["id"], refname),
+        )
+    else:
+        cur = conn.execute(
+            "INSERT INTO protected_refs (repository_id, refname) VALUES (?, ?) "
+            "ON CONFLICT DO NOTHING",
+            (repo["id"], refname),
+        )
+    if cur.rowcount:
+        audit.record(
+            conn,
+            "repository.protected_ref_removed" if remove
+            else "repository.protected_ref_added",
+            "repository",
+            repo["id"],
+            agent=actor,
+            detail={"refname": refname},
+        )
+    return _protected_refs(conn, repo["id"])
 
 
 def _validate_path_glob(glob: str) -> str:
