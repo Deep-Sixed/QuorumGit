@@ -60,7 +60,7 @@ Then initialize the store once:
 ```bash
 $ quorumgit init
 store: /home/you/.quorumgit/quorumgit.db
-migrations applied: ['001_core.sql', '002_approval_identities.sql', '004_approval_authority.sql', '005_content_governance.sql', '006_ref_updates.sql', '007_ref_update_scope_paths.sql', '008_operation_policies.sql', '009_approval_quorum.sql', '010_protected_fields.sql']
+migrations applied: ['001_core.sql', '002_approval_identities.sql', '004_approval_authority.sql', '005_content_governance.sql', '006_ref_updates.sql', '007_ref_update_scope_paths.sql', '008_operation_policies.sql', '009_approval_quorum.sql', '012_protected_fields.sql']
 contract: ok
 ```
 
@@ -286,7 +286,7 @@ Rules that hold no matter what:
 
 Registering a `reviewer` or `operator`, changing a role (`quorumgit agent role <name> <role>`), and changing repository policy are themselves authority decisions, so each requires an operator acting through `--agent` or `QUORUMGIT_AGENT`, and each is audited. The single exception is bootstrap: while no operator exists, the first one can be designated by anyone. The last remaining operator cannot be demoted, so a store never falls back into bootstrap mode by accident.
 
-> **Upgrading to protected fields.** Migration `010_protected_fields.sql` adds no rules, so nothing changes until an operator adds one with `quorumgit repo protect-field`.
+> **Upgrading to protected fields.** Migration `012_protected_fields.sql` adds no rules, so nothing changes until an operator adds one with `quorumgit repo protect-field`.
 
 > **Upgrading to per-operation policy.** Migration `008_operation_policies.sql` adds no overrides, so every operation keeps following the repository default until an operator sets one.
 
