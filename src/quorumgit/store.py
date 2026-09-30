@@ -75,12 +75,14 @@ REQUIRED_TRIGGERS = (
     "vote_updates_require_eligible_voter",
     "approvals_consumer_is_not_approver",
     "repositories_default_ref_namespaces",
+    "protected_refs_require_full_name",
+    "protected_ref_updates_require_full_name",
 )
 
 
 # Views the governance triggers read from; a store missing one would pass the
 # table and trigger checks yet fail on the next vote.
-REQUIRED_VIEWS = ("approval_effective_policy",)
+REQUIRED_VIEWS = ("approval_effective_policy", "approval_eligible_agents")
 
 
 class StoreError(RuntimeError):

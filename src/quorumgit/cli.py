@@ -233,6 +233,20 @@ def cmd_repo_policy(args, cfg) -> int:
     return 0
 
 
+def cmd_repo_protect_ref(args, cfg) -> int:
+    with store.session(cfg) as conn:
+        refs = registry.set_protected_ref(
+            conn,
+            args.name,
+            args.ref,
+            actor=getattr(args, "agent", None) or cfg.agent,
+            remove=args.remove,
+        )
+        conn.commit()
+    print(f"protected refs for {args.name}: {', '.join(refs) or '-'}")
+    return 0
+
+
 def cmd_repo_protect_path(args, cfg) -> int:
     with store.session(cfg) as conn:
         globs = registry.set_protected_path(
@@ -758,7 +772,9 @@ def build_parser() -> argparse.ArgumentParser:
     add("add", cmd_repo_add, lambda sp: (
         sp.add_argument("name"),
         sp.add_argument("path"),
-        sp.add_argument("--protected-ref", action="append", default=[]),
+        sp.add_argument("--protected-ref", action="append", default=[],
+                        help="ref needing approval for every update, such as "
+                             "refs/heads/main (a bare name is taken as a branch)"),
         sp.add_argument("--protected-path", action="append", default=[],
                         help="path glob whose changes always need an approval"),
     ), parent=repo)
@@ -784,6 +800,13 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--inherit", action="store_true",
                         help="with --operation: remove the override so the "
                              "type inherits the default again"),
+    ), parent=repo)
+    add("protect-ref", cmd_repo_protect_ref, lambda sp: (
+        sp.add_argument("name"),
+        sp.add_argument("ref", help="ref such as refs/heads/main (a bare name "
+                                    "is taken as a branch)"),
+        sp.add_argument("--remove", action="store_true"),
+        sp.add_argument("--agent", help="operator making the change"),
     ), parent=repo)
     add("protect-path", cmd_repo_protect_path, lambda sp: (
         sp.add_argument("name"),

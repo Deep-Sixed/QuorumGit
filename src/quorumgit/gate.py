@@ -6,8 +6,9 @@ carries (see git_objects), never from what an agent declared it would modify:
 changes outside the pushing claim's scopes and changes to protected paths are
 approval-governed just like protected refs, force pushes, and deletions. Who may authorize is owned by the operation's repository:
 its approval policy names the threshold, the roles whose votes count, and
-whether the requester may vote. An agent that approved an operation may never
-be the one that carries it out. Enforcement is fail-closed: any hook error
+whether the requester may vote. A consumer's own vote never counts toward
+authorizing that consumer; fixed-threshold policies still require a separate
+approver. Enforcement is fail-closed: any hook error
 rejects the push.
 """
 
@@ -189,33 +190,43 @@ def quorum_threshold(eligible_approvers: int) -> int:
     return (2 * eligible_approvers) // 3 + 1
 
 
-def _eligible_approver_count(conn: Connection, approval: dict, policy: dict) -> int:
+def _eligible_approver_count(
+    conn: Connection,
+    approval: dict,
+    policy: dict,
+    exclude_agent_id: int | None = None,
+) -> int:
     """Registered agents who could cast a counting vote on this approval."""
     rows = conn.execute("SELECT id, name, role FROM agents").fetchall()
     return sum(
         1
         for agent_id, name, role in rows
-        if _vote_refusal(approval, policy, {"id": agent_id, "name": name, "role": role})
+        if agent_id != exclude_agent_id
+        and _vote_refusal(approval, policy, {"id": agent_id, "name": name, "role": role})
         is None
     )
 
 
-def required_approvals(conn: Connection, approval: dict, policy: dict) -> int:
+def required_approvals(
+    conn: Connection,
+    approval: dict,
+    policy: dict,
+    exclude_agent_id: int | None = None,
+) -> int:
     """Eligible yes votes this approval needs under the current policy.
 
     With quorum mode on, the requirement is 2/3 + 1 of the agents eligible to
     vote on this particular approval — excluding the requester (unless the
     policy lets it vote) and a takeover's beneficiary — and never less than
-    the policy's fixed threshold. Counting only eligible agents keeps those
-    exclusions from making approval impossible while other approvers exist.
-    The same requirement decides votes and is re-checked at use time, so an
-    approval's status never disagrees with whether it can be used; who may
-    use it is a separate rule (an approver can never carry out its own
-    approval).
+    the policy's fixed threshold. During consumption, a quorum approver who is
+    also the consumer is excluded from both the yes-vote count and the quorum
+    denominator, so its own vote never authorizes its own action.
     """
     if not policy["quorum"]:
         return policy["threshold"]
-    eligible = _eligible_approver_count(conn, approval, policy)
+    eligible = _eligible_approver_count(
+        conn, approval, policy, exclude_agent_id=exclude_agent_id
+    )
     return max(policy["threshold"], quorum_threshold(eligible))
 
 
@@ -224,24 +235,36 @@ def _authorization_refusal(
 ) -> str | None:
     """Why an approved instance cannot authorize this consumer now, or None."""
     policy = _policy_for(conn, approval)
+    consumer_voted = False
     if consumer is not None:
-        approved_by_consumer = conn.execute(
+        consumer_voted = conn.execute(
             "SELECT 1 FROM votes WHERE approval_id = ? AND voter_agent_id = ? "
             "AND vote = 1",
             (approval["id"], consumer["id"]),
-        ).fetchone()
-        if approved_by_consumer is not None:
+        ).fetchone() is not None
+        if consumer_voted and not policy["quorum"]:
             return (
                 f"{consumer['name']} approved this operation and may not also "
-                "carry it out."
+                "carry it out under a fixed-threshold policy."
             )
-    eligible = _eligible_approvals(conn, approval, policy)
-    required = required_approvals(conn, approval, policy)
+
+    excluded = consumer["id"] if consumer is not None and consumer_voted else None
+    eligible = _eligible_approvals(
+        conn, approval, policy, exclude_agent_id=excluded
+    )
+    required = required_approvals(
+        conn, approval, policy, exclude_agent_id=excluded
+    )
     if eligible < required:
         basis = " (2/3 + 1 of eligible approvers)" if policy["quorum"] else ""
+        own_vote = (
+            f" {consumer['name']}'s own yes vote is excluded from its authorization."
+            if consumer is not None and consumer_voted
+            else ""
+        )
         return (
             f"Approval {approval['id']} has {eligible} eligible approval(s); the "
-            f"repository policy now requires {required}{basis}. Eligible "
+            f"repository policy now requires {required}{basis}.{own_vote} Eligible "
             f"agents can vote on approval {approval['id']} to reach it."
         )
     return None
@@ -437,8 +460,10 @@ def approved_instance(
 ) -> dict | None:
     """The approved instance for this exact operation, if it can be used now.
 
-    With a consumer, the instance must also be usable by that agent: an agent
-    that approved an operation cannot be the one that carries it out.
+    With a consumer, the instance must also be usable by that agent. Under
+    quorum policy, a consumer's own yes vote is excluded from both the vote
+    count and quorum denominator; fixed-threshold policy still forbids an
+    approver from carrying out the operation.
     """
     try:
         approval = get_approval(conn, operation_hash(operation))
@@ -607,7 +632,7 @@ def governed_operations(
     )
     if refname in repo["protected_refs"]:
         operations.append({"type": "protected_ref_update", **base})
-    elif deletion:
+    if deletion:
         operations.append({"type": "ref_delete", **base})
     elif forced:
         operations.append({"type": "force_update", **base})
@@ -662,6 +687,32 @@ def _requirement_message(operation: dict, refusal: str | None) -> str:
     return message
 
 
+def update_paths(
+    objects_dir: str | Path,
+    hub_dir: str | Path,
+    repo: dict,
+    oldrev: str,
+    newrev: str,
+    known_tips: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """(paths, scope_paths) for one ref update, from one walk of its commits.
+
+    Objects are read from ``objects_dir`` (the hub inside the hook, the
+    agent's clone for ``approve prepare``); both baselines come from the
+    registered hub: every ref tip for ``paths``, the mainline for
+    ``scope_paths`` (see governed_operations).
+    """
+    if known_tips is None:
+        known_tips = git_objects.ref_tips(hub_dir)
+    paths, scope_paths = git_objects.changed_paths_against(
+        objects_dir,
+        oldrev,
+        newrev,
+        [known_tips, git_objects.mainline_tips(hub_dir, repo["protected_refs"])],
+    )
+    return paths, scope_paths
+
+
 def evaluate_ref_update(
     conn: Connection,
     repository: str,
@@ -706,21 +757,19 @@ def evaluate_ref_update(
             )
 
     try:
-        if paths is None or field_changes is None:
-            known = git_objects.ref_tips(git_dir)
-            if paths is None:
-                paths = git_objects.changed_paths(git_dir, oldrev, newrev, known)
-            if field_changes is None:
-                field_changes = structured.field_changes(
-                    git_dir, oldrev, newrev, known, repo["protected_fields"]
-                )
-        if scope_paths is None:
-            scope_paths = git_objects.changed_paths(
-                git_dir,
-                oldrev,
-                newrev,
-                git_objects.mainline_tips(git_dir, repo["protected_refs"]),
+        if paths is None or scope_paths is None:
+            derived_paths, derived_scope_paths = update_paths(
+                git_dir, git_dir, repo, oldrev, newrev
             )
+            paths = derived_paths if paths is None else paths
+            scope_paths = derived_scope_paths if scope_paths is None else scope_paths
+        if field_changes is None:
+            known = git_objects.ref_tips(git_dir)
+            field_changes = structured.field_changes(
+                git_dir, oldrev, newrev, known, repo["protected_fields"]
+            )
+            paths = derived_paths if paths is None else paths
+            scope_paths = derived_scope_paths if scope_paths is None else scope_paths
         operations = governed_operations(
             conn, repo, refname, oldrev, newrev, git_dir, paths, scope_paths,
             field_changes,
@@ -756,6 +805,9 @@ def check_ref_update(
     oldrev: str,
     newrev: str,
     refname: str,
+    paths: list[str] | None = None,
+    scope_paths: list[str] | None = None,
+    field_changes: list[dict] | None = None,
 ) -> None:
     """pre-receive: validate one ref update and record it for its transaction.
 
@@ -764,7 +816,16 @@ def check_ref_update(
     once Git has locked the ref, in the reference-transaction hook.
     """
     repo, granted, paths, scope_paths, field_changes = evaluate_ref_update(
-        conn, repository, git_dir, pusher, oldrev, newrev, refname
+        conn,
+        repository,
+        git_dir,
+        pusher,
+        oldrev,
+        newrev,
+        refname,
+        paths=paths,
+        scope_paths=scope_paths,
+        field_changes=field_changes,
     )
     operations = [operation for _, operation in granted]
     row = conn.execute(
@@ -860,16 +921,12 @@ def prepare_push(
             "ref you can push to before preparing this push, so the plan "
             "matches what the hook will see."
         )
-    paths = git_objects.changed_paths(local_dir, oldrev, newrev, known)
+    # Mainline tips are hub ref tips, so the check above covers them too.
+    paths, scope_paths = update_paths(
+        local_dir, hub_dir, repo, oldrev, newrev, known_tips=known
+    )
     field_changes = structured.field_changes(
         local_dir, oldrev, newrev, known, repo["protected_fields"]
-    )
-    # Mainline tips are hub ref tips, so the check above covers them too.
-    scope_paths = git_objects.changed_paths(
-        local_dir,
-        oldrev,
-        newrev,
-        git_objects.mainline_tips(hub_dir, repo["protected_refs"]),
     )
 
     refusals: list[str] = []
@@ -911,6 +968,36 @@ def prepare_push(
     }
 
 
+def _derive_pushed_content(
+    conn: Connection,
+    repository: str,
+    git_dir: str,
+    updates: list[tuple[str, str, str]],
+) -> list[tuple[list[str], list[str], list[dict]]]:
+    """Paths, scope paths and protected fields for every update.
+
+    Git-object inspection is the expensive part of a push check, so all of it
+    runs before the store's write reservation is taken. Commits are immutable,
+    and the derived content is recorded with the validation for replay under
+    the reference-transaction lock.
+    """
+    repo = get_repository(conn, repository)
+    known = git_objects.ref_tips(git_dir)
+    derived = []
+    for oldrev, newrev, _refname in updates:
+        try:
+            paths, scope_paths = update_paths(
+                git_dir, git_dir, repo, oldrev, newrev, known_tips=known
+            )
+            field_changes = structured.field_changes(
+                git_dir, oldrev, newrev, known, repo["protected_fields"]
+            )
+            derived.append((paths, scope_paths, field_changes))
+        except git_objects.GitObjectError as exc:
+            raise PushRejected(f"Unable to inspect pushed objects: {exc}") from exc
+    return derived
+
+
 def run_pre_receive(
     conn: Connection, repository: str, stdin_lines: Iterable[str]
 ) -> int:
@@ -921,7 +1008,6 @@ def run_pre_receive(
         return 1
     pusher = os.environ.get("QUORUMGIT_AGENT") or None
     try:
-        begin_immediate(conn)
         if pusher is None:
             raise PushRejected(
                 "Pusher identity required; set QUORUMGIT_AGENT to a registered agent."
@@ -930,17 +1016,26 @@ def run_pre_receive(
             get_agent(conn, pusher)
         except RegistryError as exc:
             raise PushRejected(f"Pusher identity is not registered: {pusher}") from exc
-        saw_update = False
-        for line in stdin_lines:
-            parts = line.split()
-            if not parts:
-                continue
-            if len(parts) != 3:
-                raise PushRejected(f"Malformed pre-receive input: {line!r}")
-            saw_update = True
-            check_ref_update(conn, repository, git_dir, pusher, *parts)
-        if not saw_update:
+        updates = _parse_updates(stdin_lines, hook="pre-receive")
+        if not updates:
             raise PushRejected("No ref updates supplied on stdin.")
+        derived = _derive_pushed_content(conn, repository, git_dir, updates)
+        begin_immediate(conn)
+        for (oldrev, newrev, refname), (paths, scope_paths, field_changes) in zip(
+            updates, derived, strict=True
+        ):
+            check_ref_update(
+                conn,
+                repository,
+                git_dir,
+                pusher,
+                oldrev,
+                newrev,
+                refname,
+                paths=paths,
+                scope_paths=scope_paths,
+                field_changes=field_changes,
+            )
         # Without the transaction hook nothing would re-validate at update
         # time or consume approvals, so a missing one must reject the push.
         _require_reference_transaction_hook(conn, repository)
@@ -966,14 +1061,16 @@ VALIDATION_TTL_SECONDS = 300
 PREPARED_STUCK_AFTER_SECONDS = VALIDATION_TTL_SECONDS
 
 
-def _parse_updates(stdin_lines: Iterable[str]) -> list[tuple[str, str, str]]:
+def _parse_updates(
+    stdin_lines: Iterable[str], hook: str = "reference-transaction"
+) -> list[tuple[str, str, str]]:
     updates = []
     for line in stdin_lines:
         parts = line.split()
         if not parts:
             continue
         if len(parts) != 3:
-            raise PushRejected(f"Malformed reference-transaction input: {line!r}")
+            raise PushRejected(f"Malformed {hook} input: {line!r}")
         updates.append((parts[0], parts[1], parts[2]))
     return updates
 

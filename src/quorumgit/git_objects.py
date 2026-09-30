@@ -195,18 +195,45 @@ def new_commits(
 
 
 def commit_paths(git_dir: str | Path, commit: str) -> list[str]:
-    """Paths one commit introduces.
+    """Paths one commit introduces (see paths_by_commit)."""
+    return paths_by_commit(git_dir, [commit])[commit]
+
+
+def paths_by_commit(git_dir: str | Path, commits: list[str]) -> dict[str, list[str]]:
+    """Paths each commit introduces, read with a single Git process.
 
     Root commits are compared with the empty tree. Merges use Git's combined
     diff, so a clean merge introduces nothing of its own and only paths that
     differ from every parent (conflict resolutions, evil merges) are counted.
+
+    The raw format keeps the parse exact: Git heads each commit's entries with
+    its object ID, and every path follows its own `:`-prefixed status record,
+    so no path can be mistaken for the next commit's ID.
     """
+    result: dict[str, list[str]] = {commit: [] for commit in commits}
+    if not commits:
+        return result
     out = _git(
         git_dir,
-        "diff-tree", "-r", "-c", "--root", "--no-renames", "--name-only",
-        "--no-commit-id", "-z", commit,
+        "diff-tree", "--stdin", "--always", "-r", "-c", "--root", "--no-renames",
+        "--raw", "-z",
+        stdin="".join(f"{commit}\n" for commit in result),
     )
-    return [_text_path(path) for path in out.split("\0") if path]
+    tokens = iter(out.split("\0"))
+    current: str | None = None
+    for token in tokens:
+        if not token:
+            continue
+        if token.startswith(":"):
+            path = next(tokens, "")
+            if current is None or not path:
+                raise GitObjectError("git diff-tree produced an unexpected record.")
+            result[current].append(_text_path(path))
+        elif token in result:
+            current = token
+        else:
+            raise GitObjectError(f"git diff-tree reported an unrequested commit {token}.")
+    return result
 
 
 def changed_paths(
@@ -221,15 +248,31 @@ def changed_paths(
     checked only on claimed branches, so they are measured against the
     mainline alone (mainline_tips). A deletion carries no content.
     """
+    return changed_paths_against(git_dir, oldrev, newrev, [known_tips])[0]
+
+
+def changed_paths_against(
+    git_dir: str | Path,
+    oldrev: str,
+    newrev: str,
+    baselines: list[list[str]],
+) -> list[list[str]]:
+    """changed_paths for each baseline, reading every commit's paths once.
+
+    The number of Git processes is fixed (one commit walk per baseline and a
+    single diff-tree), however many commits the update brings in.
+    """
     if is_zero(newrev):
-        return []
-    known = list(known_tips)
-    if not is_zero(oldrev):
-        known.append(oldrev)
-    paths: set[str] = set()
-    for commit in new_commits(git_dir, newrev, known):
-        paths.update(commit_paths(git_dir, commit))
-    return sorted(paths)
+        return [[] for _ in baselines]
+    old = [] if is_zero(oldrev) else [oldrev]
+    walks = [new_commits(git_dir, newrev, [*tips, *old]) for tips in baselines]
+    by_commit = paths_by_commit(
+        git_dir, list(dict.fromkeys(commit for walk in walks for commit in walk))
+    )
+    return [
+        sorted({path for commit in walk for path in by_commit[commit]})
+        for walk in walks
+    ]
 
 
 def commit_parents(git_dir: str | Path, commit: str) -> list[str]:
