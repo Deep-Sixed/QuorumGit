@@ -75,6 +75,17 @@ def _protected_paths(conn: Connection, repository_id: int) -> list[str]:
     ]
 
 
+def _protected_fields(conn: Connection, repository_id: int) -> list[dict]:
+    return [
+        {"path_glob": row[0], "format": row[1], "pointer": row[2]}
+        for row in conn.execute(
+            "SELECT path_glob, format, pointer FROM protected_fields "
+            "WHERE repository_id = ? ORDER BY path_glob, pointer",
+            (repository_id,),
+        ).fetchall()
+    ]
+
+
 def _allowed_ref_namespaces(conn: Connection, repository_id: int) -> list[str]:
     return [
         row[0]
@@ -93,6 +104,7 @@ def _repository_dict(conn: Connection, row) -> dict:
         "path": row[2],
         "protected_refs": _protected_refs(conn, row[0]),
         "protected_paths": _protected_paths(conn, row[0]),
+        "protected_fields": _protected_fields(conn, row[0]),
         "allowed_ref_namespaces": _allowed_ref_namespaces(conn, row[0]),
     }
 
@@ -272,6 +284,7 @@ OPERATION_TYPES = (
     "ref_delete",
     "out_of_scope_push",
     "protected_path_update",
+    "protected_field_update",
     "lease_takeover",
 )
 
@@ -585,6 +598,65 @@ def set_protected_path(
             detail={"path_glob": glob},
         )
     return _protected_paths(conn, repo["id"])
+
+
+def set_protected_field(
+    conn: Connection,
+    repository: str,
+    glob: str,
+    pointer: str,
+    *,
+    actor: str | None,
+    fmt: str | None = None,
+    remove: bool = False,
+) -> list[dict]:
+    """Add or remove a structured rule: one value inside matching files.
+
+    ``fmt`` defaults to what the glob's extension implies (.json, .toml).
+    """
+    from .structured import RuleError, infer_format, validate_format, validate_pointer
+
+    begin_immediate(conn)
+    repo = get_repository(conn, repository)
+    require_operator(conn, actor, "Changing protected fields")
+    _validate_path_glob(glob)
+    try:
+        validate_pointer(pointer)
+        if not remove:
+            fmt = fmt or infer_format(glob)
+            if fmt is None:
+                raise RegistryError(
+                    f"Cannot tell the format of {glob!r} from its extension; "
+                    "pass --format json or --format toml."
+                )
+            validate_format(fmt)
+    except RuleError as exc:
+        raise RegistryError(str(exc)) from exc
+    if remove:
+        cur = conn.execute(
+            "DELETE FROM protected_fields "
+            "WHERE repository_id = ? AND path_glob = ? AND pointer = ?",
+            (repo["id"], glob, pointer),
+        )
+    else:
+        cur = conn.execute(
+            "INSERT INTO protected_fields (repository_id, path_glob, format, pointer) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (repository_id, path_glob, pointer) DO UPDATE "
+            "SET format = excluded.format WHERE format <> excluded.format",
+            (repo["id"], glob, fmt, pointer),
+        )
+    if cur.rowcount:
+        audit.record(
+            conn,
+            "repository.protected_field_removed" if remove
+            else "repository.protected_field_added",
+            "repository",
+            repo["id"],
+            agent=actor,
+            detail={"path_glob": glob, "pointer": pointer, "format": fmt},
+        )
+    return _protected_fields(conn, repo["id"])
 
 
 def set_allowed_ref_namespace(

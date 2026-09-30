@@ -57,6 +57,7 @@ REQUIRED_TABLES = (
     "ref_updates",
     "operation_approval_policies",
     "operation_approval_roles",
+    "protected_fields",
 )
 
 # Engine-level governance rules. A store missing any of these would still

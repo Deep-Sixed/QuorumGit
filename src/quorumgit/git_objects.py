@@ -230,3 +230,22 @@ def changed_paths(
     for commit in new_commits(git_dir, newrev, known):
         paths.update(commit_paths(git_dir, commit))
     return sorted(paths)
+
+
+def commit_parents(git_dir: str | Path, commit: str) -> list[str]:
+    """The commit's parents, in order (none for a root commit)."""
+    out = _git(git_dir, "rev-list", "--parents", "-n", "1", commit)
+    return out.split()[1:]
+
+
+def blob_at(git_dir: str | Path, commit: str, path: str) -> bytes | None:
+    """The contents of path in commit, or None when it holds no such file."""
+    result = subprocess.run(
+        ["git", "--git-dir", str(git_dir), "cat-file", "blob", f"{commit}:{path}"],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
