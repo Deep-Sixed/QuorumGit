@@ -60,7 +60,7 @@ Then initialize the store once:
 ```bash
 $ quorumgit init
 store: /home/you/.quorumgit/quorumgit.db
-migrations applied: ['001_core.sql', '002_approval_identities.sql', '004_approval_authority.sql', '005_content_governance.sql', '006_ref_updates.sql', '007_ref_update_scope_paths.sql', '008_operation_policies.sql']
+migrations applied: ['001_core.sql', '002_approval_identities.sql', '004_approval_authority.sql', '005_content_governance.sql', '006_ref_updates.sql', '007_ref_update_scope_paths.sql', '008_operation_policies.sql', '009_approval_quorum.sql']
 contract: ok
 ```
 
@@ -261,8 +261,9 @@ Rules that hold no matter what:
 - **A consumed approval is spent, not blacklisted.** Consumption moves the approval to a terminal `consumed` state (with `consumed_at`) rather than reusing `denied`, and only one *live* (`pending` or `approved`) approval may exist per operation hash. The same operation can therefore be requested and approved again later as a new approval instance — which matters for takeovers, whose payload is stable and legitimately repeatable. What is never possible is one approval authorizing twice.
 - **Nobody authorizes themselves.** Only agents whose role the repository's policy names may vote, in either direction. The requester may not vote unless the policy says so, the agent a takeover would benefit may not vote on it, and an agent that voted to approve an operation can never be the one that carries it out — pushes and takeovers by an approver are rejected, and a database trigger refuses the consumption even for writers that bypass the CLI.
 - **Authority is checked when it is used, not only when it is granted.** Consumption re-derives eligible votes from current roles and policy, so raising the threshold or demoting an approver invalidates approvals that no longer meet it. Such an approval is reopened by the next vote on it, so eligible agents can bring it up to the new requirement instead of requesting it again.
-- **The repository owns the policy.** New repositories require one vote from an `operator`, and the requester may not vote. Change it with `quorumgit repo policy <repo> [--threshold <n>] [--role <role>]… [--requester-may-vote | --no-requester-may-vote]`. `approve request` no longer accepts `--threshold`.
-- **Policy can differ per operation type.** A repository's policy is its default; it may override the threshold, the approving roles, or whether the requester may vote for any of `protected_ref_update`, `force_update`, `ref_delete`, `out_of_scope_push`, `protected_path_update`, and `lease_takeover`. Fields an override leaves unset keep following the default, and `--inherit` removes the override. The effective policy is enforced by the same database triggers, and re-derived at consumption like any other policy change.
+- **The repository owns the policy.** New repositories require one vote from an `operator`, and the requester may not vote. Change it with `quorumgit repo policy <repo> [--threshold <n>] [--role <role>]… [--requester-may-vote | --no-requester-may-vote] [--quorum | --no-quorum]`. `approve request` no longer accepts `--threshold`.
+- **Quorum mode scales the threshold with the approvers.** With `--quorum` (on the default or on one operation type's override), an operation needs **2/3 + 1 of the agents eligible to approve it** — agents holding an approving role, minus the requester (unless the policy lets it vote) and a takeover's beneficiary — and never fewer than `--threshold`. For example, with four operators a worker's request needs 3 of the 4, while an operator's own request is decided by the other three and needs all 3 of them. Because eligibility is counted when the approval is used, adding approvers raises the bar for approvals not yet used, just as raising `--threshold` does.
+- **Policy can differ per operation type.** A repository's policy is its default; it may override the threshold, the approving roles, whether the requester may vote, or quorum mode for any of `protected_ref_update`, `force_update`, `ref_delete`, `out_of_scope_push`, `protected_path_update`, and `lease_takeover`. Fields an override leaves unset keep following the default, and `--inherit` removes the override. The effective policy is enforced by the same database triggers, and re-derived at consumption like any other policy change.
 
   ```bash
   quorumgit repo policy myproject --operation force_update --threshold 2 --agent lead
@@ -297,7 +298,7 @@ The incumbent's checkout is not duplicated. When a claim supersedes an earlier c
 | `quorumgit repo add <name> <path> [--protected-ref <ref>]… [--protected-path <glob>]…` | Register a repository |
 | `quorumgit agent add <name> [--role worker\|reviewer\|operator]` | Register an agent identity (non-workers need an operator once one exists) |
 | `quorumgit agent role <name> <role>` | Change an agent's role (operator only, after bootstrap) |
-| `quorumgit repo policy <name> [--operation <type> [--inherit]] [--threshold <n>] [--role <role>]… [--[no-]requester-may-vote]` | Show or change a repository's default approval policy, or its override for one operation type (changes are operator only); also shows protected refs, protected paths, and allowed ref namespaces |
+| `quorumgit repo policy <name> [--operation <type> [--inherit]] [--threshold <n>] [--role <role>]… [--[no-]requester-may-vote] [--[no-]quorum]` | Show or change a repository's default approval policy, or its override for one operation type (changes are operator only); also shows protected refs, protected paths, and allowed ref namespaces |
 | `quorumgit repo protect-path <name> <glob> [--remove]` | Require an approval for any push changing matching paths (operator only) |
 | `quorumgit repo allow-ref <name> <prefix> [--remove]` | Allow pushes to a ref namespace such as `refs/tags/` (operator only) |
 | `quorumgit task add --repo <name> --title <t> [--objective <o>]` | Create a task |

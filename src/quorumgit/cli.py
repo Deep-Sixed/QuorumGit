@@ -149,9 +149,23 @@ def cmd_repo_list(args, cfg) -> int:
     return 0
 
 
-def _describe_policy(policy: dict) -> str:
+def _approver_count(agents: list[dict], policy: dict) -> int:
+    return sum(1 for agent in agents if agent["role"] in policy["roles"])
+
+
+def _describe_threshold(policy: dict, approvers: int) -> str:
+    if not policy["quorum"]:
+        return str(policy["threshold"])
     return (
-        f"threshold {policy['threshold']}; roles "
+        "2/3 + 1 of the agents eligible to approve each operation, at least "
+        f"{policy['threshold']} ({approvers} agent(s) hold an approving role; "
+        f"{gate.quorum_threshold(approvers)} of {approvers} before exclusions)"
+    )
+
+
+def _describe_policy(policy: dict, approvers: int) -> str:
+    return (
+        f"threshold {_describe_threshold(policy, approvers)}; roles "
         f"{', '.join(policy['roles']) or 'none'}; requester may vote: "
         f"{'yes' if policy['requester_may_vote'] else 'no'}"
     )
@@ -163,6 +177,7 @@ def cmd_repo_policy(args, cfg) -> int:
             args.threshold is not None
             or args.role
             or args.requester_may_vote is not None
+            or args.quorum is not None
             or args.inherit
         )
         if changing:
@@ -173,6 +188,7 @@ def cmd_repo_policy(args, cfg) -> int:
                 threshold=args.threshold,
                 roles=args.role or None,
                 requester_may_vote=args.requester_may_vote,
+                quorum=args.quorum,
                 operation_type=args.operation,
                 inherit=args.inherit,
             )
@@ -184,18 +200,28 @@ def cmd_repo_policy(args, cfg) -> int:
             operation_type: registry.approval_policy(conn, repo["id"], operation_type)
             for operation_type in registry.OPERATION_TYPES
         }
+        agents = registry.list_agents(conn)
     print(f"repository: {args.name}")
     if args.operation is not None:
         state = "override" if args.operation in overridden else "inherits default"
-        print(f"{args.operation} ({state}): {_describe_policy(effective[args.operation])}")
+        policy = effective[args.operation]
+        print(
+            f"{args.operation} ({state}): "
+            f"{_describe_policy(policy, _approver_count(agents, policy))}"
+        )
         return 0
-    print(f"approval threshold: {default['threshold']}")
+    approvers = _approver_count(agents, default)
+    print(f"approval threshold: {_describe_threshold(default, approvers)}")
     print(f"approving roles: {', '.join(default['roles'])}")
     print(f"requester may vote: {'yes' if default['requester_may_vote'] else 'no'}")
     if overridden:
         print("per-operation overrides:")
         for operation_type in overridden:
-            print(f"  {operation_type}: {_describe_policy(effective[operation_type])}")
+            policy = effective[operation_type]
+            print(
+                f"  {operation_type}: "
+                f"{_describe_policy(policy, _approver_count(agents, policy))}"
+            )
     else:
         print("per-operation overrides: none")
     with store.session(cfg) as conn:
@@ -723,6 +749,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "the current set)"),
         sp.add_argument("--requester-may-vote", dest="requester_may_vote",
                         action=argparse.BooleanOptionalAction, default=None),
+        sp.add_argument("--quorum", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="require 2/3 + 1 of the eligible approvers "
+                             "(never fewer than --threshold)"),
         sp.add_argument("--operation", choices=registry.OPERATION_TYPES,
                         help="show or change the override for one operation "
                              "type instead of the repository default"),

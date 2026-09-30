@@ -162,6 +162,7 @@ def test_unset_override_fields_inherit_and_inherit_removes(people, approval_repo
         "threshold": 3,
         "requester_may_vote": False,
         "roles": ["reviewer"],
+        "quorum": False,
     }
 
     effective = registry.set_approval_policy(

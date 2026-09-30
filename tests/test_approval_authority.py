@@ -365,6 +365,7 @@ def test_upgrade_leaves_no_agent_with_authority(tmp_path):
         "006_ref_updates.sql",
         "007_ref_update_scope_paths.sql",
         "008_operation_policies.sql",
+        "009_approval_quorum.sql",
     ]
     upgraded = store.connect(local)
     try:
@@ -374,6 +375,7 @@ def test_upgrade_leaves_no_agent_with_authority(tmp_path):
             "threshold": 1,
             "requester_may_vote": False,
             "roles": ["operator"],
+            "quorum": False,
         }
         backfilled = gate.get_approval_by_id(upgraded, approval_id)
         assert backfilled["repository_id"] == repo["id"]

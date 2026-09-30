@@ -287,8 +287,8 @@ def _validate_operation_type(operation_type: str) -> str:
 
 def _default_policy(conn: Connection, repository_id: int) -> dict:
     row = conn.execute(
-        "SELECT approval_threshold, requester_may_vote FROM repositories "
-        "WHERE id = ?",
+        "SELECT approval_threshold, requester_may_vote, approval_quorum "
+        "FROM repositories WHERE id = ?",
         (repository_id,),
     ).fetchone()
     if row is None:
@@ -305,15 +305,16 @@ def _default_policy(conn: Connection, repository_id: int) -> dict:
         "threshold": row[0],
         "requester_may_vote": bool(row[1]),
         "roles": roles,
+        "quorum": bool(row[2]),
     }
 
 
 def operation_policy_overrides(conn: Connection, repository_id: int) -> dict:
     """Per-operation overrides as stored: None or [] means "inherit"."""
     overrides: dict[str, dict] = {}
-    for policy_id, operation_type, threshold, requester_may_vote in conn.execute(
-        "SELECT id, operation_type, approval_threshold, requester_may_vote "
-        "FROM operation_approval_policies WHERE repository_id = ? "
+    for policy_id, operation_type, threshold, requester_may_vote, quorum in conn.execute(
+        "SELECT id, operation_type, approval_threshold, requester_may_vote, "
+        "approval_quorum FROM operation_approval_policies WHERE repository_id = ? "
         "ORDER BY operation_type",
         (repository_id,),
     ).fetchall():
@@ -322,6 +323,7 @@ def operation_policy_overrides(conn: Connection, repository_id: int) -> dict:
             "requester_may_vote": (
                 None if requester_may_vote is None else bool(requester_may_vote)
             ),
+            "quorum": None if quorum is None else bool(quorum),
             "roles": [
                 r[0]
                 for r in conn.execute(
@@ -356,6 +358,9 @@ def approval_policy(
             else override["requester_may_vote"]
         ),
         "roles": override["roles"] or policy["roles"],
+        "quorum": (
+            policy["quorum"] if override["quorum"] is None else override["quorum"]
+        ),
     }
 
 
@@ -374,6 +379,7 @@ def set_approval_policy(
     threshold: int | None = None,
     roles: list[str] | None = None,
     requester_may_vote: bool | None = None,
+    quorum: bool | None = None,
     operation_type: str | None = None,
     inherit: bool = False,
 ) -> dict:
@@ -394,7 +400,9 @@ def set_approval_policy(
         if inherit:
             raise RegistryError("--inherit applies only to an --operation override.")
         before = _default_policy(conn, repo["id"])
-        _set_default_policy(conn, repo["id"], threshold, wanted, requester_may_vote)
+        _set_default_policy(
+            conn, repo["id"], threshold, wanted, requester_may_vote, quorum
+        )
         after = _default_policy(conn, repo["id"])
         detail: dict = {"before": before, "after": after}
     else:
@@ -403,7 +411,7 @@ def set_approval_policy(
         before = overrides.get(operation_type)
         _set_operation_override(
             conn, repo["id"], operation_type, threshold, wanted,
-            requester_may_vote, inherit,
+            requester_may_vote, quorum, inherit,
         )
         after = operation_policy_overrides(conn, repo["id"]).get(operation_type)
         detail = {"operation_type": operation_type, "before": before, "after": after}
@@ -425,6 +433,7 @@ def _set_default_policy(
     threshold: int | None,
     roles: list[str] | None,
     requester_may_vote: bool | None,
+    quorum: bool | None,
 ) -> None:
     if threshold is not None:
         conn.execute(
@@ -447,6 +456,11 @@ def _set_default_policy(
             "UPDATE repositories SET requester_may_vote = ? WHERE id = ?",
             (1 if requester_may_vote else 0, repository_id),
         )
+    if quorum is not None:
+        conn.execute(
+            "UPDATE repositories SET approval_quorum = ? WHERE id = ?",
+            (1 if quorum else 0, repository_id),
+        )
 
 
 def _set_operation_override(
@@ -456,13 +470,19 @@ def _set_operation_override(
     threshold: int | None,
     roles: list[str] | None,
     requester_may_vote: bool | None,
+    quorum: bool | None,
     inherit: bool,
 ) -> None:
     if inherit:
-        if threshold is not None or roles is not None or requester_may_vote is not None:
+        if (
+            threshold is not None
+            or roles is not None
+            or requester_may_vote is not None
+            or quorum is not None
+        ):
             raise RegistryError(
                 "--inherit removes the override; it cannot be combined with "
-                "--threshold, --role, or --requester-may-vote."
+                "--threshold, --role, --requester-may-vote, or --quorum."
             )
         conn.execute(
             "DELETE FROM operation_approval_policies "
@@ -493,6 +513,12 @@ def _set_operation_override(
             "UPDATE operation_approval_policies SET requester_may_vote = ? "
             "WHERE id = ?",
             (1 if requester_may_vote else 0, policy_id),
+        )
+    if quorum is not None:
+        conn.execute(
+            "UPDATE operation_approval_policies SET approval_quorum = ? "
+            "WHERE id = ?",
+            (1 if quorum else 0, policy_id),
         )
     if roles is not None:
         conn.execute(
