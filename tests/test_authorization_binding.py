@@ -45,6 +45,7 @@ UPGRADE_MIGRATIONS = [
     "008_operation_policies.sql",
     "009_approval_quorum.sql",
     "010_protected_ref_names.sql",
+    "011_quorum_consumer_separation.sql",
 ]
 
 

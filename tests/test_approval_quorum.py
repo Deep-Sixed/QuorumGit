@@ -80,6 +80,29 @@ def test_requester_exclusion_shrinks_the_eligible_set(quorum_store, tmp_path):
     gate.consume_approval(conn, approval["id"], _op(repo), agent="pusher")
 
 
+def test_quorum_consumer_vote_does_not_authorize_itself(quorum_store, tmp_path):
+    """A quorum voter may execute only when the other voters still form quorum."""
+    _local, conn = quorum_store
+    _operators(conn, "a", "b", "c")
+    repo = register_repo(conn, tmp_path / "q-consumer-voter")
+    registry.set_approval_policy(
+        conn, repo, actor="a", quorum=True, requester_may_vote=True
+    )
+
+    op = _op(repo)
+    approval = gate.request_approval(conn, op, "a")
+    assert approval["threshold"] == 3
+    gate.vote(conn, approval["id"], "a", True)
+    gate.vote(conn, approval["id"], "b", True)
+    assert gate.vote(conn, approval["id"], "c", True)["status"] == "approved"
+
+    # a's own vote is ignored for authorizing a. The other two operators are
+    # the complete eligible set once a is excluded, and 2/3 + 1 of 2 is 2.
+    assert gate.approved_instance(conn, op, consumer="a") is not None
+    gate.consume_approval(conn, approval["id"], op, agent="a")
+    assert gate.get_approval_by_id(conn, approval["id"])["status"] == "consumed"
+
+
 def test_status_and_usability_use_the_same_requirement(quorum_store, tmp_path):
     """A non-voting operator carrying out the operation does not lower quorum.
 

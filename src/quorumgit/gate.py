@@ -6,8 +6,9 @@ carries (see git_objects), never from what an agent declared it would modify:
 changes outside the pushing claim's scopes and changes to protected paths are
 approval-governed just like protected refs, force pushes, and deletions. Who may authorize is owned by the operation's repository:
 its approval policy names the threshold, the roles whose votes count, and
-whether the requester may vote. An agent that approved an operation may never
-be the one that carries it out. Enforcement is fail-closed: any hook error
+whether the requester may vote. A consumer's own vote never counts toward
+authorizing that consumer; fixed-threshold policies still require a separate
+approver. Enforcement is fail-closed: any hook error
 rejects the push.
 """
 
@@ -189,33 +190,43 @@ def quorum_threshold(eligible_approvers: int) -> int:
     return (2 * eligible_approvers) // 3 + 1
 
 
-def _eligible_approver_count(conn: Connection, approval: dict, policy: dict) -> int:
+def _eligible_approver_count(
+    conn: Connection,
+    approval: dict,
+    policy: dict,
+    exclude_agent_id: int | None = None,
+) -> int:
     """Registered agents who could cast a counting vote on this approval."""
     rows = conn.execute("SELECT id, name, role FROM agents").fetchall()
     return sum(
         1
         for agent_id, name, role in rows
-        if _vote_refusal(approval, policy, {"id": agent_id, "name": name, "role": role})
+        if agent_id != exclude_agent_id
+        and _vote_refusal(approval, policy, {"id": agent_id, "name": name, "role": role})
         is None
     )
 
 
-def required_approvals(conn: Connection, approval: dict, policy: dict) -> int:
+def required_approvals(
+    conn: Connection,
+    approval: dict,
+    policy: dict,
+    exclude_agent_id: int | None = None,
+) -> int:
     """Eligible yes votes this approval needs under the current policy.
 
     With quorum mode on, the requirement is 2/3 + 1 of the agents eligible to
     vote on this particular approval — excluding the requester (unless the
     policy lets it vote) and a takeover's beneficiary — and never less than
-    the policy's fixed threshold. Counting only eligible agents keeps those
-    exclusions from making approval impossible while other approvers exist.
-    The same requirement decides votes and is re-checked at use time, so an
-    approval's status never disagrees with whether it can be used; who may
-    use it is a separate rule (an approver can never carry out its own
-    approval).
+    the policy's fixed threshold. During consumption, a quorum approver who is
+    also the consumer is excluded from both the yes-vote count and the quorum
+    denominator, so its own vote never authorizes its own action.
     """
     if not policy["quorum"]:
         return policy["threshold"]
-    eligible = _eligible_approver_count(conn, approval, policy)
+    eligible = _eligible_approver_count(
+        conn, approval, policy, exclude_agent_id=exclude_agent_id
+    )
     return max(policy["threshold"], quorum_threshold(eligible))
 
 
@@ -224,24 +235,36 @@ def _authorization_refusal(
 ) -> str | None:
     """Why an approved instance cannot authorize this consumer now, or None."""
     policy = _policy_for(conn, approval)
+    consumer_voted = False
     if consumer is not None:
-        approved_by_consumer = conn.execute(
+        consumer_voted = conn.execute(
             "SELECT 1 FROM votes WHERE approval_id = ? AND voter_agent_id = ? "
             "AND vote = 1",
             (approval["id"], consumer["id"]),
-        ).fetchone()
-        if approved_by_consumer is not None:
+        ).fetchone() is not None
+        if consumer_voted and not policy["quorum"]:
             return (
                 f"{consumer['name']} approved this operation and may not also "
-                "carry it out."
+                "carry it out under a fixed-threshold policy."
             )
-    eligible = _eligible_approvals(conn, approval, policy)
-    required = required_approvals(conn, approval, policy)
+
+    excluded = consumer["id"] if consumer is not None and consumer_voted else None
+    eligible = _eligible_approvals(
+        conn, approval, policy, exclude_agent_id=excluded
+    )
+    required = required_approvals(
+        conn, approval, policy, exclude_agent_id=excluded
+    )
     if eligible < required:
         basis = " (2/3 + 1 of eligible approvers)" if policy["quorum"] else ""
+        own_vote = (
+            f" {consumer['name']}'s own yes vote is excluded from its authorization."
+            if consumer is not None and consumer_voted
+            else ""
+        )
         return (
             f"Approval {approval['id']} has {eligible} eligible approval(s); the "
-            f"repository policy now requires {required}{basis}. Eligible "
+            f"repository policy now requires {required}{basis}.{own_vote} Eligible "
             f"agents can vote on approval {approval['id']} to reach it."
         )
     return None
@@ -437,8 +460,10 @@ def approved_instance(
 ) -> dict | None:
     """The approved instance for this exact operation, if it can be used now.
 
-    With a consumer, the instance must also be usable by that agent: an agent
-    that approved an operation cannot be the one that carries it out.
+    With a consumer, the instance must also be usable by that agent. Under
+    quorum policy, a consumer's own yes vote is excluded from both the vote
+    count and quorum denominator; fixed-threshold policy still forbids an
+    approver from carrying out the operation.
     """
     try:
         approval = get_approval(conn, operation_hash(operation))
@@ -606,7 +631,7 @@ def governed_operations(
     )
     if refname in repo["protected_refs"]:
         operations.append({"type": "protected_ref_update", **base})
-    elif deletion:
+    if deletion:
         operations.append({"type": "ref_delete", **base})
     elif forced:
         operations.append({"type": "force_update", **base})

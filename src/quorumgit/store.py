@@ -81,7 +81,7 @@ REQUIRED_TRIGGERS = (
 
 # Views the governance triggers read from; a store missing one would pass the
 # table and trigger checks yet fail on the next vote.
-REQUIRED_VIEWS = ("approval_effective_policy",)
+REQUIRED_VIEWS = ("approval_effective_policy", "approval_eligible_agents")
 
 
 class StoreError(RuntimeError):
