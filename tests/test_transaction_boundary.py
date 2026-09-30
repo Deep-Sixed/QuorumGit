@@ -17,8 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from quorumgit import gate, registry, work
-from tests.conftest import approve
+from quorumgit import gate, registry, store, work
+from tests.conftest import OPERATOR, approve, ensure_agent
 from tests.test_gate import _commit, _push, _setup
 
 
@@ -641,3 +641,131 @@ def test_prepared_checks_the_paths_pre_receive_derived(committed_conn, tmp_path,
         gate.get_approval_by_id(conn, ap["id"])["status"] == "consumed"
         for ap in approvals
     )
+
+
+# ---------------------------------------------- ported from the #10 handover
+# Regression cases written by the session that rebuilt this boundary on the
+# #10 branch (44a6b5f), adapted to this PR's `approval_ids` column.
+
+
+def test_approval_survives_a_non_fast_forward_git_denies_by_config(
+    committed_conn, tmp_path, cfg
+):
+    """`git init --shared` hubs set receive.denyNonFastForwards, which Git
+    enforces after pre-receive; the force-push approval must not be spent."""
+    conn = committed_conn
+    repo_name, hub, clone, a, _b = _setup(conn, tmp_path)
+    _commit(clone, "first.py", branch="feat/rewrite")
+    assert _push(clone, a, "feat/rewrite", cfg=cfg).returncode == 0
+    oldrev = _rev(["--git-dir", str(hub)], "refs/heads/feat/rewrite")
+    subprocess.run(
+        ["git", "-C", str(clone), "reset", "--hard", "HEAD~1"],
+        check=True, capture_output=True,
+    )
+    _commit(clone, "second.py", branch="feat/rewrite")
+    op = {
+        "type": "force_update",
+        "repository": repo_name,
+        "refname": "refs/heads/feat/rewrite",
+        "oldrev": oldrev,
+        "newrev": _rev(["-C", str(clone)], "HEAD"),
+    }
+    approval = approve(conn, op, requested_by="requester")
+    conn.commit()
+
+    subprocess.run(
+        ["git", "--git-dir", str(hub), "config", "receive.denyNonFastForwards", "true"],
+        check=True,
+    )
+    denied = _push(clone, a, "+feat/rewrite", cfg=cfg)
+    assert denied.returncode != 0
+    assert "non-fast-forward" in denied.stderr
+    assert _rev(["--git-dir", str(hub)], "refs/heads/feat/rewrite") == oldrev
+    assert gate.get_approval_by_id(conn, approval["id"])["status"] == "approved"
+
+    subprocess.run(
+        ["git", "--git-dir", str(hub), "config", "--unset", "receive.denyNonFastForwards"],
+        check=True,
+    )
+    forced = _push(clone, a, "+feat/rewrite", cfg=cfg)
+    assert forced.returncode == 0, forced.stderr
+    assert gate.get_approval_by_id(conn, approval["id"])["status"] == "consumed"
+
+
+def test_every_approval_of_one_update_is_consumed_and_restored_together(
+    committed_conn, tmp_path, cfg, monkeypatch
+):
+    conn = committed_conn
+    repo_name, hub, clone, a, _b = _setup(conn, tmp_path)
+    ensure_agent(conn, OPERATOR, "operator")
+    registry.set_protected_path(conn, repo_name, "deploy.yml", actor=OPERATOR)
+    conn.commit()
+    _commit(clone, "deploy.yml")
+    # Bring the objects into the hub without a governed ref update.
+    subprocess.run(
+        ["git", "--git-dir", str(hub), "fetch", str(clone), "HEAD"],
+        check=True, capture_output=True,
+    )
+    oldrev = _rev(["--git-dir", str(hub)], "refs/heads/main")
+    plan = gate.prepare_push(conn, repo_name, "main", clone, pusher=a)
+    required = {entry["operation"]["type"]: entry["operation"] for entry in plan["operations"]}
+    assert set(required) == {"protected_ref_update", "protected_path_update"}
+    approvals = [
+        approve(conn, operation, requested_by="requester")
+        for operation in required.values()
+    ]
+    conn.commit()
+
+    monkeypatch.chdir(hub)
+    monkeypatch.setenv("GIT_DIR", ".")
+    monkeypatch.setenv("QUORUMGIT_AGENT", a)
+    line = [f"{oldrev} {plan['newrev']} refs/heads/main\n"]
+    assert gate.run_pre_receive(conn, repo_name, line) == 0
+
+    def statuses() -> set[str]:
+        return {
+            gate.get_approval_by_id(conn, approval["id"])["status"]
+            for approval in approvals
+        }
+
+    assert statuses() == {"approved"}
+
+    assert gate.run_reference_transaction(conn, repo_name, "prepared", line) == 0
+    assert statuses() == {"consumed"}
+    row = conn.execute(
+        "SELECT approval_ids FROM ref_updates WHERE refname = 'refs/heads/main' "
+        "AND newrev = ? AND status = 'prepared'",
+        (plan["newrev"],),
+    ).fetchone()
+    assert row is not None
+    assert sorted(store.json_loads(row[0], [])) == sorted(ap["id"] for ap in approvals)
+
+    assert gate.run_reference_transaction(conn, repo_name, "aborted", line) == 0
+    assert statuses() == {"approved"}
+
+
+def test_prepared_uses_the_paths_pre_receive_derived(committed_conn, tmp_path, cfg):
+    """In a non-atomic push each ref commits separately. When main lands
+    first, a later ref's commits no longer look new at `prepared`; the
+    operations must still be the ones pre-receive derived and approved."""
+    conn = committed_conn
+    repo_name, _hub, clone, a, _b = _setup(conn, tmp_path)
+    task = work.create_task(conn, repo_name, "ordered refs")
+    work.claim_task(conn, task, a, branch="work/x", scope_globs=["src/**"])
+    conn.commit()
+    _commit(clone, "prod.tf")  # on main, outside the claim's scope
+    _commit(clone, "schema.sql", branch="work/x")  # also outside it
+    plans = [
+        gate.prepare_push(conn, repo_name, ref, clone, ref, pusher=a)
+        for ref in ("main", "work/x")
+    ]
+    operations = [entry["operation"] for plan in plans for entry in plan["operations"]]
+    out_of_scope = next(op for op in operations if op["type"] == "out_of_scope_push")
+    assert out_of_scope["paths"] == ["prod.tf", "schema.sql"]
+    approvals = [approve(conn, op, requested_by="requester") for op in operations]
+    conn.commit()
+
+    pushed = _push(clone, a, "main", "work/x", cfg=cfg)
+    assert pushed.returncode == 0, pushed.stderr
+    for approval in approvals:
+        assert gate.get_approval_by_id(conn, approval["id"])["status"] == "consumed"
